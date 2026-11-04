@@ -7,6 +7,7 @@ use sbe::side_enum::SideEnum;
 
 use tools::args::Args;
 use tools::event::SCALE;
+use tools::rng::Rng;
 use tools::wire::{
     CANCEL_LENGTH, CancelOrder, NEW_ORDER_LENGTH, NewOrder, encode_cancel, encode_new_order,
 };
@@ -24,22 +25,6 @@ const USAGE: &str = "sbx-load: send a repeatable stream of orders straight to th
     --spread N        prices vary this far either side of mid (default 5)
     --market-pct N    percent of orders that are market orders (default 10)
     --cancel-pct N    percent of messages that cancel an earlier order (default 0)";
-
-/// xorshift64*: small, fast and reproducible, which is all a load generator needs.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 >> 12;
-        self.0 ^= self.0 << 25;
-        self.0 ^= self.0 >> 27;
-        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn below(&mut self, limit: u64) -> u64 {
-        self.next() % limit
-    }
-}
 
 fn on_error(code: i32, message: &str) {
     eprintln!("aeron error {code}: {message}");
@@ -88,7 +73,7 @@ fn main() {
         .split(',')
         .map(symbol)
         .collect();
-    let mut rng = Rng(args.get("seed", 1u64).max(1));
+    let mut rng = Rng::new(args.get("seed", 1));
 
     let aeron = transport::connect(on_error).expect("failed to connect to the media driver");
     let channel = transport::env_or("ORDERS_CHANNEL", transport::ORDERS_CHANNEL);

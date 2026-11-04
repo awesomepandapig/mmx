@@ -270,6 +270,56 @@ cargo build -p matching-engine --release --features silent
 With `RUST_LOG` set to a level above `off`, `tracing-subscriber` prints one warning at
 startup about the static limit. Nothing is logged after that.
 
+## Benchmarking
+
+`scripts/bench.py` plays a tape of packed SBE orders into a freshly started engine, on bare
+metal, in a release build with logging compiled out. Only the benchmark process
+is attached. Stop anything else that's busy first, including `scripts/sbx.py down`.
+
+```sh
+scripts/bench.py                                # all profiles and modes, 5 repeats
+scripts/bench.py --compare m4-mac-mini          # exit 1 on a regression
+scripts/bench.py --save-baseline NAME           # write bench/baselines/NAME.json
+scripts/bench.py --tape 100m --profile ipc --modes throughput --repeat 1
+scripts/bench.py --engine path/to/binary        # benchmark another build
+```
+
+| Mode | Measures |
+|---|---|
+| `digest` | Hashes every report except timestamps, twice, and fails if they differ. Any change to the engine's behaviour changes this hash. |
+| `throughput` | Plays the tape as fast as the engine accepts it. |
+| `latency` | Sends 2M orders at a fixed rate and times each from its scheduled send to its `New` report, so a stall can't hide the queue behind it. |
+
+| Profile | Transport |
+|---|---|
+| `ipc` | Shared memory on one machine, the closest to the engine's raw speed |
+| `udp` | UDP orders and MDC reports, the default deployment |
+
+`--compare` fails if the digest changes, median throughput falls more than 10%, or p99
+latency rises more than 25%. A digest change isn't always wrong, but it means the engine's
+output changed, so save a new baseline only if that was intended. Baselines only compare
+fairly on the same machine.
+
+Tapes live in `.run/tapes`, outside git. `bench/tapes.json` records each tape's generator
+arguments and SHA-256, so identical bytes can be rebuilt (10M is 720 MB, 100M is 7.2 GB and
+takes about 13 seconds). A tape is 72-byte records end to end, with no header.
+
+Results on the M4 Mac mini, at commit `3c8ef95` plus benchmark tooling:
+
+| Build, `ipc`, 10M tape | Orders/sec | Change |
+|---|---|---|
+| Current engine | 3.05M | |
+| Without per-order latency timing | 3.17M | +4% |
+| Also one clock read per order, not per report | 3.27M | +7% |
+| Also a fast hash instead of SipHash | 3.93M | +29% |
+| Also fat LTO and one codegen unit | 4.14M | +36% |
+
+Rows below the first were scratch builds and aren't in the repo. All produced the same
+digest. Each order creates about 2.76 reports, so 3.05M orders/sec is 8.43M reports/sec.
+Current engine on `udp`: 0.78M orders/sec. At 100K orders/sec on `ipc`, p50 is 250ns,
+p99 1.5µs and p99.99 2ms; on `udp`, p50 is 15µs, p99 47µs and p99.99 3.2ms. On the 100M tape,
+the current engine reached 2.68M orders/sec (one run).
+
 ## What doesn't work yet
 
 Confirmed with the tools above:

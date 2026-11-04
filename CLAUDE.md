@@ -16,9 +16,12 @@ cargo clippy --workspace                   # CI runs clippy with --all-features
 scripts/sbx.py up | down | status          # run the local stack
 scripts/sbx.py logs matching-engine        # follow a service's log
 scripts/sbx.py verify --orders 20000 --rate 5000   # seeded load + invariants + crash check
+scripts/bench.py --compare m4-mac-mini     # deterministic tape, fails on a regression
 ```
 
 Run `scripts/sbx.py verify` after changing `matching-engine`, `level2` or `ticker`. It restarts the engine, so don't run it against something you want to keep running.
+
+Run `scripts/bench.py --compare m4-mac-mini` after changing `matching-engine` or `transport`. Its digest proves the engine's output didn't change, so use it to check refactors. Baselines only compare fairly on the machine that made them, and other work on the machine skews throughput.
 
 `auth`, `web` and `docs` are separate npm projects with no root workspace. `web` and `docs` have `npm run dev`, `build`, `lint`, `fmt` and `typecheck`. `auth` has `dev`, `build`, `lint`, `fmt` and `start`. `auth`'s `build` also runs `fmt`, which rewrites files.
 

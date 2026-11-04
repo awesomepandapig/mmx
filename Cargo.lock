@@ -2415,6 +2415,7 @@ dependencies = [
  "sbe",
  "serde",
  "serde_json",
+ "sha2",
  "transport",
 ]
 

@@ -5,4 +5,5 @@
 pub mod args;
 pub mod check;
 pub mod event;
+pub mod rng;
 pub mod wire;
