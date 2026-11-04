@@ -1,0 +1,58 @@
+{
+  "tape": "5m",
+  "max_orders": "1000000",
+  "environment": {
+    "commit": "b60f26d",
+    "dirty": true,
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+    "cpu": "Apple M4",
+    "os": "macOS-26.3.1-arm64-arm-64bit",
+    "engine": "/Users/theaw/Projects/sbx/target/dist/matching-engine",
+    "load_before": 2.86,
+    "date": "2026-11-04T15:10:53+00:00"
+  },
+  "profiles": {
+    "ipc": {
+      "digest": "ae78ea9c2c228ccc",
+      "reports": 13802884,
+      "rejected": 0,
+      "throughput": {
+        "orders_per_second": 3871873.762394271,
+        "best": 3904130.1793166995,
+        "worst": 3807751.451357403,
+        "reports_per_second": 10688604.880994337,
+        "reports": 13802884
+      },
+      "latency_ns": {
+        "p50": 250,
+        "p90": 333,
+        "p99": 1500,
+        "p99_9": 3583,
+        "p99_99": 8625,
+        "max": 68167
+      },
+      "latency_rate": 100000
+    },
+    "udp": {
+      "digest": "ae78ea9c2c228ccc",
+      "reports": 13802884,
+      "rejected": 0,
+      "throughput": {
+        "orders_per_second": 735870.6713441105,
+        "best": 738096.6506575786,
+        "worst": 729803.5932500247,
+        "reports_per_second": 2031427.5031129762,
+        "reports": 13802884
+      },
+      "latency_ns": {
+        "p50": 14708,
+        "p90": 31834,
+        "p99": 45250,
+        "p99_9": 79250,
+        "p99_99": 3067458,
+        "max": 4562667
+      },
+      "latency_rate": 100000
+    }
+  }
+}

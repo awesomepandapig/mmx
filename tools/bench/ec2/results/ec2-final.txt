@@ -1,0 +1,54 @@
+== sync1-20k | orders/s=20000 reports/s=55296 seconds=15.00 p50=303us p99=565us p99.9=2776us max=5203us
+   COUNT OK
+   matching_ns n=300000 p50=540 p99=2142 p99.9=3190 p99.99=13642 max=34178
+   warm_in_to_out_ns n=240000 p50=174777 p99=421062 p99.9=2303702 p99.99=3864642 max=4744070
+== sync1-100k | orders/s=99996 reports/s=275999 seconds=15.00 p50=571us p99=1020us p99.9=4646us max=6579us
+   COUNT OK
+   matching_ns n=1500000 p50=526 p99=6214 p99.9=8136 p99.99=17331 max=482640
+   warm_in_to_out_ns n=1200000 p50=443372 p99=638873 p99.9=3820890 p99.99=4878734 max=5357495
+== sync1-300k-b18 | orders/s=300010 reports/s=828308 seconds=10.00 p50=678us p99=2993us p99.9=6188us max=10021us
+   COUNT OK
+   matching_ns n=166667 p50=10100 p99=16029 p99.9=26289 p99.99=30392 max=417365
+   warm_in_to_out_ns n=133334 p50=485119 p99=717186 p99.9=4556528 p99.99=5617059 max=5834456
+== sync1-400k-b18 | orders/s=399963 reports/s=1104028 seconds=10.00 p50=827us p99=3112us p99.9=7182us max=9916us
+   COUNT OK
+   matching_ns n=222223 p50=10572 p99=21149 p99.9=27749 p99.99=33556 max=450623
+   warm_in_to_out_ns n=177779 p50=643230 p99=1409477 p99.9=4728524 p99.99=7308956 max=7904915
+== sync0-20k | orders/s=20000 reports/s=55297 seconds=15.00 p50=184us p99=270us p99.9=873us max=4978us
+   COUNT OK
+   matching_ns n=300000 p50=535 p99=3230 p99.9=6329 p99.99=11966 max=421164
+   warm_in_to_out_ns n=240000 p50=75797 p99=132684 p99.9=216714 p99.99=1959148 max=2604641
+== sync0-100k | orders/s=99998 reports/s=276007 seconds=15.00 p50=214us p99=315us p99.9=1791us max=5425us
+   COUNT OK
+   matching_ns n=1500000 p50=500 p99=5805 p99.9=7858 p99.99=17034 max=451505
+   warm_in_to_out_ns n=1200000 p50=96893 p99=150857 p99.9=183851 p99.99=452212 max=580859
+== sync0-300k-b18 | orders/s=300024 reports/s=828347 seconds=10.00 p50=248us p99=476us p99.9=3273us max=5198us
+   COUNT OK
+   matching_ns n=166667 p50=10606 p99=21261 p99.9=53300 p99.99=87887 max=160587
+   warm_in_to_out_ns n=133334 p50=85348 p99=145435 p99.9=203141 p99.99=290245 max=637669
+== sync0-400k-b18 | orders/s=399985 reports/s=1104089 seconds=10.00 p50=271us p99=435us p99.9=1917us max=2979us
+   COUNT OK
+   matching_ns n=222223 p50=10829 p99=30398 p99.9=40201 p99.99=52089 max=437410
+   warm_in_to_out_ns n=177779 p50=108720 p99=171036 p99.9=227622 p99.99=471471 max=720862
+#### leader kills, disk sync on
+round 1: duplicates=0 gaps=0 failovers_ms=[2620] violations=0 last_exec_id=1381445 source_rotations=1 resent=
+   digest match 1381447
+round 2: duplicates=0 gaps=0 failovers_ms=[2829] violations=0 last_exec_id=1381445 source_rotations=1 resent=
+   digest match 1381447
+round 3: duplicates=0 gaps=0 failovers_ms=[2825] violations=0 last_exec_id=1381445 source_rotations=1 resent=
+   digest match 1381447
+#### snapshot under 100K/s, then kill and restart a follower
+Member [0]: SNAPSHOT applied successfully
+snapshot took 169.955232ms, recording 2
+snapshot took 151.744007ms, recording 2
+snapshot took 135.664691ms, recording 2
+rejoined=yes in 6s
+trades=2199888 violations=0 last_exec_id=6902038 source_rotations=0 resent=0
+session open, leader is member Some(0)
+
+6902039 51072f60d37daf14
+6902039 51072f60d37daf14
+6902039 51072f60d37daf14
+snapshot loaded in 163.196655ms
+output open at 614659200 in 162.266034ms
+DONE

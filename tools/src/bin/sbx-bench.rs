@@ -27,8 +27,8 @@ const USAGE: &str = "sbx-bench: play a tape into the matching engine and measure
     --exec-channel CHANNEL    default aeron:ipc
 
 throughput  plays the tape as fast as the engine accepts it
-latency     paces the tape and times each order from its scheduled send to its New report, so a
-            stall can't hide the queue that builds behind it
+latency     paces the tape and times each order from its scheduled send to its first report, so
+            a stall can't hide the queue that builds behind it
 digest      hashes every report except timestamps; any change in behaviour changes the hash
 
 Prints one JSON object. The engine must be freshly started: order IDs identify tape records.";
@@ -49,6 +49,7 @@ enum Mode {
 #[derive(Default)]
 struct Received {
     reports: u64,
+    rejected: u64,
     first: Option<Instant>,
     last: Option<Instant>,
     latencies: Vec<u64>,
@@ -60,6 +61,7 @@ struct Output {
     mode: &'static str,
     orders: u64,
     reports: u64,
+    rejected: u64,
     seconds: f64,
     orders_per_second: f64,
     reports_per_second: f64,
@@ -90,16 +92,20 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Returns the report's order ID if it acknowledges a new order.
+/// Returns the order ID and whether it was rejected, if the report answers a new order.
 #[inline]
-fn acknowledged_order(buffer: &[u8]) -> Option<u64> {
+fn acknowledged_order(buffer: &[u8]) -> Option<(u64, bool)> {
     let header: MessageHeaderDecoder<ReadBuf<'_>> =
         MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
     if header.template_id() != 3 {
         return None;
     }
     let report: ExecutionReportDecoder<'_> = ExecutionReportDecoder::default().header(header, 0);
-    (report.exec_type() == ExecTypeEnum::New).then(|| report.order_id())
+    match report.exec_type() {
+        ExecTypeEnum::New => Some((report.order_id(), false)),
+        ExecTypeEnum::Rejected => Some((report.order_id(), true)),
+        _ => None,
+    }
 }
 
 fn wait_for_engine(subscription: &AeronSubscription) {
@@ -148,8 +154,9 @@ fn receive(
                         received.digest = fnv1a(received.digest, &copy[..length]);
                     }
 
-                    if let Some(order_id) = acknowledged_order(buffer) {
+                    if let Some((order_id, rejected)) = acknowledged_order(buffer) {
                         acknowledged += 1;
+                        received.rejected += u64::from(rejected);
                         if mode == Mode::Latency {
                             let started = *start.get().expect("orders arrive after the start");
                             let scheduled = (order_id - 1) * period_ns;
@@ -274,6 +281,7 @@ fn main() {
         mode: mode_name,
         orders,
         reports: received.reports,
+        rejected: received.rejected,
         seconds,
         orders_per_second: orders as f64 / seconds,
         reports_per_second: received.reports as f64 / seconds,

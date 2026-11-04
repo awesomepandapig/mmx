@@ -16,7 +16,7 @@ Steps marked untested haven't been tried.
 | Clang | Apple clang 17 | `rusteron` bindings and the Aeron driver |
 | Aeron | 1.54.0 (must match `rusteron-client`) | Media driver |
 | Node / npm | 23.11.0 / 10.9.2 | `auth`, `web`, `docs` |
-| Python | 3, standard library only | `scripts/sbx.py` |
+| Python | 3, standard library only | `tools/scripts/sbx.py` |
 | Apple `container` | 1.6.1 | Infrastructure on macOS |
 | NATS | `nats:2-alpine` | Market data bus |
 | QuestDB | `questdb/questdb:8.2.3` | Time-series storage |
@@ -78,7 +78,7 @@ cmake --build cppbuild/Release --target aeronmd AeronStat ErrorStat LossStat Dri
 ```
 
 Binaries land in `cppbuild/Release/binaries`. If you clone elsewhere, set `AERON_BIN`
-for `scripts/sbx.py`.
+for `tools/scripts/sbx.py`.
 
 ## 3. Build the services
 
@@ -91,10 +91,10 @@ for app in auth web docs; do (cd "$app" && npm ci); done
 ## 4. Start everything
 
 ```sh
-scripts/sbx.py up        # infrastructure, RAM disk, driver and all Rust services
-scripts/sbx.py status
-scripts/sbx.py logs matching-engine
-scripts/sbx.py down      # add --all to remove the infrastructure containers too
+tools/scripts/sbx.py up        # infrastructure, RAM disk, driver and all Rust services
+tools/scripts/sbx.py status
+tools/scripts/sbx.py logs matching-engine
+tools/scripts/sbx.py down      # add --all to remove the infrastructure containers too
 ```
 
 Logs and PID files go in `.run/`. `sbx.py` runs these steps for you:
@@ -130,12 +130,12 @@ export AERON_DIR=/Volumes/DevShm/aeron RUST_LOG=info   # macOS
 
 SUB_CHANNEL='aeron:udp?endpoint=localhost:40123' SUB_STREAM_ID=1001 \
 PUB_CHANNEL='aeron:udp?control=localhost:40456|control-mode=dynamic' PUB_STREAM_ID=1002 \
-MAX_ORDERS=10000000 target/release/matching-engine
+MAX_ORDERS=1000000 target/release/matching-engine
 
 target/release/level2
 target/release/ticker
 target/release/trade-reporter
-target/release/observer
+target/release/sbx-observer
 target/release/api
 WS_ADDR=127.0.0.1:8090 target/release/websocket
 ```
@@ -151,13 +151,13 @@ book in memory, so start them before the first order, and restart them with `mat
 | Variable | Used by | Default |
 |---|---|---|
 | `AERON_DIR` | All Aeron services | `/Volumes/DevShm/aeron` on macOS, `/dev/shm/aeron` on Linux |
-| `SUB_CHANNEL`, `SUB_STREAM_ID` | `matching-engine` (required), `level2`, `ticker`, `trade-reporter` | See `transport/src/lib.rs` |
-| `PUB_CHANNEL`, `PUB_STREAM_ID` | `matching-engine` (required), `api` | See `transport/src/lib.rs` |
+| `SUB_CHANNEL`, `SUB_STREAM_ID` | `matching-engine` (required), `level2`, `ticker`, `trade-reporter` | See `crates/transport/src/lib.rs` |
+| `PUB_CHANNEL`, `PUB_STREAM_ID` | `matching-engine` (required), `api` | See `crates/transport/src/lib.rs` |
 | `MAX_ORDERS` | `matching-engine` (required), resting orders across all symbols | None |
 | `NATS_URL` | `level2`, `ticker`, `websocket` | `localhost` |
 | `QUESTDB_CONF` | `trade-reporter` | `http::addr=localhost:9000;` |
 | `WS_ADDR` | `websocket` | `127.0.0.1:8080` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `observer` | `http://localhost:4318` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `sbx-observer` | `http://localhost:4318` |
 | `RUST_LOG` | `matching-engine`, `api`, `trade-reporter` | `info` for `matching-engine` |
 
 Execution reports use Aeron multi-destination-cast (MDC), where subscribers register
@@ -168,7 +168,7 @@ with default settings on 2-CPU VMs.
 
 ## 5. Start auth, web and docs
 
-These need `scripts/sbx.py up` first, for Postgres.
+These need `tools/scripts/sbx.py up` first, for Postgres.
 
 ```sh
 # Auth on port 8001. Run from auth/.
@@ -202,16 +202,16 @@ baked in at build time, so set them for `npm run build` too.
 to the engine, and reports violations and crashed services. It exits non-zero on either.
 
 ```sh
-scripts/sbx.py verify --orders 20000 --rate 5000
+tools/scripts/sbx.py verify --orders 20000 --rate 5000
 ```
 
 Useful variations:
 
 ```sh
-scripts/sbx.py verify --orders 1000000                  # as fast as possible
-scripts/sbx.py verify --accounts 1                      # forces self-trade prevention
-scripts/sbx.py verify --without tr,level2,ticker        # isolate a bottleneck
-scripts/sbx.py verify --capture /tmp/run.jsonl          # keep every event
+tools/scripts/sbx.py verify --orders 1000000                  # as fast as possible
+tools/scripts/sbx.py verify --accounts 1                      # forces self-trade prevention
+tools/scripts/sbx.py verify --without tr,level2,ticker        # isolate a bottleneck
+tools/scripts/sbx.py verify --capture /tmp/run.jsonl          # keep every event
 ```
 
 To send one order by hand:
@@ -241,8 +241,8 @@ engine's first order. `sbx-check` needs to see the whole run.
 ## Observability
 
 ```sh
-scripts/sbx.py observe     # Grafana, Prometheus and an OTLP collector
-scripts/sbx.py up
+tools/scripts/sbx.py observe     # Grafana, Prometheus and an OTLP collector
+tools/scripts/sbx.py up
 ```
 
 Grafana is on <http://localhost:3000> and Prometheus on <http://localhost:9090>. On a
@@ -255,9 +255,9 @@ yet, so query metrics directly:
 | `sbx_filled_qty_total` | Filled quantity, counted for both sides of each trade |
 | `sbx_violations_total` | Invariant violations; this should stay at 0 |
 | `sbx_best_bid`, `sbx_best_ask`, `sbx_book_levels` | Book state |
-| `sbx_observer_lag_seconds` | Time from the engine stamping a report to `observer` reading it |
+| `sbx_observer_lag_seconds` | Time from the engine stamping a report to `sbx-observer` reading it |
 
-`matching-engine` has no telemetry code. `observer` derives everything from its execution reports,
+`matching-engine` has no telemetry code. `sbx-observer` derives everything from its execution reports,
 and currently keeps every order in memory, so it's a development tool for now.
 
 **Engine logging.** `RUST_LOG` sets the level in normal builds, defaulting to `info`.
@@ -272,23 +272,22 @@ startup about the static limit. Nothing is logged after that.
 
 ## Benchmarking
 
-`scripts/bench.py` plays a tape of packed SBE orders into a freshly started engine, on bare
-metal, in a release build with logging compiled out. Only the benchmark process
-is attached. Stop anything else that's busy first, including `scripts/sbx.py down`.
+`tools/scripts/bench.py` plays a tape of packed SBE orders into a freshly started engine, on bare
+metal, in a `dist` build with logging compiled out. Only the benchmark process is attached. Stop anything else that's busy first, including `tools/scripts/sbx.py down`.
 
 ```sh
-scripts/bench.py                                # all profiles and modes, 5 repeats
-scripts/bench.py --compare m4-mac-mini          # exit 1 on a regression
-scripts/bench.py --save-baseline NAME           # write bench/baselines/NAME.json
-scripts/bench.py --tape 100m --profile ipc --modes throughput --repeat 1
-scripts/bench.py --engine path/to/binary        # benchmark another build
+tools/scripts/bench.py                                # all profiles and modes, 5 repeats
+tools/scripts/bench.py --compare m4-mac-mini          # exit 1 on a regression
+tools/scripts/bench.py --save-baseline NAME           # write tools/bench/baselines/NAME.json
+tools/scripts/bench.py --tape 100m --max-orders 20000000 --profile ipc --modes throughput --repeat 1
+tools/scripts/bench.py --engine path/to/binary        # benchmark another build
 ```
 
 | Mode | Measures |
 |---|---|
 | `digest` | Hashes every report except timestamps, twice, and fails if they differ. Any change to the engine's behaviour changes this hash. |
 | `throughput` | Plays the tape as fast as the engine accepts it. |
-| `latency` | Sends 2M orders at a fixed rate and times each from its scheduled send to its `New` report, so a stall can't hide the queue behind it. |
+| `latency` | Sends 2M orders at a fixed rate and times each from its scheduled send to its first report, so a stall can't hide the queue behind it. |
 
 | Profile | Transport |
 |---|---|
@@ -300,19 +299,24 @@ latency rises more than 25%. A digest change isn't always wrong, but it means th
 output changed, so save a new baseline only if that was intended. Baselines only compare
 fairly on the same machine.
 
-Tapes live in `.run/tapes`, outside git. `bench/tapes.json` records each tape's generator
+Tapes live in `.run/tapes`, outside git. `tools/bench/tapes.json` records each tape's generator
 arguments and SHA-256, so identical bytes can be rebuilt (10M is 720 MB, 100M is 7.2 GB and
 takes about 13 seconds). A tape is 72-byte records end to end, with no header.
 
-Results on the M4 Mac mini, with the engine built as `dist` with `silent`:
+Results on the M4 Mac mini, on the `5m` tape with `MAX_ORDERS` at 1M:
 
 | Transport | Orders/sec | Reports/sec | p50 | p99 | p99.99 |
 |---|---|---|---|---|---|
-| `ipc` | 4.04M | 11.15M | 208ns | 1.5µs | 0.9ms |
-| `udp` | 0.73M | 2.00M | 14µs | 48µs | 1.7ms |
+| `ipc` | 3.87M | 10.69M | 250ns | 1.5µs | 8.6µs |
+| `udp` | 0.74M | 2.03M | 15µs | 45µs | 3.1ms |
 
-Latency is measured at 100K orders/sec. Throughput is the 10M tape, where each order creates
-about 2.76 reports; the 100M tape reached 3.72M orders/sec.
+Latency is measured at 100K orders/sec. Each order creates about 2.76 reports. The 100M tape
+reached 3.41M orders/sec in one run with `--max-orders 20000000`.
+
+`--max-orders` changes the result, so a baseline can only be compared with a run at the same
+setting, on the same tape. Throughput and latency runs fail if any order is rejected, because
+rejects skip matching and would inflate the score. Digest runs allow them, which means a
+digest belongs to one tape and one `--max-orders` value.
 
 `udp` throughput didn't change when the engine got faster, so something other than the engine
 limits it. That hasn't been investigated.
@@ -325,6 +329,37 @@ cargo build -p matching-engine --profile dist --features silent   # target/dist/
 
 The `dist` profile enables fat LTO. It's separate from `release` so normal rebuilds stay fast.
 
+## Capacity and shared markets
+
+One engine hosts every symbol by default. That's the simplest deployment and uses the least
+memory and CPU, but markets share two limits:
+
+- **Throughput.** The engine is single-threaded, so a busy market reduces what the others can
+  use.
+- **`MAX_ORDERS`.** It counts resting orders across all symbols. A market that fills the book
+  causes rejects for every market on that engine.
+
+The engine doesn't police either one. It has no validation by design, so limits per market
+belong in `api`.
+
+`MAX_ORDERS` sets the memory budget, which the engine reserves and touches at boot, so a
+machine that's too small fails at startup instead of while matching. A full book rejects new
+orders and keeps running.
+
+| `MAX_ORDERS` | Memory at boot | Worst-case peak | Boot cost | Orders/sec (scratch run) |
+|---|---|---|---|---|
+| 1M (default) | 529 MB | 742 MB | 47ms | 3.85M |
+| 5M | 1.7 GB | 2.0 GB | 248ms | 3.65M |
+| 10M | 3.1 GB | 3.5 GB | 679ms | 3.55M |
+
+About 200 MB of each figure is Aeron's buffers. The worst case is every resting order at a
+unique price. Larger books are slower because they spread keys across more memory.
+
+New markets don't need a restart. The engine builds trees the first time it sees a symbol and
+never frees them, so enabling a market just means `api` starts accepting its product ID.
+Symbols cost little, but `api` must control which ones exist, and going past 65,536 symbols
+rehashes a map while matching.
+
 ## What doesn't work yet
 
 Confirmed with the tools above:
@@ -335,9 +370,10 @@ Confirmed with the tools above:
 
 Also known:
 
-- **Any symbol creates a market.** The API only checks that it's alphanumeric and at most 6
-  characters, and each new symbol allocates price levels that are never freed. Markets should
-  come from configuration.
+- **`api` accepts any symbol.** It only checks that it's alphanumeric and at most 6 characters.
+  It should only accept enabled markets, and it has no per-market order limits yet.
+- **The engine doesn't check prices.** `api` rejects non-positive prices but doesn't enforce a
+  tick size yet.
 
 - `trade-reporter` skips filled orders, because it only saves `New`, `PartiallyFilled` and `Canceled`.
 - `web`'s ticker expects `event.tickers`, but `websocket` sends every client `l2_data`.
@@ -347,21 +383,36 @@ Also known:
 - The API has no auth and invents a random account per order. It binds `0.0.0.0:8000`,
   and the Vite dev servers also bind `0.0.0.0`, so they're reachable from your LAN.
 
+## Future work
+
+- **Choose how many symbols share an engine.** Let operators reduce the symbols on an engine, or
+  give a heavy market its own. This needs a routing table in `api` that maps each symbol to an
+  engine's stream, plus per-engine channels in `tools/scripts/sbx.py`. The engine itself shouldn't
+  need to change, because it matches whatever arrives. It costs at least one more CPU core per
+  engine.
+- **Per-market limits in `api`,** so one market can't fill a shared book.
+- **Per-player rate limits in `api`,** kept in Valkey, with defaults that game owners can override.
+- **Gateway selection.** Decide how game servers pick a gateway: geo, latency tables or round robin.
+- **Aeron Archive and replay.** Replaying input should rebuild the book, and replaying output
+  into `level2` would test it offline. Timestamps will differ, because the engine stamps them
+  when it receives each message.
+- **Stop `level2` silently dropping updates.** It discards them when its queue is full.
+
 ## Resource use
 
 `matching-engine`, `level2`, `ticker` and `trade-reporter` poll in a tight loop, so each uses a full CPU core
-even when idle. `observer`, `sbx-check` and `sbx-book` sleep when idle.
+even when idle. `sbx-observer`, `sbx-check` and `sbx-book` sleep when idle.
 
 ## Regenerating SBE codecs
 
-Only needed after changing `messages.xml`. Not run during this setup, and it needs Java.
+Only needed after changing `crates/sbe/messages.xml`. Not run during this setup, and it needs Java.
 
 ```sh
 git clone https://github.com/aeron-io/simple-binary-encoding.git
 cd simple-binary-encoding
 ./gradlew clean assemble
 java -Dsbe.target.language=Rust -Dsbe.output.dir=<output dir> \
-  -jar sbe-all/build/libs/sbe-all-<version>.jar ../sbx/messages.xml
+  -jar sbe-all/build/libs/sbe-all-<version>.jar ../sbx/crates/sbe/messages.xml
 ```
 
 Check how the output path maps onto `sbe/src/` before overwriting anything. The version

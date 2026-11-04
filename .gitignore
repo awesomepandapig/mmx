@@ -3,6 +3,10 @@
 
 tests/
 transparent_listener/
-old/
 target/
 .run/
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+tools/bench/ec2/hosts.json

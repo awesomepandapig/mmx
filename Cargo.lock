@@ -103,6 +103,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "cluster",
  "env_logger",
  "log",
  "sbe",
@@ -351,6 +352,14 @@ dependencies = [
  "glob",
  "libc",
  "libloading",
+]
+
+[[package]]
+name = "cluster"
+version = "0.1.0"
+dependencies = [
+ "rusteron-archive",
+ "rusteron-client",
 ]
 
 [[package]]
@@ -1140,6 +1149,7 @@ dependencies = [
 name = "matching-engine"
 version = "0.1.0"
 dependencies = [
+ "cluster",
  "foldhash",
  "priority-queue",
  "sbe",
@@ -1259,17 +1269,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "observer"
-version = "0.1.0"
-dependencies = [
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "tools",
- "transport",
 ]
 
 [[package]]
@@ -1770,6 +1769,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rusteron-archive"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77e4a440033bb554592d9d4431cee0f44f5c5beca694b84a9e2537b5f324ff7d"
+dependencies = [
+ "bindgen",
+ "cmake",
+ "dunce",
+ "log",
+ "pkg-config",
+ "proc-macro2",
+ "regex",
+ "rusteron-code-gen",
+ "walkdir",
 ]
 
 [[package]]
@@ -2419,6 +2435,11 @@ dependencies = [
 name = "tools"
 version = "0.1.0"
 dependencies = [
+ "cluster",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "rusteron-archive",
  "sbe",
  "serde",
  "serde_json",
@@ -2670,6 +2691,7 @@ checksum = "3cf4199d1e5d15ddd86a694e4d0dffa9c323ce759fea589f00fef9d81cc1931d"
 dependencies = [
  "getrandom 0.3.3",
  "js-sys",
+ "serde",
  "wasm-bindgen",
 ]
 
