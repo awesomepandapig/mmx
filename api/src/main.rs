@@ -1,7 +1,5 @@
 mod aeron_handler;
-use aeron_handler::{build_context, create_publication, get_aeron_dir, unwrap_publication};
-
-use aeron_rs::publication::Publication;
+use aeron_handler::{OrderSender, spawn_order_publisher};
 
 mod order;
 
@@ -10,20 +8,15 @@ use routes::{get_order, post_order};
 
 mod errors;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
-
-use aeron_rs::aeron::Aeron;
-use aeron_rs::concurrent::atomic_buffer::{AlignedBuffer, AtomicBuffer};
-use aeron_rs::concurrent::status::status_indicator_reader::channel_status_to_str;
 
 use axum::{Router, routing::get};
 
 use log::{error, info};
 
 pub struct AppState {
-    publication: Publication,
-    buffer: AtomicBuffer,
+    orders: OrderSender,
 }
 
 #[tokio::main]
@@ -32,33 +25,20 @@ async fn main() {
 
     let start_time = Instant::now();
 
-    let aeron_dir = get_aeron_dir();
-    info!("Aeron: Using directory: {:?}", aeron_dir);
+    info!("Aeron: Using directory: {:?}", transport::aeron_dir());
 
-    let context = build_context(&aeron_dir);
-    let mut aeron = match Aeron::new(context) {
-        Ok(a) => {
-            info!("Aeron: Instance created");
-            a
-        }
+    let channel = transport::env_or("PUB_CHANNEL", transport::ORDERS_CHANNEL);
+    let stream_id = transport::stream_id_or("PUB_STREAM_ID", transport::ORDERS_STREAM);
+
+    let orders = match spawn_order_publisher(&channel, stream_id) {
+        Ok(orders) => orders,
         Err(e) => {
-            error!("Aeron: Failed to create instance: {:?}", e);
+            error!("Aeron: Failed to create publication: {}", e);
             return;
         }
     };
 
-    let wrapped_publication = create_publication(&mut aeron, "aeron:udp?endpoint=localhost:40123", 1001);
-    let publication = unwrap_publication(wrapped_publication);
-
-    let pub_status = publication.channel_status();
-    info!("Aeron: Publication {}", channel_status_to_str(pub_status));
-
-    let aligned_buffer = AlignedBuffer::with_capacity(72);
-
-    let shared_state = Arc::new(AppState {
-        publication,
-        buffer: AtomicBuffer::from_aligned(&aligned_buffer),
-    });
+    let shared_state = Arc::new(AppState { orders });
 
     let app = Router::new().route(
         "/api/v1/orders",

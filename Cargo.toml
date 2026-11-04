@@ -1,18 +1,22 @@
 [workspace]
 members = [
     "sbe",
+    "transport",
+    "tools",
+    "observer",
     "api",
-    "me",
-    "md/level2",
-    "md/ticker",
-    "ws",
-    "tr",
+    "matching-engine",
+    "market-data/level2",
+    "market-data/ticker",
+    "websocket",
+    "trade-reporter",
 ]
 
 resolver = "3"
 
 [workspace.dependencies]
 sbe = { path = "sbe" }
+transport = { path = "transport" }
 
 [workspace.package]
 edition = "2024"

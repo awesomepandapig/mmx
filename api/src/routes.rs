@@ -1,4 +1,5 @@
 use super::AppState;
+use super::aeron_handler::OutboundOrder;
 use super::errors::AppError;
 use super::order::{Order, SymbolType, UuidType, create_order_buffer};
 
@@ -11,7 +12,7 @@ use sbe::{ord_type_enum::OrdTypeEnum, side_enum::SideEnum};
 
 use serde::Deserialize;
 
-use super::order::MESSAGE_SIZE;
+use tokio::sync::oneshot;
 
 use uuid::Uuid;
 
@@ -158,21 +159,23 @@ pub async fn post_order(
         parsed_input.price_mantissa,
     );
 
-    state.buffer.put_bytes(0, &order_buffer);
+    let (published, result) = oneshot::channel();
 
-    let result = state
-        .publication
-        .offer_part(state.buffer, 0, MESSAGE_SIZE as i32);
+    state
+        .orders
+        .send(OutboundOrder { message: order_buffer, published })
+        .await
+        .map_err(|_| AppError::InternalServerError("Order publisher stopped".to_string()))?;
 
-    match result {
-        Ok(_code) => {
-            timestamp_ns = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map_err(|e| AppError::InternalServerError(format!("Failed to get system time: {}", e)))?
-                .as_nanos() as u64;
-        }
-        Err(err) => println!("Offer with error: {}", err),
-    }
+    result
+        .await
+        .map_err(|_| AppError::InternalServerError("Order publisher stopped".to_string()))?
+        .map_err(|e| AppError::InternalServerError(format!("Failed to publish order: {}", e)))?;
+
+    timestamp_ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| AppError::InternalServerError(format!("Failed to get system time: {}", e)))?
+        .as_nanos() as u64;
 
     let order = Order::from_buffer(
         parsed_input.cl_ord_id,

@@ -1,111 +1,79 @@
-use std::env;
-use std::ffi::CString;
-use std::sync::{Arc, Mutex};
-use std::thread::yield_now;
-use std::process;
+use super::order::MESSAGE_SIZE;
 
-use aeron_rs::aeron::Aeron;
-use aeron_rs::context::Context;
-use aeron_rs::publication::Publication;
-use aeron_rs::utils::errors::AeronError;
+use std::hint::spin_loop;
+use std::sync::mpsc as std_mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use log::{info, error};
+use log::{error, info};
 
-pub fn get_aeron_dir() -> String {
-    env::var("AERON_DIR").unwrap_or_else(|_| {
-        #[cfg(target_os = "macos")]
-        return "/Volumes/DevShm/aeron".to_string();
+use tokio::sync::{mpsc, oneshot};
 
-        #[cfg(target_os = "linux")]
-        return "/dev/shm/aeron".to_string();
+use transport::{AeronExclusivePublication, AeronOfferError};
 
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        panic!(
-            "AERON_DIR not set and no default available for this OS ({})",
-            env::consts::OS
-        );
-    })
+const ORDER_QUEUE_LENGTH: usize = 1024;
+const BACK_PRESSURE_TIMEOUT: Duration = Duration::from_millis(100);
+
+pub struct OutboundOrder {
+    pub message: [u8; MESSAGE_SIZE],
+    pub published: oneshot::Sender<Result<(), String>>,
 }
 
-pub fn build_context(aeron_dir: &str) -> Context {
-    let mut context = Context::new();
+pub type OrderSender = mpsc::Sender<OutboundOrder>;
 
-    context.set_aeron_dir(aeron_dir.to_string());
-    context.set_new_publication_handler(Box::new(on_new_publication_handler));
-    context.set_new_subscription_handler(Box::new(on_new_subscription_handler));
-    context.set_error_handler(Box::new(error_handler));
-    context.set_pre_touch_mapped_memory(true);
-
-    context
+fn error_handler(code: i32, message: &str) {
+    error!("Aeron: Error {}: {}", code, message);
 }
 
-pub fn create_publication(
-    aeron: &mut Aeron,
-    channel: &str,
-    stream_id: i32,
-) -> Arc<Mutex<Publication>> {
-    let publication_id = aeron
-        .add_publication(str_to_c(channel), stream_id)
-        .expect("Error adding publication");
+fn offer(publication: &AeronExclusivePublication, message: &[u8]) -> Result<(), String> {
+    let start = Instant::now();
 
     loop {
-        if let Ok(publication) = aeron.find_publication(publication_id) {
-            return publication;
+        match publication.offer(message) {
+            Ok(_) => return Ok(()),
+            Err(AeronOfferError::BackPressured | AeronOfferError::AdminAction)
+                if start.elapsed() < BACK_PRESSURE_TIMEOUT =>
+            {
+                spin_loop();
+            }
+            Err(err) => return Err(err.to_string()),
         }
-        yield_now();
     }
 }
 
-fn str_to_c(val: &str) -> CString {
-    CString::new(val).expect("Error converting str to CString")
-}
+/// Aeron handles can't leave the thread that created them, so one thread owns the client and
+/// request handlers queue their orders to it.
+pub fn spawn_order_publisher(channel: &str, stream_id: i32) -> Result<OrderSender, String> {
+    let channel = channel.to_string();
+    let (orders, mut pending) = mpsc::channel::<OutboundOrder>(ORDER_QUEUE_LENGTH);
+    let (started, startup) = std_mpsc::channel();
 
-fn error_handler(error: AeronError) {
-    println!("Error: {:?}", error);
-}
+    thread::Builder::new()
+        .name("order-publisher".to_string())
+        .spawn(move || {
+            let client = transport::connect(error_handler).and_then(|aeron| {
+                let publication = transport::exclusive_publication(&aeron, &channel, stream_id)?;
+                Ok((aeron, publication))
+            });
 
-fn on_new_publication_handler(
-    channel: CString,
-    stream_id: i32,
-    session_id: i32,
-    correlation_id: i64,
-) {
-    info!(
-        "Aeron: Created Subscription — Channel: {}, StreamID: {}, SessionID: {}, CorrelationID: {}",
-        channel.to_str().unwrap(),
-        stream_id,
-        session_id,
-        correlation_id
-    );
-}
+            let (_aeron, publication) = match client {
+                Ok(client) => {
+                    let _ = started.send(Ok(()));
+                    client
+                }
+                Err(err) => {
+                    let _ = started.send(Err(format!("{err:?}")));
+                    return;
+                }
+            };
+            info!("Aeron: Created publication {} on stream {}", channel, stream_id);
 
-fn on_new_subscription_handler(channel: CString, stream_id: i32, correlation_id: i64) {
-    info!(
-        "Aeron: Created Subscription — Channel: {}, StreamID: {}, CorrelationID: {}",
-        channel.to_str().unwrap(),
-        stream_id,
-        correlation_id
-    );
-}
+            while let Some(order) = pending.blocking_recv() {
+                let _ = order.published.send(offer(&publication, &order.message));
+            }
+        })
+        .map_err(|err| err.to_string())?;
 
-
-pub fn unwrap_publication(
-    wrapped_pub: Arc<Mutex<Publication>>,
-) -> Publication {
-    // Attempt to get the Mutex out of the Arc.
-    // This will only succeed if the strong count is 1.
-    let mutex = Arc::try_unwrap(wrapped_pub).unwrap_or_else(|_| {
-        error!("Could not unwrap Arc for Publication, still has multiple owners. This should not happen in the matching engine. Exiting.");
-        process::exit(1);
-    });
-
-    // Get the Publication out of the Mutex.
-    // This consumes the mutex, returning the inner data.
-    mutex.into_inner().unwrap_or_else(|poison_err| {
-        error!(
-            "Mutex for Publication is poisoned. Exiting. Error: {}",
-            poison_err
-        );
-        process::exit(1);
-    })
+    startup.recv().map_err(|err| err.to_string())??;
+    Ok(orders)
 }
