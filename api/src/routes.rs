@@ -57,6 +57,13 @@ fn parse_and_validate_order_payload(payload: &CreateOrder) -> Result<ParsedOrder
             payload.product_id
         )));
     }
+    // Symbols become NATS subjects downstream, so they can't contain separators.
+    if !symbol_str.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Err(AppError::ValidationError(format!(
+            "Product ID '{}' is invalid. It must be alphanumeric.",
+            payload.product_id
+        )));
+    }
     symbol[..symbol_str.len()].copy_from_slice(symbol_str.as_bytes());
 
     // --- Side Validation ---

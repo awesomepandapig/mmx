@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Reproducible matching engine benchmark.
 
-Plays a deterministic tape of SBE orders into a freshly started engine, on bare metal.
+Plays a deterministic tape of SBE orders into a freshly started `dist` build of the engine, on
+bare metal.
 
     scripts/bench.py                         run everything, print a summary
     scripts/bench.py --save-baseline NAME    also save the results as bench/baselines/NAME.json
@@ -28,7 +29,7 @@ BENCH = ROOT / "bench"
 TAPES = ROOT / ".run" / "tapes"
 RESULTS = ROOT / ".run" / "bench"
 TOOLS = ROOT / "target" / "release"
-ENGINE = ROOT / "target" / "bench" / "release" / "matching-engine"
+ENGINE = ROOT / "target" / "dist" / "matching-engine"
 IS_MAC = platform.system() == "Darwin"
 AERON_DIR = "/Volumes/DevShm/aeron-bench" if IS_MAC else "/dev/shm/aeron-bench"
 AERON_BIN = Path(os.environ.get("AERON_BIN", Path.home() / "Projects/aeron/cppbuild/Release/binaries"))
@@ -59,8 +60,7 @@ def run(command, **kwargs):
 
 def build():
     run(["cargo", "build", "--release", "-p", "tools"])
-    run(["cargo", "build", "-p", "matching-engine", "--release", "--features", "silent",
-         "--target-dir", "target/bench"])
+    run(["cargo", "build", "-p", "matching-engine", "--profile", "dist", "--features", "silent"])
 
 
 def ensure_tape(name):

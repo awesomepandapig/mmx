@@ -76,6 +76,7 @@ impl Handler {
 
     #[inline(always)]
     pub fn process_new_order(&mut self, header_decoder: MessageHeaderDecoder<ReadBuf<'_>>) {
+        self.publisher.stamp_transact_time();
         let mut order = self.process_new_order_decode(header_decoder);
 
         if self.book.is_full() {
@@ -103,8 +104,9 @@ impl Handler {
 
     #[inline(always)]
     pub fn process_cancel_order(&mut self, header_decoder: MessageHeaderDecoder<ReadBuf<'_>>) {
+        self.publisher.stamp_transact_time();
         let request = self.process_cancel_order_decode(header_decoder);
-        let order_key = (request.account, request.client_order_id);
+        let order_key = (request.account, request.original_client_order_id);
 
         if !self.book.order_key_map.contains_key(&order_key) {
             self.publish_cancel_reject(
@@ -164,8 +166,6 @@ impl Handler {
         let decoder: OrderCancelRequestDecoder<'_> =
             OrderCancelRequestDecoder::default().header(header_decoder, 0);
 
-        self.counter_order_id += 1;
-
         CancelRequest {
             original_client_order_id: {
                 let id = decoder.orig_cl_ord_id();
@@ -219,7 +219,7 @@ impl Handler {
     fn handle_limit_order<S: SideSpecificContext>(&mut self, aggressor_order: &mut Order) {
         while aggressor_order.leaves_quantity > 0 {
             // Get the best price level
-            let Some(mut resting_order) = S::get_best_opposite(&mut self.book) else {
+            let Some(mut resting_order) = S::get_best_opposite(&mut self.book, &aggressor_order.symbol) else {
                 break; // No orders on opposite side
             };
 
@@ -275,7 +275,7 @@ impl Handler {
     fn handle_market_order<S: SideSpecificContext>(&mut self, aggressor_order: &mut Order) {
         while aggressor_order.leaves_quantity > 0 {
             // Get the best price level
-            let Some(mut resting_order) = S::get_best_opposite(&mut self.book) else {
+            let Some(mut resting_order) = S::get_best_opposite(&mut self.book, &aggressor_order.symbol) else {
                 // No orders on opposite side
                 self.publish_cancel(aggressor_order);
                 return;

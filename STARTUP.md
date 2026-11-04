@@ -153,7 +153,7 @@ book in memory, so start them before the first order, and restart them with `mat
 | `AERON_DIR` | All Aeron services | `/Volumes/DevShm/aeron` on macOS, `/dev/shm/aeron` on Linux |
 | `SUB_CHANNEL`, `SUB_STREAM_ID` | `matching-engine` (required), `level2`, `ticker`, `trade-reporter` | See `transport/src/lib.rs` |
 | `PUB_CHANNEL`, `PUB_STREAM_ID` | `matching-engine` (required), `api` | See `transport/src/lib.rs` |
-| `MAX_ORDERS` | `matching-engine` (required) | None |
+| `MAX_ORDERS` | `matching-engine` (required), resting orders across all symbols | None |
 | `NATS_URL` | `level2`, `ticker`, `websocket` | `localhost` |
 | `QUESTDB_CONF` | `trade-reporter` | `http::addr=localhost:9000;` |
 | `WS_ADDR` | `websocket` | `127.0.0.1:8080` |
@@ -304,45 +304,46 @@ Tapes live in `.run/tapes`, outside git. `bench/tapes.json` records each tape's 
 arguments and SHA-256, so identical bytes can be rebuilt (10M is 720 MB, 100M is 7.2 GB and
 takes about 13 seconds). A tape is 72-byte records end to end, with no header.
 
-Results on the M4 Mac mini, at commit `3c8ef95` plus benchmark tooling:
+Results on the M4 Mac mini, with the engine built as `dist` with `silent`:
 
-| Build, `ipc`, 10M tape | Orders/sec | Change |
-|---|---|---|
-| Current engine | 3.05M | |
-| Without per-order latency timing | 3.17M | +4% |
-| Also one clock read per order, not per report | 3.27M | +7% |
-| Also a fast hash instead of SipHash | 3.93M | +29% |
-| Also fat LTO and one codegen unit | 4.14M | +36% |
+| Transport | Orders/sec | Reports/sec | p50 | p99 | p99.99 |
+|---|---|---|---|---|---|
+| `ipc` | 4.04M | 11.15M | 208ns | 1.5µs | 0.9ms |
+| `udp` | 0.73M | 2.00M | 14µs | 48µs | 1.7ms |
 
-Rows below the first were scratch builds and aren't in the repo. All produced the same
-digest. Each order creates about 2.76 reports, so 3.05M orders/sec is 8.43M reports/sec.
-Current engine on `udp`: 0.78M orders/sec. At 100K orders/sec on `ipc`, p50 is 250ns,
-p99 1.5µs and p99.99 2ms; on `udp`, p50 is 15µs, p99 47µs and p99.99 3.2ms. On the 100M tape,
-the current engine reached 2.68M orders/sec (one run).
+Latency is measured at 100K orders/sec. Throughput is the 10M tape, where each order creates
+about 2.76 reports; the 100M tape reached 3.72M orders/sec.
+
+`udp` throughput didn't change when the engine got faster, so something other than the engine
+limits it. That hasn't been investigated.
+
+Deployed builds of the engine should match the benchmark:
+
+```sh
+cargo build -p matching-engine --profile dist --features silent   # target/dist/matching-engine
+```
+
+The `dist` profile enables fat LTO. It's separate from `release` so normal rebuilds stay fast.
 
 ## What doesn't work yet
 
 Confirmed with the tools above:
 
-- **Any rejected cancel crashes `level2` and `ticker`.** They panic on template 4, and
-  every cancel is rejected, because `matching-engine` looks up the wrong ID (`matching-engine/src/handler.rs:109`).
-- **`matching-engine` has one book for all symbols.** `JSP` orders trade against `OTHER` orders.
 - **Subscribers slow the engine.** 1M orders at full speed reached about 151K orders/sec
   with every service, and 585K with only the checker. Each order produces about 2.7
   reports, and that run used a shared-mode driver with logging on.
 
-Found by reading the code, not yet reproduced:
-
-- **`matching-engine` spends an order ID on each cancel request,** so `level2`'s sequence check fails
-  on the next order, even if template 4 is handled.
-- **`level2` removes a whole price level on cancel,** even with other orders resting.
-
 Also known:
+
+- **Any symbol creates a market.** The API only checks that it's alphanumeric and at most 6
+  characters, and each new symbol allocates price levels that are never freed. Markets should
+  come from configuration.
 
 - `trade-reporter` skips filled orders, because it only saves `New`, `PartiallyFilled` and `Canceled`.
 - `web`'s ticker expects `event.tickers`, but `websocket` sends every client `l2_data`.
 - `websocket` doesn't complete the WebSocket close, so clients that wait for it hang.
-- `GET /api/v1/orders` does nothing, and there's no cancel route.
+- `GET /api/v1/orders` does nothing, and there's no cancel route. The engine cancels correctly,
+  but a cancel must name the owning account, and the API has no auth to establish one.
 - The API has no auth and invents a random account per order. It binds `0.0.0.0:8000`,
   and the Vite dev servers also bind `0.0.0.0`, so they're reachable from your LAN.
 

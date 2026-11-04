@@ -8,7 +8,6 @@ use sbe::side_enum::SideEnum;
 pub struct OrderBook {
     pub bids: BTreeMap<i64, i64>,
     pub asks: BTreeMap<i64, i64>,
-    pub last_seen_id: u64,
 }
 
 impl OrderBook {
@@ -16,7 +15,6 @@ impl OrderBook {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            last_seen_id: 0,
         }
     }
 
@@ -68,16 +66,6 @@ impl OrderBook {
                     price
                 );
 
-                // Assumption: The 'leaves_qty' from the report should match our calculation.
-                debug_assert_eq!(
-                    current_quantity_at_level - report.last_qty,
-                    report.leaves_qty,
-                    "CRITICAL: Mismatch in remaining quantity calculation. Book: {} - Fill: {} != Leaves: {}",
-                    current_quantity_at_level,
-                    report.last_qty,
-                    report.leaves_qty
-                );
-
                 let quantity = entry.get_mut();
                 *quantity -= report.last_qty;
                 if *quantity == 0 {
@@ -105,18 +93,25 @@ impl OrderBook {
         let price = report.price;
 
         match map.entry(price) {
-            Entry::Occupied(entry) => {
-                let current_quantity_at_level = *entry.get();
+            Entry::Occupied(mut entry) => {
                 let quantity_to_remove = report.leaves_qty;
 
-                debug_assert_eq!(
-                    current_quantity_at_level, quantity_to_remove,
-                    "CRITICAL: Canceled order quantity mismatch. Book has {}, report says cancel {}",
-                    current_quantity_at_level, quantity_to_remove
+                assert!(
+                    *entry.get() >= quantity_to_remove,
+                    "CRITICAL: Canceled {} at price {} but only {} is available",
+                    quantity_to_remove,
+                    price,
+                    entry.get()
                 );
 
-                entry.remove();
-                0
+                let quantity = entry.get_mut();
+                *quantity -= quantity_to_remove;
+                if *quantity == 0 {
+                    entry.remove();
+                    0
+                } else {
+                    *quantity
+                }
             }
             Entry::Vacant(_) => {
                 panic!(

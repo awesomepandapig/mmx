@@ -29,6 +29,10 @@ pub struct ExecutionReportMessage {
     pub side: SideEnum,
 }
 
+pub fn symbol_name(symbol: &SymbolType) -> String {
+    String::from_utf8_lossy(symbol).trim_end_matches('\0').to_string()
+}
+
 pub fn decode_execution_report(
     header_decoder: MessageHeaderDecoder<ReadBuf<'_>>,
 ) -> ExecutionReportMessage {

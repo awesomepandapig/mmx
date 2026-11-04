@@ -9,6 +9,7 @@
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
@@ -96,15 +97,18 @@ fn main() {
             filled.add((stats.filled_qty - last.filled_qty) as f64 / SCALE as f64, &[]);
             violations.add(checker.violation_count - last_violations, &[]);
 
-            if let Some(price) = checker.best_bid() {
-                best_bid.record(price as f64 / SCALE as f64, &[]);
+            for name in checker.symbols() {
+                let symbol = [KeyValue::new("symbol", name.clone())];
+                if let Some(price) = checker.best_bid(&name) {
+                    best_bid.record(price as f64 / SCALE as f64, &symbol);
+                }
+                if let Some(price) = checker.best_ask(&name) {
+                    best_ask.record(price as f64 / SCALE as f64, &symbol);
+                }
+                let levels = checker.top_of_book(&name, Side::Buy, usize::MAX).len()
+                    + checker.top_of_book(&name, Side::Sell, usize::MAX).len();
+                depth.record(levels as u64, &symbol);
             }
-            if let Some(price) = checker.best_ask() {
-                best_ask.record(price as f64 / SCALE as f64, &[]);
-            }
-            let levels = checker.top_of_book(Side::Buy, usize::MAX).len()
-                + checker.top_of_book(Side::Sell, usize::MAX).len();
-            depth.record(levels as u64, &[]);
 
             last = stats.clone();
             last_violations = checker.violation_count;

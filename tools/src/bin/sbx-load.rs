@@ -106,7 +106,7 @@ fn main() {
         let symbol = symbols[rng.below(symbols.len() as u64) as usize];
 
         if !sent.is_empty() && rng.below(100) < cancel_pct {
-            let (orig_cl_ord_id, account, side): ([u64; 2], [u64; 2], SideEnum) =
+            let (orig_cl_ord_id, account, side, symbol): ([u64; 2], [u64; 2], SideEnum, [u8; 6]) =
                 sent[rng.below(sent.len() as u64) as usize];
             encode_cancel(
                 &CancelOrder {
@@ -142,7 +142,7 @@ fn main() {
             &mut new_order,
         );
         back_pressured += send(&publication, &new_order);
-        sent.push((cl_ord_id, account, side));
+        sent.push((cl_ord_id, account, side, symbol));
     }
 
     let elapsed = started.elapsed().as_secs_f64();

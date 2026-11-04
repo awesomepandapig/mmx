@@ -25,13 +25,16 @@ fn render(checker: &Checker, depth: usize, rate: f64) -> String {
         stats.orders, stats.trades, stats.canceled, stats.rejected, rate, checker.violation_count
     );
 
-    out += &format!("{:>14} {:>14} {:>7}\n", "PRICE", "QTY", "ORDERS");
-    for (price, size, orders) in checker.top_of_book(Side::Sell, depth).iter().rev() {
-        out += &format!("{:>14} {:>14} {orders:>7}  ask\n", format_decimal(*price), qty(*size));
-    }
-    out += "  ------------------------------------\n";
-    for (price, size, orders) in checker.top_of_book(Side::Buy, depth) {
-        out += &format!("{:>14} {:>14} {orders:>7}  bid\n", format_decimal(price), qty(size));
+    for symbol in checker.symbols() {
+        out += &format!("{symbol}\n{:>14} {:>14} {:>7}\n", "PRICE", "QTY", "ORDERS");
+        for (price, size, orders) in checker.top_of_book(&symbol, Side::Sell, depth).iter().rev() {
+            out += &format!("{:>14} {:>14} {orders:>7}  ask\n", format_decimal(*price), qty(*size));
+        }
+        out += "  ------------------------------------\n";
+        for (price, size, orders) in checker.top_of_book(&symbol, Side::Buy, depth) {
+            out += &format!("{:>14} {:>14} {orders:>7}  bid\n", format_decimal(price), qty(size));
+        }
+        out += "\n";
     }
 
     for violation in checker.violations.iter().take(5) {

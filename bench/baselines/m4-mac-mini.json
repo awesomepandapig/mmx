@@ -1,33 +1,33 @@
 {
   "tape": "10m",
   "environment": {
-    "commit": "3c8ef95",
+    "commit": "a6cb337",
     "dirty": true,
     "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
     "cpu": "Apple M4",
     "os": "macOS-26.3.1-arm64-arm-64bit",
-    "engine": "/Users/theaw/Projects/sbx/target/bench/release/matching-engine",
-    "load_before": 1.84,
-    "date": "2026-11-04T04:44:30+00:00"
+    "engine": "/Users/theaw/Projects/sbx/target/dist/matching-engine",
+    "load_before": 3.22,
+    "date": "2026-11-04T06:03:53+00:00"
   },
   "profiles": {
     "ipc": {
       "digest": "e4fee401f4acfeae",
       "reports": 27605632,
       "throughput": {
-        "orders_per_second": 3053633.5232930346,
-        "best": 3055092.171310516,
-        "worst": 3032718.5989381354,
-        "reports_per_second": 8429748.330689093,
+        "orders_per_second": 4037740.8313850015,
+        "best": 4052126.556016598,
+        "worst": 3998809.287354694,
+        "reports_per_second": 11146438.75025884,
         "reports": 27605632
       },
       "latency_ns": {
-        "p50": 250,
-        "p90": 292,
-        "p99": 1500,
-        "p99_9": 5542,
-        "p99_99": 1988250,
-        "max": 3893958
+        "p50": 208,
+        "p90": 291,
+        "p99": 1458,
+        "p99_9": 4292,
+        "p99_99": 887625,
+        "max": 2148375
       },
       "latency_rate": 100000
     },
@@ -35,19 +35,19 @@
       "digest": "e4fee401f4acfeae",
       "reports": 27605632,
       "throughput": {
-        "orders_per_second": 778538.6251940179,
-        "best": 780199.2808206199,
-        "worst": 774932.8693013821,
-        "reports_per_second": 2149205.078489199,
+        "orders_per_second": 725302.094668823,
+        "best": 729260.3174638139,
+        "worst": 723247.9401696335,
+        "reports_per_second": 2002242.2714256686,
         "reports": 27605632
       },
       "latency_ns": {
-        "p50": 14583,
-        "p90": 32208,
-        "p99": 47333,
-        "p99_9": 96750,
-        "p99_99": 3237292,
-        "max": 4428500
+        "p50": 14458,
+        "p90": 29792,
+        "p99": 47958,
+        "p99_9": 95417,
+        "p99_99": 1669958,
+        "max": 3364750
       },
       "latency_rate": 100000
     }

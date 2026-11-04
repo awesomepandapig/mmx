@@ -1,9 +1,12 @@
-use crate::types::{Order, OrderKey};
+use crate::types::{Order, OrderKey, SymbolType};
 
 use slab::Slab;
-use std::collections::{BTreeSet, HashMap};
+use foldhash::{HashMap, HashMapExt};
+use std::collections::BTreeSet;
 
 use sbe::side_enum::SideEnum;
+
+const PRICE_LEVEL_CAPACITY: usize = 1024;
 
 pub struct Limit {
     head_order_idx: Option<usize>,
@@ -19,13 +22,30 @@ impl Limit {
     }
 }
 
-pub struct OrderBook {
-    pub pool: Slab<Order>,
-    pub order_key_map: HashMap<OrderKey, usize>,
+/// The price levels of one symbol.
+pub struct Levels {
     pub bids_price_tree: BTreeSet<i64>,
     pub asks_price_tree: BTreeSet<i64>,
     pub bids_price_map: HashMap<i64, Limit>,
     pub asks_price_map: HashMap<i64, Limit>,
+}
+
+impl Levels {
+    fn new() -> Self {
+        Self {
+            bids_price_tree: BTreeSet::new(),
+            asks_price_tree: BTreeSet::new(),
+            bids_price_map: HashMap::with_capacity(PRICE_LEVEL_CAPACITY),
+            asks_price_map: HashMap::with_capacity(PRICE_LEVEL_CAPACITY),
+        }
+    }
+}
+
+/// All symbols share one order pool and key map, so `capacity` bounds the whole engine.
+pub struct OrderBook {
+    pub pool: Slab<Order>,
+    pub order_key_map: HashMap<OrderKey, usize>,
+    pub levels: HashMap<SymbolType, Levels>,
 }
 
 impl OrderBook {
@@ -33,10 +53,7 @@ impl OrderBook {
         Self {
             pool: Slab::with_capacity(capacity),
             order_key_map: HashMap::new(),
-            bids_price_tree: BTreeSet::new(),
-            asks_price_tree: BTreeSet::new(),
-            bids_price_map: HashMap::with_capacity(capacity / 10),
-            asks_price_map: HashMap::with_capacity(capacity / 10),
+            levels: HashMap::new(),
         }
     }
 
@@ -50,8 +67,9 @@ impl OrderBook {
 
         let order_idx = self.pool.insert(*order);
         self.order_key_map.insert(order_key, order_idx);
+        let levels = self.levels.entry(order.symbol).or_insert_with(Levels::new);
 
-        if let Some(limit) = self.bids_price_map.get_mut(&order.price) {
+        if let Some(limit) = levels.bids_price_map.get_mut(&order.price) {
             let tail_idx = limit
                 .tail_order_idx
                 .expect("Inconsistency: Existing limit cannot be empty"); // TODO: Handle error
@@ -62,8 +80,8 @@ impl OrderBook {
             let mut new_limit = Limit::new();
             new_limit.head_order_idx = Some(order_idx);
             new_limit.tail_order_idx = Some(order_idx);
-            self.bids_price_map.insert(order.price, new_limit);
-            self.bids_price_tree.insert(order.price);
+            levels.bids_price_map.insert(order.price, new_limit);
+            levels.bids_price_tree.insert(order.price);
         }
     }
 
@@ -72,8 +90,9 @@ impl OrderBook {
         let order_key = order.key();
         let order_idx = self.pool.insert(*order);
         self.order_key_map.insert(order_key, order_idx);
+        let levels = self.levels.entry(order.symbol).or_insert_with(Levels::new);
 
-        if let Some(limit) = self.asks_price_map.get_mut(&order.price) {
+        if let Some(limit) = levels.asks_price_map.get_mut(&order.price) {
             let tail_idx = limit
                 .tail_order_idx
                 .expect("Inconsistency: Existing limit cannot be empty"); // TODO: Handle error
@@ -84,8 +103,8 @@ impl OrderBook {
             let mut new_limit = Limit::new();
             new_limit.head_order_idx = Some(order_idx);
             new_limit.tail_order_idx = Some(order_idx);
-            self.asks_price_map.insert(order.price, new_limit);
-            self.asks_price_tree.insert(order.price);
+            levels.asks_price_map.insert(order.price, new_limit);
+            levels.asks_price_tree.insert(order.price);
         }
     }
 
@@ -100,10 +119,14 @@ impl OrderBook {
         let order = self.pool.remove(order_idx);
 
         // Get appropriate structs based on side
+        let levels = self
+            .levels
+            .get_mut(&order.symbol)
+            .expect("Data inconsistency: no levels for a resting order's symbol"); // TODO: Handle error
         let (price_map, tree) = if order.side == SideEnum::Buy {
-            (&mut self.bids_price_map, &mut self.bids_price_tree)
+            (&mut levels.bids_price_map, &mut levels.bids_price_tree)
         } else {
-            (&mut self.asks_price_map, &mut self.asks_price_tree)
+            (&mut levels.asks_price_map, &mut levels.asks_price_tree)
         };
 
         let limit = price_map
@@ -141,9 +164,10 @@ impl OrderBook {
     /// Returns a mutable reference to the best bid order, if one exists.
     /// This allows for in-place modification of the order.
     /// # Time Complexity: O(log N)
-    pub fn best_bid(&mut self) -> Option<&mut Order> {
-        if let Some(&best_price) = self.bids_price_tree.last() {
-            let head_idx = self
+    pub fn best_bid(&mut self, symbol: &SymbolType) -> Option<&mut Order> {
+        let levels = self.levels.get(symbol)?;
+        if let Some(&best_price) = levels.bids_price_tree.last() {
+            let head_idx = levels
                 .bids_price_map
                 .get(&best_price)
                 .expect("Inconsistency: sorted_prices has a price that price_map does not") // TODO: Handle error
@@ -159,9 +183,10 @@ impl OrderBook {
     /// Returns a mutable reference to the best ask/offer order, if one exists.
     /// This allows for in-place modification of the order.
     /// # Time Complexity: O(log N)
-    pub fn best_ask(&mut self) -> Option<&mut Order> {
-        if let Some(&best_price) = self.asks_price_tree.first() {
-            let head_idx = self
+    pub fn best_ask(&mut self, symbol: &SymbolType) -> Option<&mut Order> {
+        let levels = self.levels.get(symbol)?;
+        if let Some(&best_price) = levels.asks_price_tree.first() {
+            let head_idx = levels
                 .asks_price_map
                 .get(&best_price)
                 .expect("Inconsistency: sorted_prices has a price that price_map does not") // TODO: Handle error

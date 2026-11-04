@@ -126,11 +126,27 @@ impl ExecutionReport {
 
 pub struct Publisher {
     publication: AeronExclusivePublication,
+    transact_time: u64,
 }
 
 impl Publisher {
     pub fn new(publication: AeronExclusivePublication) -> Self {
-        Self { publication }
+        Self {
+            publication,
+            transact_time: 0,
+        }
+    }
+
+    /// Reads the clock once per inbound message, so every report it causes shares a time.
+    #[inline(always)]
+    pub fn stamp_transact_time(&mut self) {
+        // This cast is safe until year 2554.
+        #[allow(clippy::cast_possible_truncation)]
+        let transact_time = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("System time is before Unix epoch") // TODO NO EXPECT
+            .as_nanos() as u64;
+        self.transact_time = transact_time;
     }
 
     // TODO: BACKPRESSURE STRATEGY
@@ -240,7 +256,7 @@ impl Publisher {
         let mut encoder = Self::begin_encoding_execution_report(write_buf);
 
         Self::set_common_fields(&mut encoder, order, exec_id);
-        encoder = Self::set_composite_fields(encoder, order);
+        encoder = Self::set_composite_fields(encoder, order, self.transact_time);
         encoder.exec_type(report.exec_type());
         encoder.ord_status(report.ord_status(order));
         encoder.ord_rej_reason(report.ord_rej_reason());
@@ -297,8 +313,9 @@ impl Publisher {
     fn set_composite_fields<'a>(
         encoder: ExecutionReportEncoder<'a>,
         order: &Order,
+        transact_time: u64,
     ) -> ExecutionReportEncoder<'a> {
-        let encoder = Self::set_transact_time(encoder);
+        let encoder = Self::set_transact_time(encoder, transact_time);
         let encoder = Self::set_leaves_qty(encoder, order.leaves_quantity);
         let encoder = Self::set_cum_qty(encoder, order.cumulative_quantity);
         let encoder = Self::set_order_qty(encoder, order.quantity);
@@ -312,14 +329,10 @@ impl Publisher {
     }
 
     #[inline(always)]
-    fn set_transact_time(encoder: ExecutionReportEncoder<'_>) -> ExecutionReportEncoder<'_> {
-        // This cast is safe until year 2554.
-        #[allow(clippy::cast_possible_truncation)]
-        let transact_time = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("System time is before Unix epoch") // TODO NO EXPECT
-            .as_nanos() as u64;
-
+    fn set_transact_time(
+        encoder: ExecutionReportEncoder<'_>,
+        transact_time: u64,
+    ) -> ExecutionReportEncoder<'_> {
         let mut time_encoder = encoder.transact_time_encoder();
         time_encoder.time(transact_time);
         time_encoder

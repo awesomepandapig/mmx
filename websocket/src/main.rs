@@ -53,9 +53,8 @@ async fn handle_connection(peer: SocketAddr, stream: TcpStream) -> Result<()> {
         .await
         .expect("nats connection failed"); // TODO: Replace expect with explicit handle and trace
 
-    // TODO: GET NATS_CHANNEL FROM ENV VARIABLE
     let mut subscriber = client
-        .subscribe("foo")
+        .subscribe("l2.*")
         .await
         .expect("Failed to connect to NATS");
 
@@ -64,6 +63,7 @@ async fn handle_connection(peer: SocketAddr, stream: TcpStream) -> Result<()> {
     let mut ticker = interval(Duration::from_millis(250));
 
     while let Some(message) = subscriber.next().await {
+        let product_id = message.subject.as_str().trim_start_matches("l2.").to_string();
         let inner_json: Value =
             serde_json::from_slice(&message.payload).expect("Invalid JSON in NATS message payload"); // TODO: HANDLE ERROR
 
@@ -79,7 +79,7 @@ async fn handle_connection(peer: SocketAddr, stream: TcpStream) -> Result<()> {
             "sequence_num": sequence_num,
             "events": [{
                 "type": "update",
-                "product_id": "JSP",
+                "product_id": product_id,
                 "updates": [inner_json]
             }]
         });

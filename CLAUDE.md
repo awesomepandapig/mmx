@@ -9,7 +9,7 @@ SBX is an order-book exchange, built for Hypixel SkyBlock and being repositioned
 ```sh
 cargo build --workspace --release          # all Rust services and tools
 cargo build -p matching-engine             # one service
-cargo test --workspace                     # only tools has tests so far
+cargo test --workspace                     # tools and level2 have tests so far
 cargo test -p tools flags_time_priority    # one test
 cargo clippy --workspace                   # CI runs clippy with --all-features
 
@@ -30,14 +30,16 @@ Run `scripts/bench.py --compare m4-mac-mini` after changing `matching-engine` or
 ```
 api --(aeron udp, stream 1001: NewOrderSingle)--> matching-engine
 matching-engine --(aeron MDC, stream 1002: ExecutionReport)--> level2, ticker, trade-reporter, observer, sbx-* tools
-level2 --(NATS subject "foo")--> websocket --> browser
-ticker --(NATS subject "ticker:JSP")--> nothing subscribes yet
+level2 --(NATS subject "l2.<symbol>")--> websocket --> browser
+ticker --(NATS subject "ticker.<symbol>")--> nothing subscribes yet
 trade-reporter --> QuestDB (tables are created on first write)
 observer --(OTLP)--> collector
 auth (better-auth + Express) --> Postgres; not connected to api yet
 ```
 
-- `matching-engine` is single-threaded and in-memory, so all order and book state is lost on restart. It links no telemetry: `observer` derives metrics from its output, and `--features silent` compiles out logging in release builds.
+- `matching-engine` is single-threaded and in-memory, so all order and book state is lost on restart. It links no telemetry: `observer` derives metrics from its output, and `--features silent` compiles out logging and latency timing in release builds.
+- Each symbol has its own price levels, but all symbols share one order pool and key map. `MAX_ORDERS` bounds the total, and client order IDs are unique per account across symbols.
+- The engine uses `foldhash` because SipHash cost about 20% of throughput. Order keys come from clients, so keep it seeded, and never expose map iteration order.
 - All Aeron code goes through the `transport` crate, built on `rusteron-client`. It wraps Aeron's C client, so the driver must match the bundled Aeron version (1.54.0).
 - `rusteron` handles aren't `Send`. Create a client on the thread that uses it; `api` has one thread owning its publication. Don't enable `multi-threaded`, because it would make every service pay for atomic reference counts.
 - Messages are SBE. `messages.xml` is the schema and `sbe/` is generated code, so don't edit `sbe/src` by hand. Template IDs: 1 NewOrderSingle, 2 OrderCancelRequest, 3 ExecutionReport, 4 OrderCancelReject.
@@ -47,9 +49,10 @@ auth (better-auth + Express) --> Postgres; not connected to api yet
 
 ## Things that bite
 
-- `level2` and `ticker` keep their own in-memory book and assert that order IDs arrive in sequence. Start them before the first order, and restart them together with `matching-engine`.
-- `level2` and `ticker` panic on any template ID other than 3. Any rejected cancel crashes them.
-- `matching-engine` has one book for all symbols. See "What doesn't work yet" in `STARTUP.md` for other confirmed bugs.
+- `level2` and `ticker` keep their own in-memory books and assert that order IDs arrive in sequence. Start them before the first order, and restart them together with `matching-engine`.
+- `level2` and `ticker` panic on any template ID other than 3 or 4.
+- Only new and rejected orders spend an order ID. Every report spends an exec ID, including cancel rejects.
+- See "What doesn't work yet" in `STARTUP.md` for known gaps.
 - `tracing`'s `max_level_*` features are ignored in release builds; use `release_max_level_*`.
 - `level2` and `ticker` duplicate `messages.rs`, so changes need to be made in both.
 - `old/` holds retired services. It's in `.gitignore` but its files are still tracked. `tests/` is ignored too, so new top-level test directories won't show up in git without `-f`.

@@ -9,6 +9,7 @@ use tracing::info;
 
 pub fn process_execution_report(
     book: &mut OrderBook,
+    last_seen_id: &mut u64,
     ticker_state: &mut TickerState,
     report: &ExecutionReportMessage,
 ) -> Option<String> {
@@ -17,12 +18,12 @@ pub fn process_execution_report(
         ExecTypeEnum::New => {
             assert_eq!(
                 report.order_id,
-                book.last_seen_id + 1,
+                *last_seen_id + 1,
                 "Error: Recieved id {} expected {}",
                 report.order_id,
-                book.last_seen_id + 1
+                *last_seen_id + 1
             );
-            book.last_seen_id += 1;
+            *last_seen_id += 1;
 
             if report.price != i64::MIN {
                 book.add_order(&report);
@@ -61,12 +62,12 @@ pub fn process_execution_report(
         ExecTypeEnum::Rejected => {
             assert_eq!(
                 report.order_id,
-                book.last_seen_id + 1,
+                *last_seen_id + 1,
                 "Error: Recieved id {} expected {}",
                 report.order_id,
-                book.last_seen_id + 1
+                *last_seen_id + 1
             );
-            book.last_seen_id += 1;
+            *last_seen_id += 1;
         }
         _ => {
             // Handle other execution types or ignore
