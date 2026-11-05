@@ -9,6 +9,7 @@ members = [
     "services/market-data/level2",
     "services/market-data/ticker",
     "services/trade-reporter",
+    "services/outbox",
     "tools",
 ]
 
