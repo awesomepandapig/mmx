@@ -6,7 +6,7 @@
 use super::decimal;
 use super::order::SymbolType;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, RwLock};
@@ -37,11 +37,13 @@ pub struct Market {
     pub tick_size: i64,
     pub min_size: i64,
     pub max_size: i64,
+    pub enabled: bool,
 }
 
+/// Every market in the file. A disabled one takes no orders, but operators still need to see it.
 #[derive(Debug, Default)]
 pub struct Markets {
-    enabled: HashMap<String, Market>,
+    listed: BTreeMap<String, Market>,
 }
 
 /// Checks a symbol's shape and returns its normalized form. Symbols become NATS subjects and
@@ -72,7 +74,7 @@ impl Markets {
         let file: MarketsFile = serde_yaml::from_str(text).map_err(|err| err.to_string())?;
 
         let mut seen = HashSet::new();
-        let mut enabled = HashMap::new();
+        let mut listed = BTreeMap::new();
         for entry in file.markets {
             let name = normalize_symbol(&entry.symbol)?;
             if !seen.insert(name.clone()) {
@@ -90,23 +92,31 @@ impl Markets {
                 return Err(format!("{name}: min_size is above max_size"));
             }
 
-            if entry.enabled.unwrap_or(true) {
-                let mut symbol = [0u8; SYMBOL_LENGTH];
-                symbol[..name.len()].copy_from_slice(name.as_bytes());
-                enabled.insert(name, Market { symbol, tick_size, min_size, max_size });
-            }
+            let mut symbol = [0u8; SYMBOL_LENGTH];
+            symbol[..name.len()].copy_from_slice(name.as_bytes());
+            let enabled = entry.enabled.unwrap_or(true);
+            listed.insert(name, Market { symbol, tick_size, min_size, max_size, enabled });
         }
-        Ok(Self { enabled })
+        Ok(Self { listed })
     }
 
+    /// An enabled market, which is the only kind that takes orders.
     pub fn get(&self, symbol: &str) -> Option<&Market> {
-        self.enabled.get(symbol)
+        self.listed.get(symbol).filter(|market| market.enabled)
     }
 
+    /// A market in the file, enabled or not.
+    pub fn listed(&self, symbol: &str) -> Option<&Market> {
+        self.listed.get(symbol)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &Market)> {
+        self.listed.iter()
+    }
+
+    /// The enabled markets, sorted.
     pub fn symbols(&self) -> Vec<String> {
-        let mut symbols: Vec<String> = self.enabled.keys().cloned().collect();
-        symbols.sort_unstable();
-        symbols
+        self.listed.iter().filter(|(_, market)| market.enabled).map(|(name, _)| name.clone()).collect()
     }
 }
 
@@ -165,6 +175,15 @@ markets:
         assert_eq!((item.min_size, item.max_size), (100_000_000, 1_000_000_000));
         assert_eq!(&item.symbol, b"ITEM\0\0");
         assert_eq!(markets.get("GEM").unwrap().max_size, i64::MAX);
+        assert!(markets.get("OLD").is_none());
+    }
+
+    #[test]
+    fn a_disabled_market_is_still_listed_for_operators() {
+        let markets = Markets::parse(GOOD).unwrap();
+        assert!(!markets.listed("OLD").unwrap().enabled);
+        let names: Vec<&String> = markets.iter().map(|(name, _)| name).collect();
+        assert_eq!(names, ["GEM", "ITEM", "OLD"]);
     }
 
     #[test]

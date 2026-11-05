@@ -26,7 +26,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 const ORDERS_COLUMNS: &str = "cl_ord_id, last(symbol) symbol, last(ord_status) ord_status, \
      last(side) side, last(leaves_qty) leaves_qty, last(cum_qty) cum_qty, last(price) price, \
-     last(avg_px) avg_px, min(ts) created_at, max(ts) updated_at";
+     last_not_null(avg_px) avg_px, min(ts) created_at, max(ts) updated_at";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrderKey {
@@ -62,6 +62,13 @@ pub struct RecordedOrder {
     pub updated_at: String,
 }
 
+/// An order that's still working, with what a cancel needs to find it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenOrder {
+    pub account: Uuid,
+    pub id: Uuid,
+}
+
 /// A player's orders. `symbol` must already be normalized.
 #[derive(Clone, Debug, Default)]
 pub struct OrderQuery {
@@ -85,6 +92,9 @@ pub trait OrderStore: Send + Sync {
     async fn order_reached_engine(&self, key: &OrderKey, window: Duration) -> Result<bool, String>;
 
     async fn orders(&self, query: &OrderQuery) -> Result<Vec<RecordedOrder>, String>;
+
+    /// Every player's working orders in one market. `symbol` must already be normalized.
+    async fn open_orders_in_market(&self, symbol: &str, limit: usize) -> Result<Vec<OpenOrder>, String>;
 }
 
 #[derive(Deserialize)]
@@ -124,9 +134,14 @@ fn repeat_sql(key: &OrderKey, window: Duration) -> String {
     )
 }
 
+/// A rejected repeat shares its original's client order ID, but it says nothing about that order.
+/// Left in, it would read as the latest state of an order that's still working, and a game could
+/// release live escrow. Rows with no reason are null, and they have to stay.
+const NOT_A_REPEAT: &str = "(ord_rej_reason is null or ord_rej_reason != 'duplicate_order')";
+
 /// Values reach this SQL as parsed UUIDs and normalized symbols, so none can contain a quote.
 fn orders_sql(query: &OrderQuery) -> String {
-    let mut filters = format!("account = '{}'", query.account);
+    let mut filters = format!("account = '{}' and {NOT_A_REPEAT}", query.account);
     if let Some(id) = query.cl_ord_id {
         filters.push_str(&format!(" and cl_ord_id = '{id}'"));
     }
@@ -143,6 +158,37 @@ fn orders_sql(query: &OrderQuery) -> String {
          order by created_at desc limit {}",
         query.limit
     )
+}
+
+/// Two players can share a client order ID, so rows group by account too. They also group by the
+/// engine's order ID, because a rejected repeat of a working order shares its client order ID. The
+/// repeat's reject would otherwise read as the working order's latest state and hide it.
+fn open_orders_sql(symbol: &str, limit: usize) -> String {
+    format!(
+        "select account, cl_ord_id from (select account, cl_ord_id, order_id, \
+         last(ord_status) ord_status from orders where symbol = '{symbol}') \
+         where ord_status in ('new', 'partially_filled') limit {limit}"
+    )
+}
+
+fn parse_open_orders(reply: &ExecReply) -> Result<Vec<OpenOrder>, String> {
+    let column = |name: &str| {
+        reply
+            .columns
+            .iter()
+            .position(|column| column.name == name)
+            .ok_or_else(|| format!("no column {name}"))
+    };
+    let (account, id) = (column("account")?, column("cl_ord_id")?);
+    let uuid = |row: &[Value], at: usize| -> Result<Uuid, String> {
+        let text = row.get(at).and_then(Value::as_str).ok_or("expected a UUID")?;
+        Uuid::parse_str(text).map_err(|err| err.to_string())
+    };
+    reply
+        .dataset
+        .iter()
+        .map(|row| Ok(OpenOrder { account: uuid(row, account)?, id: uuid(row, id)? }))
+        .collect()
 }
 
 fn parse_status(status: &str) -> Result<RecordedStatus, String> {
@@ -275,6 +321,13 @@ impl OrderStore for QuestDb {
             None => Ok(Vec::new()),
         }
     }
+
+    async fn open_orders_in_market(&self, symbol: &str, limit: usize) -> Result<Vec<OpenOrder>, String> {
+        match self.exec(&open_orders_sql(symbol, limit)).await? {
+            Some(reply) => parse_open_orders(&reply),
+            None => Ok(Vec::new()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +402,99 @@ mod tests {
 
         let body = r#"{"columns":[{"name":"writerTxn"}],"dataset":[[7]]}"#;
         assert!(parse_commits(&parse_reply(body).unwrap().unwrap()).is_err());
+    }
+
+    #[test]
+    fn order_queries_leave_out_rejected_repeats() {
+        let sql = orders_sql(&OrderQuery { account: account(), limit: 1, ..Default::default() });
+        assert!(sql.contains(&format!("from orders where account = '{}' and (ord_rej_reason is null or ord_rej_reason != 'duplicate_order')", account())), "{sql}");
+    }
+
+    /// Run by hand against a scratch QuestDB, because it writes rows:
+    /// `QUESTDB_SCRATCH_URL=http://localhost:19000 cargo test -p api real_questdb -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs a scratch QuestDB"]
+    async fn real_questdb_keeps_a_repeated_order_working() {
+        const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS orders (
+            ts TIMESTAMP, symbol SYMBOL, exec_type SYMBOL, ord_status SYMBOL, side SYMBOL,
+            ord_rej_reason SYMBOL, account UUID, cl_ord_id UUID, order_id LONG, exec_id LONG,
+            price LONG, ord_qty LONG, leaves_qty LONG, cum_qty LONG, avg_px LONG
+        ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, exec_id)";
+
+        let db = QuestDb::new(&std::env::var("QUESTDB_SCRATCH_URL").unwrap()).unwrap();
+        db.exec(SCHEMA).await.unwrap();
+
+        // Fresh IDs each run, because rows that share a time and exec ID replace each other.
+        let (player, resting, partial) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let base = i64::from(Uuid::new_v4().as_u128() as u32) * 10;
+        let symbol = format!("T{:05X}", base as u32 & 0xFFFFF);
+        let rows = [
+            (resting, "new", "new", "null", 1, 200, 0),
+            (partial, "new", "new", "null", 2, 200, 0),
+            (partial, "trade", "partially_filled", "null", 2, 150, 50),
+            (resting, "rejected", "rejected", "'duplicate_order'", 3, 200, 0),
+            (partial, "rejected", "rejected", "'duplicate_order'", 4, 200, 0),
+        ];
+        for (at, (id, exec_type, status, reason, order_id, leaves, filled)) in rows.iter().enumerate() {
+            let sql = format!(
+                "insert into orders values ('2026-11-04T12:00:{at:02}.000000Z', '{symbol}', '{exec_type}', \
+                 '{status}', 'buy', {reason}, '{player}', '{id}', {order_id}, {}, 100, 200, {leaves}, \
+                 {filled}, null)",
+                base + at as i64,
+            );
+            db.exec(&sql).await.unwrap();
+        }
+
+        // WAL rows land a moment after the insert.
+        let count = format!("select count() from orders where account = '{player}'");
+        for _ in 0..100 {
+            let reply = db.exec(&count).await.unwrap().unwrap();
+            if first_number(&reply) == Some(rows.len() as i64) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let query = OrderQuery { account: player, limit: 10, ..Default::default() };
+        let listed = db.orders(&query).await.unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed.iter().all(|order| order.status == RecordedStatus::Open), "{listed:?}");
+
+        let open = OrderQuery { open_only: true, ..query.clone() };
+        assert_eq!(db.orders(&open).await.unwrap().len(), 2, "cancel-all must find both");
+
+        let one = OrderQuery { cl_ord_id: Some(partial), limit: 1, ..query };
+        let order = db.orders(&one).await.unwrap().remove(0);
+        assert_eq!(order.status, RecordedStatus::Open);
+        assert_eq!((order.leaves_mantissa, order.filled_mantissa), (150, 50));
+        assert!(order.created_at.contains("12:00:01"), "{}", order.created_at);
+
+        let market = db.open_orders_in_market(&symbol, 10).await.unwrap();
+        assert_eq!(market.len(), 2, "{market:?}");
+    }
+
+    #[test]
+    fn a_market_query_spans_players_and_keeps_each_order_apart() {
+        let sql = open_orders_sql("ITEM", 25);
+        assert!(sql.contains("symbol = 'ITEM'"));
+        assert!(!sql.contains("account ="), "every player: {sql}");
+        assert!(sql.contains("select account, cl_ord_id, order_id,"), "{sql}");
+        assert!(sql.contains("ord_status in ('new', 'partially_filled')"));
+        assert!(sql.ends_with("limit 25"));
+    }
+
+    #[test]
+    fn reads_open_orders() {
+        let body = r#"{
+            "columns": [{"name":"account","type":"UUID"},{"name":"cl_ord_id","type":"UUID"}],
+            "dataset": [["11111111-1111-1111-1111-111111111111","22222222-2222-2222-2222-222222222222"]]
+        }"#;
+        let orders = parse_open_orders(&parse_reply(body).unwrap().unwrap()).unwrap();
+        assert_eq!(orders[0].account, account());
+        assert_eq!(orders[0].id, Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+
+        let body = r#"{"columns":[{"name":"account"},{"name":"cl_ord_id"}],"dataset":[[null,"x"]]}"#;
+        assert!(parse_open_orders(&parse_reply(body).unwrap().unwrap()).is_err());
     }
 
     #[test]

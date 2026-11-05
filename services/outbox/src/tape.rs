@@ -103,7 +103,7 @@ fn subscribe(aeron: &archive::Aeron, source: &Source, position: i64) -> Option<a
 
 /// Feeds the outbox from the tape until it fails or halts.
 pub fn follow(outbox: &mut Outbox, nodes: usize) -> Error {
-    let aeron = archive_client();
+    let mut aeron = archive_client();
     let mut subscription: Option<archive::AeronArchivePersistentSubscription> = None;
     let mut current_node = None;
     let mut last_frame = Instant::now();
@@ -158,9 +158,14 @@ pub fn follow(outbox: &mut Outbox, nodes: usize) -> Error {
                 }
                 Some(source) if failed || (source.recorded > position && current_node != Some(source.node)) => {
                     let resume = outbox.resume_position();
-                    eprintln!("reading the tape from node {} at {resume}", source.node);
-                    subscription = subscribe(&aeron, &source, resume);
-                    current_node = subscription.is_some().then_some(source.node);
+                    let node = source.node;
+                    eprintln!("reading the tape from node {node} at {resume}");
+                    // Closing a subscription leaves its images mapped until the client closes,
+                    // and each one holds 192 MB of shared memory.
+                    drop((subscription.take(), source));
+                    aeron = archive_client();
+                    subscription = probe(&aeron, node).and_then(|source| subscribe(&aeron, &source, resume));
+                    current_node = subscription.is_some().then_some(node);
                 }
                 Some(_) => {}
                 None if failed => {

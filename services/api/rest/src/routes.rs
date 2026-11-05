@@ -1,13 +1,15 @@
 use super::AppState;
+use super::admin;
 use super::aeron_handler::{EngineRequest, OrderOutcome, OutboundOrder};
 use super::errors::AppError;
+use super::halts::Refusal;
 use super::identity::Player;
 use super::markets::normalize_symbol;
 use super::order::{Order, create_cancel_buffer, create_order_buffer, u64s_to_uuid, uuid_to_u64s};
 use super::rate_limit::Decision;
 use super::repeat::await_recorder;
 use super::store::OrderQuery;
-use super::validation::{CreateOrder, validate_order};
+use super::validation::{CreateOrder, ValidOrder, validate_order};
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -19,6 +21,7 @@ use axum::{
         rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::StatusCode,
+    middleware,
     routing::{get, post},
 };
 
@@ -32,13 +35,25 @@ use uuid::Uuid;
 
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 1000;
-const MAX_CANCEL_ALL: usize = 10_000;
+pub const MAX_CANCEL_ALL: usize = 10_000;
 
 pub fn router(state: Arc<AppState>) -> Router {
+    // Every route here shares the one layer, so a new one can't forget its auth.
+    let admin_routes = Router::new()
+        .route("/api/v1/admin/markets", get(admin::list_markets))
+        .route("/api/v1/admin/markets/reload", post(admin::reload_markets))
+        .route("/api/v1/admin/markets/{symbol}/halt", post(admin::halt_market))
+        .route("/api/v1/admin/markets/{symbol}/resume", post(admin::resume_market))
+        .route("/api/v1/admin/markets/{symbol}/cancel-all", post(admin::cancel_market_orders))
+        .route_layer(middleware::from_fn_with_state(state.clone(), admin::require_admin));
+
     Router::new()
+        .route("/healthz", get(admin::healthz))
+        .route("/readyz", get(admin::readyz))
+        .route("/metrics", get(admin::metrics))
         .route("/api/v1/orders", get(list_orders).post(post_order).delete(cancel_all_orders))
         .route("/api/v1/orders/{id}", get(get_order).delete(cancel_order))
-        .route("/api/v1/admin/markets/reload", post(reload_markets))
+        .merge(admin_routes)
         .with_state(state)
 }
 
@@ -64,7 +79,7 @@ async fn submit(
     Ok(result)
 }
 
-async fn outcome(result: oneshot::Receiver<OrderOutcome>) -> Result<OrderOutcome, AppError> {
+pub async fn outcome(result: oneshot::Receiver<OrderOutcome>) -> Result<OrderOutcome, AppError> {
     result
         .await
         .map_err(|_| AppError::InternalServerError("Order publisher stopped".to_string()))
@@ -83,8 +98,30 @@ async fn check_rate_limit(state: &AppState, player: Player) -> Result<(), AppErr
     }
 }
 
+/// Only new orders stop here. Cancels must always work, so a player can get funds out of the book.
+fn check_halt(state: &AppState, order: &ValidOrder) -> Result<(), AppError> {
+    let symbol = String::from_utf8_lossy(&order.symbol);
+    let symbol = symbol.trim_end_matches('\0');
+    state.halts.check(symbol).map_err(|refusal| match refusal {
+        Refusal::Halted => {
+            AppError::MarketHalted { symbol: symbol.to_string(), id: u64s_to_uuid(order.cl_ord_id) }
+        }
+        Refusal::Unknown => AppError::HaltStateUnknown,
+    })
+}
+
 pub async fn post_order(
     State(state): State<Arc<AppState>>,
+    player: Player,
+    payload: Result<Json<CreateOrder>, JsonRejection>,
+) -> Result<(StatusCode, Json<Order>), AppError> {
+    let result = place_order(&state, player, payload).await;
+    state.metrics.record_order(&result);
+    result
+}
+
+async fn place_order(
+    state: &AppState,
     player: Player,
     payload: Result<Json<CreateOrder>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Order>), AppError> {
@@ -94,14 +131,19 @@ pub async fn post_order(
     let order = validate_order(&payload, player, &markets, state.require_client_order_id)?;
     let id = u64s_to_uuid(order.cl_ord_id);
 
-    check_rate_limit(&state, player).await?;
+    // First so that a halted market doesn't spend the player's limit.
+    check_halt(state, &order)?;
+    check_rate_limit(state, player).await?;
     if let Some(repeats) = &state.repeats {
         repeats.check(player.0, id).await?;
     }
+    // The checks above can wait on Valkey and QuestDB, and a halt may have landed meanwhile.
+    check_halt(state, &order)?;
 
+    let _in_flight = state.metrics.in_flight();
     let message = create_order_buffer(&order, now_ns()?).to_vec();
     let request = EngineRequest::New((order.account, order.cl_ord_id));
-    match outcome(submit(&state, request, message).await?).await? {
+    match outcome(submit(state, request, message).await?).await? {
         OrderOutcome::Accepted => {}
         OrderOutcome::Rejected => return Err(AppError::OrderRejected(id)),
         OrderOutcome::Repeat => return Err(AppError::RepeatOrder(id)),
@@ -125,7 +167,7 @@ pub struct CancelledOrder {
 
 /// Queues a cancel for one of the player's orders. It carries its own ID, which the engine echoes
 /// in a reject.
-async fn submit_cancel(
+pub async fn submit_cancel(
     state: &AppState,
     player: Player,
     id: Uuid,
@@ -279,17 +321,4 @@ pub async fn get_order(
     })?;
     let order = orders.into_iter().next().ok_or(AppError::OrderNotFound)?;
     Ok(Json(Order::recorded(order)))
-}
-
-#[derive(Serialize, Debug)]
-pub struct ReloadedMarkets {
-    markets: Vec<String>,
-}
-
-/// Applies `markets.yaml` to this gateway. Every gateway needs its own reload.
-pub async fn reload_markets(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<ReloadedMarkets>, AppError> {
-    let markets = state.markets.reload().map_err(AppError::MarketsNotReloaded)?;
-    Ok(Json(ReloadedMarkets { markets: markets.symbols() }))
 }

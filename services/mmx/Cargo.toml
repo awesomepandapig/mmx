@@ -1,0 +1,22 @@
+[package]
+name = "mmx"
+version = "0.1.0"
+edition = "2024"
+
+# `mmx` only speaks HTTP, so it must build with plain cargo. Don't add `transport`, `cluster` or
+# `rusteron`, which need Aeron and CMake. reqwest's TLS backend needs CMake too, so it's left out.
+[dependencies]
+axum = "0.8.4"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3.31"
+hmac = "0.12.1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "query"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+serde_yaml = "0.9"
+sha2 = "0.10.9"
+subtle = "2.6"
+tokio = { version = "1.45.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+uuid = { version = "1.17.0", features = ["serde", "v4"] }

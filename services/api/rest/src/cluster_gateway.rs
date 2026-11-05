@@ -4,7 +4,7 @@
 //! or may not have reached the log, so sending pauses until the new term's marker. Every report
 //! before it is final, so any order still waiting never reached the log and is safe to resend.
 
-use super::aeron_handler::{EngineRequest, OrderKey, OrderOutcome, OrderSender, OutboundOrder};
+use super::aeron_handler::{EngineLink, EngineRequest, OrderKey, OrderOutcome, OrderSender, OutboundOrder};
 use super::order::UuidType;
 use super::repeat::ReportStream;
 
@@ -352,13 +352,14 @@ pub fn spawn_cluster_gateway(
     config: ClusterConfig,
     stream: Arc<ReportStream>,
     retry_window: Duration,
+    link: Arc<EngineLink>,
 ) -> Result<OrderSender, String> {
     let (orders, incoming) = mpsc::channel::<OutboundOrder>(ORDER_QUEUE_LENGTH);
     let (started, startup) = std_mpsc::channel();
 
     thread::Builder::new()
         .name("cluster-gateway".to_string())
-        .spawn(move || run(config, stream, retry_window, incoming, started))
+        .spawn(move || run(config, stream, retry_window, link, incoming, started))
         .map_err(|err| err.to_string())?;
 
     startup.recv().map_err(|err| err.to_string())??;
@@ -369,6 +370,7 @@ fn run(
     config: ClusterConfig,
     stream: Arc<ReportStream>,
     retry_window: Duration,
+    link: Arc<EngineLink>,
     mut incoming: mpsc::Receiver<OutboundOrder>,
     started: std_mpsc::Sender<Result<(), String>>,
 ) {
@@ -414,7 +416,11 @@ fn run(
 
         for subscription in &reports {
             let _ = subscription.poll_fn(
-                |buffer, _header| tracker.on_report(buffer, Instant::now()),
+                // Ahead of the answer, so anything that follows it waits for this report too.
+                |buffer, header| {
+                    stream.advance_to(header.position());
+                    tracker.on_report(buffer, Instant::now());
+                },
                 256,
             );
         }
@@ -432,6 +438,8 @@ fn run(
             if images == 0 {
                 stream.covered_since(Instant::now());
             }
+            // An order needs a way in and a way to hear the answer.
+            link.set(client.is_leader_connected() && images > 0);
         }
 
         client.poll_egress();

@@ -28,6 +28,17 @@ pub enum AppError {
     OrderNotFound,
     /// The markets file wasn't applied, and the gateway keeps the markets it had.
     MarketsNotReloaded(String),
+    /// Operators stopped this market. Nothing reached the engine, so any escrow can be released.
+    MarketHalted { symbol: String, id: Uuid },
+    /// This gateway has never read the halt list, so it can't tell whether the market is open.
+    HaltStateUnknown,
+    /// `MMX_ADMIN_TOKEN` isn't set.
+    AdminDisabled,
+    MarketNotFound,
+    /// The halt is in force on this gateway, but others haven't been told.
+    HaltNotShared(String),
+    /// The resume didn't reach the shared list, so the market stays halted everywhere.
+    MarketStillHalted(String),
 }
 
 #[derive(Serialize)]
@@ -111,6 +122,28 @@ impl IntoResponse for AppError {
             AppError::OrderNotFound => body(StatusCode::NOT_FOUND, "order_not_found", "No such order."),
             AppError::MarketsNotReloaded(msg) => {
                 body(StatusCode::UNPROCESSABLE_ENTITY, "markets_not_reloaded", "The markets file was not applied.")
+                    .details(msg)
+            }
+            AppError::MarketHalted { symbol, id } => {
+                body(StatusCode::UNPROCESSABLE_ENTITY, "market_halted", format!("Market '{symbol}' is halted."))
+                    .details("Nothing was sent to the engine. Cancels still work.")
+                    .id(id)
+            }
+            AppError::HaltStateUnknown => {
+                body(StatusCode::SERVICE_UNAVAILABLE, "halt_state_unknown", "This gateway can't tell which markets are halted yet.")
+                    .details("Nothing was sent to the engine. Cancels still work.")
+            }
+            AppError::AdminDisabled => {
+                body(StatusCode::SERVICE_UNAVAILABLE, "admin_disabled", "Admin routes are disabled.")
+                    .details("Set MMX_ADMIN_TOKEN to enable them.")
+            }
+            AppError::MarketNotFound => body(StatusCode::NOT_FOUND, "market_not_found", "No such market."),
+            AppError::HaltNotShared(msg) => {
+                body(StatusCode::SERVICE_UNAVAILABLE, "halt_not_shared", "The market is halted on this gateway only.")
+                    .details(format!("This gateway keeps trying to share the halt. Other gateways are still open: {msg}"))
+            }
+            AppError::MarketStillHalted(msg) => {
+                body(StatusCode::SERVICE_UNAVAILABLE, "market_still_halted", "The market was not resumed.")
                     .details(msg)
             }
             AppError::InternalServerError(msg) => {

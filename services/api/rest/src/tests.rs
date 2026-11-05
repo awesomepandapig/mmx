@@ -1,14 +1,19 @@
 //! Drives the whole router in-process, with fakes for the engine, Valkey and QuestDB.
 
 use super::AppState;
-use super::aeron_handler::{EngineRequest, OrderOutcome, OutboundOrder};
+use super::aeron_handler::{EngineLink, EngineRequest, OrderOutcome, OutboundOrder};
+use super::halts::Halts;
+use super::halts::testing::FakeHaltStore;
 use super::identity::{PLAYER_HEADER, TrustedGameServer};
 use super::markets::MarketRegistry;
+use super::metrics::Metrics;
 use super::order::{MESSAGE_SIZE, uuid_to_u64s};
 use super::rate_limit::{Decision, RateLimiter, Unlimited};
 use super::repeat::{RepeatGuard, ReportStream};
 use super::routes::router;
-use super::store::{OrderKey, OrderQuery, OrderStore, OrdersCommits, RecordedOrder, RecordedStatus};
+use super::store::{
+    OpenOrder, OrderKey, OrderQuery, OrderStore, OrdersCommits, RecordedOrder, RecordedStatus,
+};
 
 use std::collections::VecDeque;
 use std::fs;
@@ -41,6 +46,7 @@ use uuid::Uuid;
 
 const MARKETS: &str = "markets:\n  - {symbol: ITEM, tick_size: \"0.05\", min_size: \"1\", max_size: \"100\"}\n";
 const HOUR: Duration = Duration::from_secs(3600);
+const ADMIN_TOKEN: &str = "test-admin-token";
 
 /// Answers each request in turn, and keeps what it was sent.
 #[derive(Default)]
@@ -86,6 +92,8 @@ struct FakeStore {
     orders: Mutex<Vec<RecordedOrder>>,
     queries: Mutex<Vec<OrderQuery>>,
     repeat_checks: AtomicUsize,
+    open_in_market: Mutex<Vec<OpenOrder>>,
+    market_queries: Mutex<Vec<(String, usize)>>,
 }
 
 #[async_trait]
@@ -116,6 +124,14 @@ impl OrderStore for FakeStore {
         self.queries.lock().unwrap().push(query.clone());
         Ok(self.orders.lock().unwrap().clone())
     }
+
+    async fn open_orders_in_market(&self, symbol: &str, limit: usize) -> Result<Vec<OpenOrder>, String> {
+        if self.failing.load(Ordering::Relaxed) {
+            return Err("down".to_string());
+        }
+        self.market_queries.lock().unwrap().push((symbol.to_string(), limit));
+        Ok(self.open_in_market.lock().unwrap().clone())
+    }
 }
 
 struct FakeLimiter(Result<Decision, String>);
@@ -134,6 +150,8 @@ struct Gateway {
     stream: Arc<ReportStream>,
     markets_file: PathBuf,
     player: Uuid,
+    link: Arc<EngineLink>,
+    halts: Arc<Halts>,
 }
 
 impl Drop for Gateway {
@@ -148,11 +166,20 @@ struct Setup {
     /// How long the retry window is. Memory covers a zero window from the start.
     window: Duration,
     clustered: bool,
+    halts: Option<Arc<Halts>>,
+    admin_token: Option<String>,
 }
 
 impl Default for Setup {
     fn default() -> Self {
-        Self { outcomes: Vec::new(), limiter: Arc::new(Unlimited), window: Duration::ZERO, clustered: true }
+        Self {
+            outcomes: Vec::new(),
+            limiter: Arc::new(Unlimited),
+            window: Duration::ZERO,
+            clustered: true,
+            halts: None,
+            admin_token: Some(ADMIN_TOKEN.to_string()),
+        }
     }
 }
 
@@ -169,6 +196,9 @@ fn gateway(setup: Setup) -> Gateway {
         store: dyn_store.clone(),
         window: setup.window,
     });
+    let link = Arc::new(EngineLink::default());
+    link.set(true);
+    let halts = setup.halts.unwrap_or_else(|| Arc::new(Halts::standalone()));
     let state = AppState {
         orders: engine.start(),
         auth: Arc::new(TrustedGameServer),
@@ -178,6 +208,10 @@ fn gateway(setup: Setup) -> Gateway {
         report_stream: setup.clustered.then(|| stream.clone()),
         repeats,
         require_client_order_id: setup.clustered,
+        engine: link.clone(),
+        halts: halts.clone(),
+        metrics: Metrics::default(),
+        admin_token: setup.admin_token,
     };
     Gateway {
         app: router(Arc::new(state)),
@@ -186,18 +220,31 @@ fn gateway(setup: Setup) -> Gateway {
         stream,
         markets_file,
         player: Uuid::new_v4(),
+        link,
+        halts,
     }
 }
 
 struct Reply {
     status: StatusCode,
     retry_after: Option<String>,
+    content_type: Option<String>,
+    text: String,
     body: Value,
 }
 
 impl Gateway {
     async fn send(&self, method: Method, uri: &str, player: Option<&str>, body: Option<Value>) -> Reply {
-        let mut request = Request::builder().method(method).uri(uri);
+        let request = Request::builder().method(method).uri(uri);
+        self.dispatch(request, player, body).await
+    }
+
+    async fn dispatch(
+        &self,
+        mut request: axum::http::request::Builder,
+        player: Option<&str>,
+        body: Option<Value>,
+    ) -> Reply {
         if let Some(player) = player {
             request = request.header(PLAYER_HEADER, player);
         }
@@ -213,9 +260,26 @@ impl Gateway {
             .headers()
             .get("retry-after")
             .map(|value| value.to_str().unwrap().to_string());
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .map(|value| value.to_str().unwrap().to_string());
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-        Reply { status, retry_after, body }
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        Reply { status, retry_after, content_type, text, body }
+    }
+
+    async fn admin_as(&self, method: Method, uri: &str, token: Option<&str>) -> Reply {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        self.dispatch(request, None, None).await
+    }
+
+    async fn admin(&self, method: Method, uri: &str) -> Reply {
+        self.admin_as(method, uri, Some(ADMIN_TOKEN)).await
     }
 
     async fn call(&self, method: Method, uri: &str, body: Option<Value>) -> Reply {
@@ -740,7 +804,7 @@ async fn a_reload_changes_which_markets_are_open() {
     fs::write(&gateway.markets_file, "markets:\n  - {symbol: GEM, tick_size: \"0.05\"}\n").unwrap();
     assert_eq!(gateway.post(body.clone()).await.status, StatusCode::BAD_REQUEST, "needs a reload");
 
-    let reply = gateway.call(Method::POST, "/api/v1/admin/markets/reload", None).await;
+    let reply = gateway.admin(Method::POST, "/api/v1/admin/markets/reload").await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.body, json!({"markets": ["GEM"]}));
     assert_eq!(gateway.post(body).await.status, StatusCode::CREATED);
@@ -753,12 +817,442 @@ async fn a_bad_reload_reports_why_and_keeps_trading() {
     let gateway = gateway(Setup::default());
     fs::write(&gateway.markets_file, "markets: [").unwrap();
 
-    let reply = gateway.call(Method::POST, "/api/v1/admin/markets/reload", None).await;
+    let reply = gateway.admin(Method::POST, "/api/v1/admin/markets/reload").await;
     assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(reply.body["code"], "markets_not_reloaded");
     assert!(reply.body["details"].is_string());
 
     assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+}
+
+const HALT: &str = "/api/v1/admin/markets/item/halt";
+const RESUME: &str = "/api/v1/admin/markets/item/resume";
+const CANCEL_ALL: &str = "/api/v1/admin/markets/item/cancel-all";
+
+fn shared_halts(store: &Arc<FakeHaltStore>) -> Arc<Halts> {
+    Arc::new(Halts::shared(store.clone()))
+}
+
+fn open_order() -> OpenOrder {
+    OpenOrder { account: Uuid::new_v4(), id: Uuid::new_v4() }
+}
+
+#[tokio::test]
+async fn every_admin_route_needs_the_token() {
+    let gateway = gateway(Setup::default());
+    let routes = [
+        (Method::GET, "/api/v1/admin/markets"),
+        (Method::POST, "/api/v1/admin/markets/reload"),
+        (Method::POST, HALT),
+        (Method::POST, RESUME),
+        (Method::POST, CANCEL_ALL),
+    ];
+    for (method, uri) in routes {
+        let reply = gateway.admin_as(method.clone(), uri, None).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{uri}");
+        assert_eq!(reply.body["code"], "unauthenticated", "{uri}");
+
+        let reply = gateway.admin_as(method, uri, Some("wrong")).await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{uri}");
+    }
+    assert!(!gateway.halts.is_halted("ITEM"), "a refused halt changes nothing");
+    assert!(gateway.store.market_queries.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_player_header_is_no_substitute_for_the_token() {
+    let gateway = gateway(Setup::default());
+    let reply = gateway.call(Method::POST, HALT, None).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn without_a_token_admin_is_off_and_trading_is_not() {
+    let gateway = gateway(Setup { admin_token: None, ..Default::default() });
+    for token in [None, Some("anything"), Some("")] {
+        let reply = gateway.admin_as(Method::POST, HALT, token).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(reply.body["code"], "admin_disabled");
+    }
+    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+    assert_eq!(gateway.send(Method::GET, "/healthz", None, None).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn probes_need_no_auth() {
+    let gateway = gateway(Setup { admin_token: None, ..Default::default() });
+    for uri in ["/healthz", "/readyz", "/metrics"] {
+        assert_eq!(gateway.send(Method::GET, uri, None, None).await.status, StatusCode::OK, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn ready_follows_the_engine() {
+    let gateway = gateway(Setup::default());
+    let reply = gateway.send(Method::GET, "/readyz", None, None).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body, json!({"ready": true, "checks": {"engine": true, "halts_known": true}}));
+
+    gateway.link.set(false);
+    let reply = gateway.send(Method::GET, "/readyz", None, None).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.body["ready"], false);
+    assert_eq!(reply.body["checks"]["engine"], false);
+    assert_eq!(gateway.send(Method::GET, "/healthz", None, None).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn ready_shows_valkey_being_down_without_leaving_rotation() {
+    let store = Arc::new(FakeHaltStore::default());
+    let gateway = gateway(Setup { halts: Some(shared_halts(&store)), ..Default::default() });
+    gateway.halts.refresh().await;
+    let reply = gateway.send(Method::GET, "/readyz", None, None).await;
+    assert_eq!(reply.body["checks"]["valkey"], true);
+
+    store.set_down(true);
+    gateway.halts.refresh().await;
+    let reply = gateway.send(Method::GET, "/readyz", None, None).await;
+    assert_eq!(reply.status, StatusCode::OK, "cancels must keep reaching this gateway");
+    assert_eq!(reply.body["ready"], true);
+    assert_eq!(reply.body["checks"]["valkey"], false);
+    assert_eq!(reply.body["checks"]["halts_known"], true);
+}
+
+#[tokio::test]
+async fn markets_list_with_strings_and_flags() {
+    let gateway = gateway(Setup::default());
+    fs::write(
+        &gateway.markets_file,
+        "markets:\n  - {symbol: ITEM, tick_size: \"0.05\", min_size: \"1\", max_size: \"100\"}\n  - {symbol: OLD, tick_size: \"1\", enabled: false}\n",
+    )
+    .unwrap();
+    gateway.admin(Method::POST, "/api/v1/admin/markets/reload").await;
+    gateway.admin(Method::POST, HALT).await;
+
+    let reply = gateway.admin(Method::GET, "/api/v1/admin/markets").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    let markets = reply.body["markets"].as_array().unwrap();
+    assert_eq!(
+        markets[0],
+        json!({
+            "symbol": "ITEM", "tick_size": "0.05", "min_size": "1", "max_size": "100",
+            "enabled": true, "halted": true,
+        })
+    );
+    assert_eq!(markets[1]["symbol"], "OLD");
+    assert_eq!(markets[1]["enabled"], false);
+    assert_eq!(markets[1]["halted"], false);
+}
+
+#[tokio::test]
+async fn a_halted_market_refuses_new_orders_with_a_stable_code() {
+    let gateway = gateway(Setup::default());
+    let reply = gateway.admin(Method::POST, HALT).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["symbol"], "ITEM");
+    assert_eq!(reply.body["halted"], true);
+
+    let id = Uuid::new_v4();
+    let reply = gateway.post(limit_order(id)).await;
+    assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(reply.body["code"], "market_halted");
+    assert_eq!(reply.body["id"], id.to_string());
+    assert_eq!(gateway.engine.sent(), 0);
+
+    let reply = gateway.admin(Method::POST, RESUME).await;
+    assert_eq!(reply.body["halted"], false);
+    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_halt_does_not_touch_other_markets() {
+    let gateway = gateway(Setup::default());
+    fs::write(
+        &gateway.markets_file,
+        "markets:\n  - {symbol: ITEM, tick_size: \"0.05\"}\n  - {symbol: GEM, tick_size: \"0.05\"}\n",
+    )
+    .unwrap();
+    gateway.admin(Method::POST, "/api/v1/admin/markets/reload").await;
+    gateway.admin(Method::POST, HALT).await;
+
+    let mut body = limit_order(Uuid::new_v4());
+    body["product_id"] = json!("GEM");
+    assert_eq!(gateway.post(body).await.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn cancels_still_work_while_halted() {
+    let gateway = gateway(Setup {
+        outcomes: vec![OrderOutcome::Canceled, OrderOutcome::Canceled],
+        ..Default::default()
+    });
+    gateway.admin(Method::POST, HALT).await;
+
+    let uri = format!("/api/v1/orders/{}", Uuid::new_v4());
+    assert_eq!(gateway.call(Method::DELETE, &uri, None).await.status, StatusCode::OK);
+
+    gateway.stream.advance_to(4096);
+    gateway.store.position.store(4096, Ordering::Relaxed);
+    *gateway.store.orders.lock().unwrap() = vec![recorded(RecordedStatus::Open, Some(1))];
+    let reply = gateway.call(Method::DELETE, "/api/v1/orders", None).await;
+    assert_eq!(reply.body["canceled"].as_array().unwrap().len(), 1);
+    assert_eq!(gateway.engine.sent(), 2);
+}
+
+#[tokio::test]
+async fn cancels_work_on_a_gateway_that_never_read_the_halt_list() {
+    let store = Arc::new(FakeHaltStore::default());
+    store.set_down(true);
+    let gateway = gateway(Setup {
+        outcomes: vec![OrderOutcome::Canceled],
+        halts: Some(shared_halts(&store)),
+        ..Default::default()
+    });
+    gateway.halts.refresh().await;
+
+    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.body["code"], "halt_state_unknown");
+    assert_eq!(gateway.engine.sent(), 0);
+
+    let uri = format!("/api/v1/orders/{}", Uuid::new_v4());
+    assert_eq!(gateway.call(Method::DELETE, &uri, None).await.status, StatusCode::OK);
+
+    let reply = gateway.send(Method::GET, "/readyz", None, None).await;
+    assert_eq!(reply.status, StatusCode::OK, "it must stay reachable for cancels");
+    assert_eq!(reply.body["checks"]["halts_known"], false);
+    let reply = gateway.admin(Method::GET, "/api/v1/admin/markets").await;
+    assert_eq!(reply.body["markets"][0]["halted"], true, "orders are being refused");
+}
+
+#[tokio::test]
+async fn a_halt_on_one_gateway_reaches_another() {
+    let store = Arc::new(FakeHaltStore::default());
+    let first = gateway(Setup { halts: Some(shared_halts(&store)), ..Default::default() });
+    let second = gateway(Setup { halts: Some(shared_halts(&store)), ..Default::default() });
+    first.halts.refresh().await;
+    second.halts.refresh().await;
+
+    assert_eq!(first.admin(Method::POST, HALT).await.status, StatusCode::OK);
+    second.halts.refresh().await;
+    let reply = second.post(limit_order(Uuid::new_v4())).await;
+    assert_eq!(reply.body["code"], "market_halted");
+    assert_eq!(second.engine.sent(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn polling_picks_up_a_halt_within_the_promised_time() {
+    let store = Arc::new(FakeHaltStore::default());
+    let halts = shared_halts(&store);
+    halts.refresh().await;
+    halts.start_polling();
+
+    shared_halts(&store).halt("ITEM").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(halts.is_halted("ITEM"));
+}
+
+#[tokio::test]
+async fn a_halt_valkey_never_heard_is_reported_and_in_force_here() {
+    let store = Arc::new(FakeHaltStore::default());
+    let gateway = gateway(Setup { halts: Some(shared_halts(&store)), ..Default::default() });
+    gateway.halts.refresh().await;
+    store.set_down(true);
+
+    let reply = gateway.admin(Method::POST, HALT).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.body["code"], "halt_not_shared");
+    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.body["code"], "market_halted");
+}
+
+#[tokio::test]
+async fn a_resume_valkey_never_heard_keeps_the_market_halted() {
+    let store = Arc::new(FakeHaltStore::default());
+    let gateway = gateway(Setup { halts: Some(shared_halts(&store)), ..Default::default() });
+    gateway.halts.refresh().await;
+    gateway.admin(Method::POST, HALT).await;
+    store.set_down(true);
+
+    let reply = gateway.admin(Method::POST, RESUME).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.body["code"], "market_still_halted");
+    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.body["code"], "market_halted");
+}
+
+#[tokio::test]
+async fn an_unknown_market_cannot_be_halted() {
+    let gateway = gateway(Setup::default());
+    let reply = gateway.admin(Method::POST, "/api/v1/admin/markets/typo/halt").await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(reply.body["code"], "market_not_found");
+    assert!(!gateway.halts.is_halted("TYPO"));
+
+    let reply = gateway.admin(Method::POST, "/api/v1/admin/markets/a-b/halt").await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_reload_does_not_lift_a_halt() {
+    let gateway = gateway(Setup::default());
+    gateway.admin(Method::POST, HALT).await;
+    gateway.admin(Method::POST, "/api/v1/admin/markets/reload").await;
+    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.body["code"], "market_halted");
+}
+
+/// Lands a halt during the rate limit check, which sits between the order's two halt checks.
+struct HaltingLimiter(Arc<Halts>);
+
+#[async_trait]
+impl RateLimiter for HaltingLimiter {
+    async fn check(&self, _player: Uuid) -> Result<Decision, String> {
+        self.0.halt("ITEM").await?;
+        Ok(Decision::Allowed)
+    }
+}
+
+#[tokio::test]
+async fn a_halt_landing_during_the_checks_still_stops_the_order() {
+    let halts = Arc::new(Halts::standalone());
+    let gateway = gateway(Setup {
+        limiter: Arc::new(HaltingLimiter(halts.clone())),
+        halts: Some(halts),
+        ..Default::default()
+    });
+    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
+    assert_eq!(reply.body["code"], "market_halted");
+    assert_eq!(gateway.engine.sent(), 0);
+}
+
+struct CountingLimiter(AtomicUsize);
+
+#[async_trait]
+impl RateLimiter for CountingLimiter {
+    async fn check(&self, _player: Uuid) -> Result<Decision, String> {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Ok(Decision::Allowed)
+    }
+}
+
+#[tokio::test]
+async fn a_refused_order_does_not_spend_the_limit() {
+    let limiter = Arc::new(CountingLimiter(AtomicUsize::new(0)));
+    let gateway = gateway(Setup { limiter: limiter.clone(), ..Default::default() });
+    gateway.admin(Method::POST, HALT).await;
+    gateway.post(limit_order(Uuid::new_v4())).await;
+    assert_eq!(limiter.0.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn market_cancel_all_reports_every_answer_and_spans_players() {
+    let gateway = gateway(Setup {
+        outcomes: vec![OrderOutcome::Canceled, OrderOutcome::NotOpen, OrderOutcome::TimedOut],
+        ..Default::default()
+    });
+    gateway.stream.advance_to(4096);
+    gateway.store.position.store(4096, Ordering::Relaxed);
+    let orders = [open_order(), open_order(), open_order()];
+    *gateway.store.open_in_market.lock().unwrap() = orders.to_vec();
+
+    let reply = gateway.admin(Method::POST, CANCEL_ALL).await;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body, json!({"requested": 3, "canceled": 1, "failed": 1, "truncated": false}));
+    assert_eq!(gateway.engine.sent(), 3);
+    assert_eq!(*gateway.store.market_queries.lock().unwrap(), [("ITEM".to_string(), 10_000)]);
+
+    for (index, order) in orders.iter().enumerate() {
+        let message = gateway.engine.message(index);
+        let header: MessageHeaderDecoder<ReadBuf<'_>> =
+            MessageHeaderDecoder::default().wrap(ReadBuf::new(&message), 0);
+        let cancel: OrderCancelRequestDecoder<'_> = OrderCancelRequestDecoder::default().header(header, 0);
+        assert_eq!(cancel.account(), uuid_to_u64s(order.account), "each cancel carries its owner");
+        assert_eq!(cancel.orig_cl_ord_id(), uuid_to_u64s(order.id));
+    }
+}
+
+#[tokio::test]
+async fn market_cancel_all_says_when_it_was_truncated() {
+    let gateway = gateway(Setup::default());
+    gateway.stream.advance_to(0);
+    *gateway.store.open_in_market.lock().unwrap() = vec![open_order(); 10_000];
+
+    let reply = gateway.admin(Method::POST, CANCEL_ALL).await;
+    assert_eq!(reply.body["requested"], 10_000);
+    assert_eq!(reply.body["truncated"], true);
+}
+
+#[tokio::test]
+async fn market_cancel_all_does_not_halt() {
+    let gateway = gateway(Setup::default());
+    gateway.stream.advance_to(0);
+    gateway.admin(Method::POST, CANCEL_ALL).await;
+    assert!(!gateway.halts.is_halted("ITEM"));
+    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn market_cancel_all_reaches_a_market_taken_out_of_the_file() {
+    let gateway = gateway(Setup { outcomes: vec![OrderOutcome::Canceled], ..Default::default() });
+    gateway.stream.advance_to(0);
+    *gateway.store.open_in_market.lock().unwrap() = vec![open_order()];
+
+    let reply = gateway.admin(Method::POST, "/api/v1/admin/markets/gone/cancel-all").await;
+    assert_eq!(reply.body["canceled"], 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn market_cancel_all_waits_for_the_recorder_so_no_order_is_missed() {
+    let gateway = gateway(Setup::default());
+    gateway.stream.advance_to(4096);
+    gateway.store.position.store(1024, Ordering::Relaxed);
+    *gateway.store.open_in_market.lock().unwrap() = vec![open_order()];
+
+    let reply = gateway.admin(Method::POST, CANCEL_ALL).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.body["code"], "recorder_behind");
+    assert_eq!(gateway.engine.sent(), 0);
+}
+
+#[tokio::test]
+async fn market_cancel_all_sends_nothing_when_questdb_is_down() {
+    let gateway = gateway(Setup::default());
+    gateway.stream.advance_to(0);
+    gateway.store.failing.store(true, Ordering::Relaxed);
+    let reply = gateway.admin(Method::POST, CANCEL_ALL).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(gateway.engine.sent(), 0);
+}
+
+#[tokio::test]
+async fn without_a_cluster_a_published_cancel_is_not_counted_as_done() {
+    let gateway = gateway(Setup { clustered: false, ..Default::default() });
+    *gateway.store.open_in_market.lock().unwrap() = vec![open_order()];
+    let reply = gateway.admin(Method::POST, CANCEL_ALL).await;
+    assert_eq!(reply.body, json!({"requested": 1, "canceled": 0, "failed": 1, "truncated": false}));
+}
+
+#[tokio::test]
+async fn metrics_count_orders_by_what_happened() {
+    let gateway = gateway(Setup {
+        outcomes: vec![OrderOutcome::Accepted, OrderOutcome::Rejected],
+        ..Default::default()
+    });
+    gateway.post(limit_order(Uuid::new_v4())).await;
+    gateway.post(limit_order(Uuid::new_v4())).await;
+    let mut bad = limit_order(Uuid::new_v4());
+    bad["price"] = json!("1.01");
+    gateway.post(bad).await;
+    gateway.admin(Method::POST, HALT).await;
+    gateway.post(limit_order(Uuid::new_v4())).await;
+
+    let reply = gateway.send(Method::GET, "/metrics", None, None).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.content_type.unwrap().starts_with("text/plain; version=0.0.4"));
+    assert!(reply.text.contains("mmx_gateway_orders_accepted_total 1\n"), "{}", reply.text);
+    assert!(reply.text.contains("{reason=\"engine_rejected\"} 1\n"), "{}", reply.text);
+    assert!(reply.text.contains("{reason=\"invalid\"} 1\n"), "{}", reply.text);
+    assert!(reply.text.contains("mmx_gateway_halted_rejects_total 1\n"), "{}", reply.text);
+    assert!(reply.text.contains("mmx_gateway_orders_in_flight 0\n"), "{}", reply.text);
 }
 
 #[test]

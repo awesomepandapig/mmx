@@ -1,18 +1,38 @@
 use super::order::UuidType;
 
 use std::hint::spin_loop;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{error, info};
 
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
 
 use transport::{AeronExclusivePublication, AeronOfferError};
 
 const ORDER_QUEUE_LENGTH: usize = 1024;
 const BACK_PRESSURE_TIMEOUT: Duration = Duration::from_millis(100);
+const LINK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Whether the thread that owns the Aeron handles can reach the engine. Handles can't leave that
+/// thread, so it publishes the answer here for `/readyz`.
+#[derive(Default)]
+pub struct EngineLink(AtomicBool);
+
+impl EngineLink {
+    pub fn set(&self, connected: bool) {
+        self.0.store(connected, Ordering::Relaxed);
+    }
+
+    pub fn is_up(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
 
 /// What happened to a request, once it's certain.
 #[derive(Debug, PartialEq, Eq)]
@@ -71,8 +91,13 @@ fn offer(publication: &AeronExclusivePublication, message: &[u8]) -> Result<(), 
 
 /// Aeron handles can't leave the thread that created them, so one thread owns the client and
 /// request handlers queue their orders to it.
-pub fn spawn_order_publisher(channel: &str, stream_id: i32) -> Result<OrderSender, String> {
+pub fn spawn_order_publisher(
+    channel: &str,
+    stream_id: i32,
+    link: Arc<EngineLink>,
+) -> Result<OrderSender, String> {
     let channel = channel.to_string();
+    let runtime = Handle::current();
     let (orders, mut pending) = mpsc::channel::<OutboundOrder>(ORDER_QUEUE_LENGTH);
     let (started, startup) = std_mpsc::channel();
 
@@ -96,7 +121,14 @@ pub fn spawn_order_publisher(channel: &str, stream_id: i32) -> Result<OrderSende
             };
             info!("Aeron: Created publication {} on stream {}", channel, stream_id);
 
-            while let Some(order) = pending.blocking_recv() {
+            loop {
+                link.set(publication.is_connected());
+                // Waking up now and then keeps the link current while no orders arrive.
+                let order = match runtime.block_on(timeout(LINK_CHECK_INTERVAL, pending.recv())) {
+                    Ok(Some(order)) => order,
+                    Ok(None) => return,
+                    Err(_) => continue,
+                };
                 let outcome = match offer(&publication, &order.message) {
                     Ok(()) => OrderOutcome::Accepted,
                     Err(err) => OrderOutcome::Failed(err),
