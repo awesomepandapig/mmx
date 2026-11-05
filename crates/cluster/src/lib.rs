@@ -7,14 +7,22 @@
 
 use std::hint::spin_loop;
 use std::ptr;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use rusteron_client::*;
 
+mod retention;
+mod schedule;
 mod snapshot;
 
-pub use snapshot::ArchiveClient;
+use retention::Housekeeper;
+use schedule::SnapshotSchedule;
+
+pub use retention::{Retention, TapeMark, TapeRetention};
+pub use schedule::SnapshotPolicy;
+pub use snapshot::{ArchiveClient, TapeExtent};
 
 const SCHEMA_ID: u16 = 111;
 const SCHEMA_VERSION: u16 = 17;
@@ -23,6 +31,7 @@ const PROTOCOL_VERSION: i32 = 3 << 8; // 0.3.0
 const NULL_VALUE: i64 = -1;
 const NULL_POSITION: i64 = -1;
 
+const CONTROL_TOGGLE_TYPE_ID: i32 = 202;
 const COMMIT_POSITION_TYPE_ID: i32 = 203;
 const RECOVERY_STATE_TYPE_ID: i32 = 204;
 
@@ -52,6 +61,9 @@ const TEMPLATE_REQUEST_SERVICE_ACK: u16 = 108;
 
 const ACTION_SNAPSHOT: i32 = 2;
 
+const TOGGLE_NEUTRAL: i64 = 1;
+const TOGGLE_SNAPSHOT: i64 = 4;
+
 const EVENT_OK: i32 = 0;
 const EVENT_ERROR: i32 = 1;
 const EVENT_REDIRECT: i32 = 2;
@@ -73,28 +85,50 @@ impl Role {
     }
 }
 
+/// What the service wants from the snapshot schedule right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotRequest {
+    /// Follow the schedule.
+    Scheduled,
+    /// Take one as soon as this node leads, whatever the schedule says.
+    Now,
+    /// Skip the schedule, because the state isn't worth keeping yet.
+    Hold,
+}
+
 /// The application side of a cluster node. Callbacks run on the service thread, in log order, so
 /// every node sees exactly the same sequence.
 pub trait ClusteredService {
-    fn on_session_message(&mut self, timestamp: i64, log_position: i64, payload: &[u8]);
+    fn on_session_message(&mut self, archive: &ArchiveClient, timestamp: i64, log_position: i64, payload: &[u8]);
     fn on_role_change(&mut self, role: Role);
     /// Runs in log order when a leadership term starts. Nothing from an older term can follow,
     /// because the consensus module drops ingress stamped with any other term.
     fn on_new_leadership_term(&mut self, leadership_term_id: i64);
-    fn do_background_work(&mut self) {}
-    /// Writes the full state in chunks small enough for one Aeron message.
-    fn on_take_snapshot(&mut self, archive: &ArchiveClient, write: &mut dyn FnMut(&[u8]));
+    /// Runs once replay has finished, before this node acknowledges the live log. A leader can't
+    /// open the log for new messages until that acknowledgement arrives, so a service that exits
+    /// here keeps the cluster from moving past this position.
+    fn on_join_live_log(&mut self, archive: &ArchiveClient, role: Role, log_position: i64);
+    fn do_background_work(&mut self, _archive: &ArchiveClient) {}
+    fn snapshot_request(&self) -> SnapshotRequest {
+        SnapshotRequest::Scheduled
+    }
+    /// Writes the full state in chunks small enough for one Aeron message, and returns where the
+    /// snapshot sits on the tape.
+    fn on_take_snapshot(&mut self, archive: &ArchiveClient, write: &mut dyn FnMut(&[u8])) -> TapeMark;
     /// Receives the chunks written by `on_take_snapshot`, in order.
     fn on_load_snapshot(&mut self, chunk: &[u8]);
     /// Runs once any snapshot is loaded, before the service joins the log.
     fn on_recovered(&mut self, archive: &ArchiveClient);
 }
 
-/// Where the service finds this node's Aeron driver and Archive.
+/// Where the service finds this node's Aeron driver and Archive, and how it looks after them.
+#[derive(Clone)]
 pub struct NodeConfig {
     pub cluster_id: i32,
     pub aeron_dir: String,
     pub archive_control_channel: String,
+    pub snapshots: SnapshotPolicy,
+    pub retention: Retention,
 }
 
 fn read_i32(buffer: &[u8], offset: usize) -> i32 {
@@ -148,11 +182,21 @@ struct ActiveLog {
     channel: String,
 }
 
+impl ActiveLog {
+    /// A replay ends at a known position, and only the live log has no end.
+    const fn is_live(&self) -> bool {
+        self.max_log_position == i64::MAX
+    }
+}
+
 struct Agent<'a, S: ClusteredService> {
     aeron: &'a Aeron,
     archive: snapshot::ArchiveClient,
     service: &'a mut S,
     consensus: AeronPublication,
+    control_toggle: &'a AtomicI64,
+    schedule: SnapshotSchedule,
+    housekeeper: Housekeeper,
     ack_id: i64,
     log_position: i64,
     cluster_time: i64,
@@ -177,6 +221,28 @@ impl<S: ClusteredService> Agent<'_, S> {
         while let Err(error) = self.consensus.offer(&message) {
             assert!(error.is_retryable(), "failed to ack the consensus module: {error}");
             spin_loop();
+        }
+    }
+
+    /// Asks the consensus module for a snapshot, the way `ClusterTool snapshot` does. It only
+    /// takes effect once the toggle is neutral, so a request already in progress can't double up.
+    /// The consensus module only reads this toggle on the leader.
+    fn request_snapshot_if_due(&self) {
+        if self.role != Role::Leader {
+            return;
+        }
+        let wanted = match self.service.snapshot_request() {
+            SnapshotRequest::Now => true,
+            SnapshotRequest::Scheduled => self.schedule.is_due(self.log_position, self.cluster_time),
+            SnapshotRequest::Hold => false,
+        };
+        if wanted {
+            let _ = self.control_toggle.compare_exchange(
+                TOGGLE_NEUTRAL,
+                TOGGLE_SNAPSHOT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 
@@ -214,6 +280,7 @@ impl<S: ClusteredService> Agent<'_, S> {
             TEMPLATE_SESSION_MESSAGE => {
                 self.cluster_time = read_i64(body, 16);
                 self.service.on_session_message(
+                    &self.archive,
                     self.cluster_time,
                     position,
                     &buffer[SESSION_HEADER_LENGTH..],
@@ -228,10 +295,12 @@ impl<S: ClusteredService> Agent<'_, S> {
             TEMPLATE_CLUSTER_ACTION => {
                 self.cluster_time = read_i64(body, 16);
                 if read_i32(body, 24) == ACTION_SNAPSHOT {
-                    let started = Instant::now();
-                    let recording_id = snapshot::take(&self.archive, self.service);
-                    self.ack(read_i64(body, 8), recording_id);
-                    eprintln!("snapshot took {:?}, recording {recording_id}", started.elapsed());
+                    let log_position = read_i64(body, 8);
+                    let (recording_id, tape, timing) = snapshot::take(&self.archive, self.service);
+                    self.ack(log_position, recording_id);
+                    self.schedule.on_snapshot(log_position, self.cluster_time);
+                    self.housekeeper.on_snapshot(recording_id, log_position, tape);
+                    eprintln!("snapshot recording {recording_id}: {timing}");
                 }
             }
             _ => {}
@@ -258,6 +327,9 @@ impl<S: ClusteredService> Agent<'_, S> {
         assert_eq!(active.log_position, self.log_position, "the log must be contiguous");
 
         self.max_log_position = active.max_log_position;
+        if active.is_live() {
+            self.service.on_join_live_log(&self.archive, active.role, active.log_position);
+        }
         self.ack(active.log_position, NULL_VALUE);
 
         if self.role != active.role {
@@ -284,9 +356,14 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
         .expect("failed to add the service subscription");
 
     let (commit_counter, _) = await_counter(aeron, COMMIT_POSITION_TYPE_ID, cluster_id, 0);
+    let (toggle_counter, _) = await_counter(aeron, CONTROL_TOGGLE_TYPE_ID, cluster_id, 0);
     let (_, recovery) = await_counter(aeron, RECOVERY_STATE_TYPE_ID, cluster_id, 24);
     let reader = aeron.counters_reader();
     let commit_position: *const i64 = reader.addr(commit_counter);
+    let toggle_position: *const i64 = reader.addr(toggle_counter);
+    // SAFETY: the counter lives in the driver's counters file for the client's lifetime, is
+    // aligned for an i64, and every other writer uses atomic operations on it too.
+    let control_toggle = unsafe { AtomicI64::from_ptr(toggle_position.cast_mut()) };
 
     let archive = snapshot::connect(config);
     if read_i64(&recovery, 0) != NULL_VALUE {
@@ -296,14 +373,19 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
     }
     service.on_recovered(&archive);
 
+    let recovered_position = read_i64(&recovery, 8);
+    let recovered_time = read_i64(&recovery, 16);
     let mut agent = Agent {
         aeron,
         archive,
         service,
         consensus,
+        control_toggle,
+        schedule: SnapshotSchedule::new(config.snapshots, recovered_position, recovered_time),
+        housekeeper: Housekeeper::start(config),
         ack_id: 0,
-        log_position: read_i64(&recovery, 8),
-        cluster_time: read_i64(&recovery, 16),
+        log_position: recovered_position,
+        cluster_time: recovered_time,
         termination_position: NULL_POSITION,
         requested_ack_position: NULL_POSITION,
         active_log: None,
@@ -367,7 +449,8 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
             }
         }
 
-        agent.service.do_background_work();
+        agent.service.do_background_work(&agent.archive);
+        agent.request_snapshot_if_due();
 
         if polled == 0 {
             spin_loop();

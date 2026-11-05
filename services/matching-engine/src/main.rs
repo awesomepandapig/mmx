@@ -1,10 +1,17 @@
+mod admin;
 mod clustered;
 mod config;
+#[cfg(feature = "diagnostics")]
+mod diagnostics;
 mod handler;
 mod metrics;
 mod orderbook;
 mod publisher;
+mod recovery;
 mod side;
+mod snapshot;
+#[cfg(test)]
+mod tests;
 mod types;
 
 use config::{create_exclusive_publication, create_subscription, error_handler};
@@ -28,17 +35,26 @@ const FRAGMENT_LIMIT: usize = 10;
 
 pub fn on_message(buffer: &[u8], handler: &mut Handler, metrics: &mut LatencyMetrics) {
     let started = LatencyMetrics::start();
+    if dispatch(buffer, handler) {
+        metrics.record(started);
+    }
+}
 
+/// Handles one order or cancel, and returns whether it was a new order. It reads no clock, so
+/// it's safe on the clustered path.
+#[inline(always)]
+pub fn dispatch(buffer: &[u8], handler: &mut Handler) -> bool {
     let read_buf = ReadBuf::new(buffer);
     let header_decoder: MessageHeaderDecoder<ReadBuf<'_>> =
         MessageHeaderDecoder::default().wrap(read_buf, 0);
     match header_decoder.template_id() {
         1 => {
             handler.process_new_order(header_decoder);
-            metrics.record(started);
+            true
         }
         2 => {
             handler.process_cancel_order(header_decoder);
+            false
         }
         unknown_id => {
             error!(
@@ -46,11 +62,21 @@ pub fn on_message(buffer: &[u8], handler: &mut Handler, metrics: &mut LatencyMet
                 template_id = unknown_id,
                 "Unknown message template ID received, rejecting message"
             );
+            false
         }
     }
 }
 
 fn main() -> ! {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|command| command == "admin") {
+        if let Err(message) = admin::run(&args[1..]) {
+            eprintln!("{message}");
+            process::exit(2);
+        }
+        process::exit(0);
+    }
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let subscriber = FmtSubscriber::builder().with_env_filter(filter).finish();
 

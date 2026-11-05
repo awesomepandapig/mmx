@@ -3,103 +3,152 @@
 //! Every node applies the same log and produces the same bytes, so nothing here reads a clock or
 //! depends on being leader. Each node publishes and records its own output stream, and consumers
 //! can follow any node by stream position.
+//!
+//! The one exception is deciding to stop. A node that can't continue exits rather than diverging,
+//! and `recovery.rs` makes those decisions.
 
+use std::process;
+
+use cluster::{ArchiveClient, Role, SnapshotRequest, TapeExtent, TapeMark};
+
+use crate::admin::{self, AdminCommand};
+use crate::config;
+use crate::dispatch;
 use crate::handler::Handler;
-use crate::metrics::LatencyMetrics;
-use crate::publisher::{self, Publisher};
-use crate::{on_message, types};
+use crate::publisher::{OUTPUT_SESSION_ID, OUTPUT_STREAM_ID, Publisher, RecoveryEvent};
+use crate::recovery::{self, EXIT_TOTAL_LOSS, Join, RebuildPlan, RebuildRequest, RecoveryConfig, Startup, TapeFold};
+use crate::snapshot;
 
-const SNAPSHOT_HEADER: usize = 56;
-const SNAPSHOT_CHUNK: usize = 60_000;
-
-/// Times messages on one clock: from the leader stamping them into the log to this node
-/// finishing them, and matching alone.
-struct Timing {
-    path: String,
-    matching: Vec<u64>,
-    in_to_out: Vec<u64>,
-    reported: usize,
-    seen_at_last_check: usize,
-}
-
-impl Timing {
-    fn record(&mut self, matching: u64, in_to_out: u64) {
-        if self.matching.len() < self.matching.capacity() {
-            self.matching.push(matching);
-            self.in_to_out.push(in_to_out);
-        }
-    }
-
-    fn report(&mut self) {
-        if self.matching.len() == self.reported {
-            return;
-        }
-        self.reported = self.matching.len();
-        let line = |name: &str, values: &[u64]| {
-            let mut sorted = values.to_vec();
-            sorted.sort_unstable();
-            let at = |q: f64| sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)];
-            format!(
-                "{name} n={} p50={} p99={} p99.9={} p99.99={} max={}\n",
-                sorted.len(), at(0.5), at(0.99), at(0.999), at(0.9999), at(1.0)
-            )
-        };
-        let warm_from = self.in_to_out.len() / 5;
-        let mut worst: Vec<(u64, usize)> = self.in_to_out.iter().copied().zip(0..).collect();
-        worst.sort_unstable_by(|a, b| b.cmp(a));
-        // Stalls show up as runs of neighbours, so report only well separated ones.
-        let mut stalls: Vec<(u64, usize)> = Vec::new();
-        for (value, index) in worst {
-            if stalls.iter().all(|(_, seen)| seen.abs_diff(index) > 20_000) {
-                stalls.push((value, index));
-                if stalls.len() == 6 {
-                    break;
-                }
-            }
-        }
-        let text = line("matching_ns", &self.matching)
-            + &line("in_to_out_ns", &self.in_to_out)
-            + &line("warm_in_to_out_ns", &self.in_to_out[warm_from..])
-            + &format!("stalls_us_at_index {:?}\n", stalls.iter().map(|(v, i)| (v / 1000, *i)).collect::<Vec<_>>());
-        let _ = std::fs::write(&self.path, text);
-    }
-}
+#[cfg(feature = "diagnostics")]
+use crate::diagnostics::Diagnostics;
 
 struct ClusteredEngine {
-    timing: Option<Timing>,
-    last_timing_report: std::time::Instant,
     aeron: transport::Aeron,
     output_channel: String,
-    output_position: i64,
     handler: Handler,
-    metrics: LatencyMetrics,
-    digest_file: Option<String>,
-    last_written: u64,
-    last_report: std::time::Instant,
+    recovery: RecoveryConfig,
+    /// While set, output is held back and the tape is left untouched, because it may hold more
+    /// than the log can reproduce.
+    held: bool,
+    loader: Option<snapshot::Loader>,
+    snapshot_wanted: bool,
+    tape_swept: Option<i64>,
+    #[cfg(feature = "diagnostics")]
+    diagnostics: Diagnostics,
+}
+
+/// Stops this node. Exiting before the ack is what keeps a leader from opening the log.
+fn refuse(reason: &str) -> ! {
+    eprintln!("refusing to resume: {reason}");
+    process::exit(EXIT_TOTAL_LOSS);
+}
+
+fn tape(archive: &ArchiveClient) -> Option<TapeExtent> {
+    archive.await_tape_extent(OUTPUT_STREAM_ID, OUTPUT_SESSION_ID)
+}
+
+impl ClusteredEngine {
+    /// Opens the output stream at `position`, cutting off anything newer on the tape, and resends
+    /// `unsent` reports from the ring.
+    fn open_output(&mut self, archive: &ArchiveClient, position: i64, unsent: u64) {
+        let channel = archive.prepare_output(&self.output_channel, OUTPUT_STREAM_ID, OUTPUT_SESSION_ID, position);
+        let publication = transport::exclusive_publication(&self.aeron, &channel, OUTPUT_STREAM_ID)
+            .expect("failed to add the output publication");
+        self.handler.publisher.open_output(publication, unsent);
+        self.held = false;
+        eprintln!("output open at {position}, {unsent} reports to resend");
+    }
+
+    /// Ends a hold that replay has made safe.
+    fn release_output(&mut self, archive: &ArchiveClient) {
+        let position = self.handler.publisher.output_position();
+        match recovery::output_start(position, tape(archive).map(|tape| tape.stop)) {
+            Ok((start, unsent)) => self.open_output(archive, start, unsent),
+            Err(reason) => refuse(&reason),
+        }
+    }
+
+    fn rebuild(&mut self, archive: &ArchiveClient, expected: i64, target: i64) {
+        let request = RebuildRequest {
+            expected,
+            target,
+            quiet: self.handler.publisher.quiet_range(),
+            durable: self.recovery.durable,
+            held: self.held,
+            tape: if self.held { tape(archive) } else { None },
+        };
+        let from = match recovery::plan_rebuild(&request) {
+            RebuildPlan::Apply { from } => from,
+            RebuildPlan::Ignore(reason) => return eprintln!("ignoring the rebuild: {reason}"),
+            RebuildPlan::Refuse(reason) => refuse(&reason),
+        };
+
+        let mut fold = TapeFold::seed(&self.handler);
+        let mut failure = Ok(());
+        let read = archive.read_tape(OUTPUT_STREAM_ID, OUTPUT_SESSION_ID, from, target, &mut |message| {
+            if failure.is_ok() {
+                failure = fold.apply(message);
+            }
+        });
+        if let Err(reason) = read.and(failure) {
+            refuse(&reason);
+        }
+
+        fold.install(&mut self.handler);
+        self.handler.publisher.rebase(target);
+        self.open_output(archive, target, 0);
+        if let Err(reason) = fold.settle(&mut self.handler) {
+            refuse(&reason);
+        }
+
+        let open_orders = self.handler.book.pool.len();
+        self.handler.publisher.publish_recovery_marker(RecoveryEvent::Rebuilt, target, open_orders as u64);
+        // Replaying the log would need this exact tape again, so make the result stand on its own.
+        self.snapshot_wanted = true;
+        eprintln!("rebuilt the book from the tape at {target}, {open_orders} open orders");
+    }
+
+    fn on_admin(&mut self, archive: &ArchiveClient, message: &[u8]) {
+        match AdminCommand::decode(message) {
+            Some(AdminCommand::Rebuild { expected, position }) => self.rebuild(archive, expected, position),
+            Some(AdminCommand::CancelAll) => {
+                let canceled = self.handler.cancel_all();
+                let position = self.handler.publisher.output_position();
+                self.handler.publisher.publish_recovery_marker(RecoveryEvent::CanceledAll, position, canceled as u64);
+                eprintln!("canceled {canceled} open orders");
+            }
+            Some(AdminCommand::TapeSwept { position }) => {
+                self.tape_swept = Some(self.tape_swept.map_or(position, |swept| swept.max(position)));
+            }
+            None => eprintln!("ignoring a malformed admin command"),
+        }
+    }
 }
 
 impl cluster::ClusteredService for ClusteredEngine {
-    fn on_session_message(&mut self, timestamp: i64, _log_position: i64, payload: &[u8]) {
+    fn on_session_message(&mut self, archive: &ArchiveClient, timestamp: i64, _log_position: i64, payload: &[u8]) {
         self.handler.publisher.set_cluster_time(timestamp as u64);
-        let match_started = self.timing.is_some().then(std::time::Instant::now);
+        #[cfg(feature = "diagnostics")]
+        let started = self.diagnostics.message_started();
+
         let mut offset = 0;
         while offset < payload.len() {
             let block_length = u16::from_le_bytes([payload[offset], payload[offset + 1]]) as usize;
             let end = offset + 8 + block_length;
-            on_message(&payload[offset..end], &mut self.handler, &mut self.metrics);
+            let message = &payload[offset..end];
+            if admin::is_admin(message) {
+                self.on_admin(archive, message);
+            } else {
+                dispatch(message, &mut self.handler);
+            }
             offset = end;
         }
 
-        if let (Some(timing), Some(started)) = (&mut self.timing, match_started) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock is after the epoch")
-                .as_nanos() as i64;
-            timing.record(started.elapsed().as_nanos() as u64, (now - timestamp).max(0) as u64);
-        }
+        #[cfg(feature = "diagnostics")]
+        self.diagnostics.message_finished(started, timestamp);
     }
 
-    fn on_role_change(&mut self, role: cluster::Role) {
+    fn on_role_change(&mut self, role: Role) {
         eprintln!("role {role:?}");
     }
 
@@ -107,127 +156,102 @@ impl cluster::ClusteredService for ClusteredEngine {
         self.handler.publisher.publish_term_marker(leadership_term_id);
     }
 
-    fn on_recovered(&mut self, archive: &cluster::ArchiveClient) {
-        let started = std::time::Instant::now();
-        let channel = archive.prepare_output(
-            &self.output_channel,
-            publisher::OUTPUT_STREAM_ID,
-            publisher::OUTPUT_SESSION_ID,
-            self.output_position,
-        );
-        let publication = transport::exclusive_publication(&self.aeron, &channel, publisher::OUTPUT_STREAM_ID)
-            .expect("failed to add the output publication");
-        self.handler.publisher.open_output(publication);
-        eprintln!("output open at {} in {:?}", self.output_position, started.elapsed());
+    fn on_join_live_log(&mut self, archive: &ArchiveClient, role: Role, _log_position: i64) {
+        let Some(durable) = self.recovery.durable.filter(|_| self.held) else { return };
+        let recovered = self.handler.publisher.output_position();
+        match recovery::at_join(recovered, durable, role == Role::Leader, self.recovery.rebuild) {
+            Join::Release => self.release_output(archive),
+            Join::Wait => eprintln!("holding output: recovered {recovered}, durable {durable}"),
+            Join::Refuse => refuse(&format!(
+                "total loss: the log recovered output to {recovered}, but {durable} is durable. Set \
+                 RECOVERY_MODE=rebuild, then run: matching-engine admin rebuild {recovered} POSITION"
+            )),
+        }
     }
 
-    fn on_take_snapshot(&mut self, archive: &cluster::ArchiveClient, write: &mut dyn FnMut(&[u8])) {
-        let started = std::time::Instant::now();
-        let output_position = self.handler.publisher.flush();
-        if std::env::var("NO_OUTPUT").is_err() {
-            archive.await_recorded(self.handler.publisher.session_id(), output_position);
+    fn on_recovered(&mut self, archive: &ArchiveClient) {
+        if let Some(loader) = self.loader.take() {
+            loader.finish(&mut self.handler);
         }
+        let position = self.handler.publisher.output_position();
+        if self.recovery.durable.is_none() {
+            eprintln!("DURABLE_POSITION isn't set, so a total loss can't be detected");
+        }
+        match recovery::at_startup(position, self.recovery) {
+            Startup::Open => self.open_output(archive, position, 0),
+            Startup::Hold => {
+                self.held = true;
+                eprintln!("holding output at {position} until replay ends");
+            }
+        }
+    }
+
+    fn on_take_snapshot(&mut self, archive: &ArchiveClient, write: &mut dyn FnMut(&[u8])) -> TapeMark {
+        let started = std::time::Instant::now();
+        let position = if self.held {
+            self.handler.publisher.output_position()
+        } else {
+            let flushed = self.handler.publisher.flush();
+            archive.await_recorded(self.handler.publisher.session_id(), flushed);
+            flushed
+        };
         eprintln!("output flushed in {:?}", started.elapsed());
 
-        let handler = &self.handler;
-        let (written, digest) = handler.publisher.state();
-        let mut header = [0u8; SNAPSHOT_HEADER];
-        header[0] = 1;
-        for (i, value) in [handler.counter_order_id, handler.counter_exec_id, handler.counter_match_id, written, digest, output_position as u64].iter().enumerate() {
-            header[8 + i * 8..16 + i * 8].copy_from_slice(&value.to_le_bytes());
+        let computed = self.handler.publisher.output_position();
+        if computed != position {
+            eprintln!("BUG: output is at {position}, but the engine computed {computed}");
         }
-        write(&header);
 
-        let mut chunk = Vec::with_capacity(SNAPSHOT_CHUNK);
-        chunk.push(2u8);
-        handler.book.for_each_resting(&mut |order| {
-            types::encode_order(order, &mut chunk);
-            if chunk.len() + types::ORDER_RECORD > SNAPSHOT_CHUNK {
-                write(&chunk);
-                chunk.truncate(1);
-            }
-        });
-        if chunk.len() > 1 {
-            write(&chunk);
-        }
+        let mut output = self.handler.publisher.state();
+        output.position = position;
+        snapshot::write(&self.handler, &output, write);
+        self.snapshot_wanted = false;
+        TapeMark { position, swept: self.tape_swept }
     }
 
     fn on_load_snapshot(&mut self, chunk: &[u8]) {
-        match chunk[0] {
-            1 => {
-                let value = |i: usize| u64::from_le_bytes(chunk[8 + i * 8..16 + i * 8].try_into().expect("eight bytes"));
-                self.handler.counter_order_id = value(0);
-                self.handler.counter_exec_id = value(1);
-                self.handler.counter_match_id = value(2);
-                self.handler.publisher.restore(value(3), value(4));
-                self.output_position = value(5) as i64;
-            }
-            _ => {
-                for record in chunk[1..].chunks_exact(types::ORDER_RECORD) {
-                    let order = types::decode_order(record);
-                    if order.side == sbe::side_enum::SideEnum::Buy {
-                        self.handler.book.add_bid(&order);
-                    } else {
-                        self.handler.book.add_ask(&order);
-                    }
-                }
-            }
+        let loader = self.loader.get_or_insert_with(snapshot::Loader::default);
+        loader.on_chunk(&mut self.handler, chunk);
+    }
+
+    fn snapshot_request(&self) -> SnapshotRequest {
+        if self.held {
+            SnapshotRequest::Hold
+        } else if self.snapshot_wanted {
+            SnapshotRequest::Now
+        } else {
+            SnapshotRequest::Scheduled
         }
     }
 
-    fn do_background_work(&mut self) {
+    fn do_background_work(&mut self, archive: &ArchiveClient) {
         self.handler.publisher.drain();
 
-        // Sorting takes long enough to stall matching, so it only runs once traffic has stopped.
-        if self.last_timing_report.elapsed().as_secs() >= 2 {
-            self.last_timing_report = std::time::Instant::now();
-            if let Some(timing) = &mut self.timing
-                && timing.matching.len() == timing.seen_at_last_check
-            {
-                timing.report();
-            } else if let Some(timing) = &mut self.timing {
-                timing.seen_at_last_check = timing.matching.len();
+        if self.held && !self.recovery.rebuild {
+            let position = self.handler.publisher.output_position();
+            if self.recovery.durable.is_some_and(|durable| position >= durable) {
+                self.release_output(archive);
             }
         }
 
-        if self.last_report.elapsed().as_millis() >= 100 {
-            self.last_report = std::time::Instant::now();
-            let (written, digest) = self.handler.publisher.state();
-            if written != self.last_written {
-                self.last_written = written;
-                if let Some(path) = &self.digest_file {
-                    let _ = std::fs::write(path, format!("{written} {digest:016x}\n"));
-                }
-            }
-        }
+        #[cfg(feature = "diagnostics")]
+        self.diagnostics.report(&self.handler.publisher);
     }
 }
 
 pub fn run(aeron: &transport::Aeron) {
-    let publisher = Publisher::new(None, true);
     let mut engine = ClusteredEngine {
-        timing: std::env::var("TIMING_FILE").ok().map(|path| Timing {
-            path,
-            matching: Vec::with_capacity(8_000_000),
-            in_to_out: Vec::with_capacity(8_000_000),
-            reported: 0,
-            seen_at_last_check: 0,
-        }),
-        last_timing_report: std::time::Instant::now(),
         aeron: aeron.clone(),
         output_channel: std::env::var("PUB_CHANNEL").expect("PUB_CHANNEL is required"),
-        output_position: 0,
-        handler: Handler::new(publisher),
-        metrics: LatencyMetrics::new(100_000),
-        digest_file: std::env::var("DIGEST_FILE").ok(),
-        last_written: 0,
-        last_report: std::time::Instant::now(),
+        handler: Handler::new(Publisher::new(None, true)),
+        recovery: config::recovery_config(),
+        held: false,
+        loader: None,
+        snapshot_wanted: false,
+        tape_swept: None,
+        #[cfg(feature = "diagnostics")]
+        diagnostics: Diagnostics::from_env(),
     };
     eprintln!("service joining the cluster");
-    let config = cluster::NodeConfig {
-        cluster_id: 0,
-        aeron_dir: transport::aeron_dir(),
-        archive_control_channel: std::env::var("ARCHIVE_CONTROL").expect("ARCHIVE_CONTROL is required"),
-    };
-    cluster::run(aeron, &config, &mut engine);
+    cluster::run(aeron, &config::node_config(), &mut engine);
 }

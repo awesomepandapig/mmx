@@ -74,21 +74,29 @@ impl OrderBook {
         self.price_map.clear();
     }
 
-    /// Visits resting orders from the head of each level, so restoring them in this order
-    /// preserves time priority.
-    pub fn for_each_resting(&self, visit: &mut dyn FnMut(&Order)) {
-        for (symbol, trees) in &self.trees {
-            for (tree, is_bid) in [(&trees.bids_price_tree, true), (&trees.asks_price_tree, false)] {
-                for &price in tree {
-                    let key = LevelKey { price, symbol: *symbol, is_bid };
-                    let mut next = self.price_map[&key].head_order_idx;
-                    while let Some(index) = next {
-                        let order = &self.pool[index];
-                        visit(order);
-                        next = order.next_order_idx;
-                    }
-                }
-            }
+    /// Every resting order, in pool order. That order differs between nodes that loaded a
+    /// snapshot and nodes that didn't, so never let it reach the output.
+    pub fn resting(&self) -> impl Iterator<Item = &Order> {
+        self.pool.iter().map(|(_, order)| order)
+    }
+
+    /// Empties the book, keeping its memory and every symbol's trees.
+    pub fn reset(&mut self) {
+        self.pool.clear();
+        self.order_key_map.clear();
+        self.price_map.clear();
+        for trees in self.trees.values_mut() {
+            trees.bids_price_tree.clear();
+            trees.asks_price_tree.clear();
+        }
+    }
+
+    /// Adds an order to the back of its queue.
+    pub fn add(&mut self, order: &Order) {
+        if order.side == SideEnum::Buy {
+            self.add_bid(order);
+        } else {
+            self.add_ask(order);
         }
     }
 

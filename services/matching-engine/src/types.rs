@@ -76,19 +76,20 @@ pub struct CancelRequest {
 pub const ORDER_RECORD: usize = 104;
 
 /// Writes the fields that define a resting order. Queue links are rebuilt on load.
-pub fn encode_order(order: &Order, out: &mut Vec<u8>) {
-    out.extend_from_slice(&order.price.to_le_bytes());
-    out.extend_from_slice(&order.quantity.to_le_bytes());
-    out.extend_from_slice(&order.leaves_quantity.to_le_bytes());
-    out.extend_from_slice(&order.cumulative_quantity.to_le_bytes());
-    out.extend_from_slice(&order.total_notional.to_le_bytes());
-    out.extend_from_slice(&order.sequence_number.to_le_bytes());
-    out.extend_from_slice(&order.client_order_id.to_le_bytes());
-    out.extend_from_slice(&order.account.to_le_bytes());
-    out.extend_from_slice(&order.transact_time.to_le_bytes());
-    out.extend_from_slice(&order.symbol);
-    out.push(order.side as u8);
-    out.push(order.r#type as u8);
+#[inline(always)]
+pub fn encode_order(order: &Order, record: &mut [u8; ORDER_RECORD]) {
+    record[0..8].copy_from_slice(&order.price.to_le_bytes());
+    record[8..16].copy_from_slice(&order.quantity.to_le_bytes());
+    record[16..24].copy_from_slice(&order.leaves_quantity.to_le_bytes());
+    record[24..32].copy_from_slice(&order.cumulative_quantity.to_le_bytes());
+    record[32..48].copy_from_slice(&order.total_notional.to_le_bytes());
+    record[48..56].copy_from_slice(&order.sequence_number.to_le_bytes());
+    record[56..72].copy_from_slice(&order.client_order_id.to_le_bytes());
+    record[72..88].copy_from_slice(&order.account.to_le_bytes());
+    record[88..96].copy_from_slice(&order.transact_time.to_le_bytes());
+    record[96..102].copy_from_slice(&order.symbol);
+    record[102] = order.side as u8;
+    record[103] = order.r#type as u8;
 }
 
 pub fn decode_order(record: &[u8]) -> Order {
