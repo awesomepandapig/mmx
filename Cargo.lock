@@ -2969,8 +2969,13 @@ name = "websocket"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "base64 0.22.1",
+ "bytes",
  "chrono",
  "futures-util",
+ "parking_lot",
+ "ring",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
