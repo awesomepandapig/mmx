@@ -72,8 +72,8 @@ spec:
               value: mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012
             - name: TAPE_REPORTS
               value: mmx-node-0.mmx-node:40450,mmx-node-1.mmx-node:40451,mmx-node-2.mmx-node:40452
-            - name: QUESTDB_PG_URL
-              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: QUESTDB_URL
+              value: "http://mmx-questdb:9000"
             - name: VALKEY_URL
               value: redis://mmx-valkey:6379
             - name: MARKETS_FILE

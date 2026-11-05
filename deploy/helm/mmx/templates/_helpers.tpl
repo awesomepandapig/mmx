@@ -131,8 +131,8 @@ capabilities:
 {{- if .Values.questdb.enabled }}
 - name: QUESTDB_CONF
   value: "http::addr={{ include "mmx.fullname" . }}-questdb:9000;"
-- name: QUESTDB_PG_URL
-  value: "postgres://admin:quest@{{ include "mmx.fullname" . }}-questdb:8812/qdb"
+- name: QUESTDB_URL
+  value: "http://{{ include "mmx.fullname" . }}-questdb:9000"
 {{- end }}
 {{- if .Values.valkey.enabled }}
 - name: VALKEY_URL

@@ -183,10 +183,10 @@ fn parse_orders(reply: &ExecReply) -> Result<Vec<RecordedOrder>, String> {
             Ok(RecordedOrder {
                 id: Uuid::parse_str(&text(row, id)?).map_err(|err| err.to_string())?,
                 symbol: text(row, symbol)?,
-                side: if row[side].as_bool().ok_or("side is not a boolean")? {
-                    SideEnum::Buy
-                } else {
-                    SideEnum::Sell
+                side: match text(row, side)?.as_str() {
+                    "buy" => SideEnum::Buy,
+                    "sell" => SideEnum::Sell,
+                    other => return Err(format!("unknown side {other}")),
                 },
                 status: parse_status(&text(row, status)?)?,
                 leaves_mantissa: number(row, leaves).ok_or("leaves_qty is not a number")?,
@@ -311,16 +311,16 @@ mod tests {
         let body = r#"{
             "columns": [
                 {"name":"cl_ord_id","type":"VARCHAR"},{"name":"symbol","type":"SYMBOL"},
-                {"name":"ord_status","type":"SYMBOL"},{"name":"side","type":"BOOLEAN"},
+                {"name":"ord_status","type":"SYMBOL"},{"name":"side","type":"SYMBOL"},
                 {"name":"leaves_qty","type":"LONG"},{"name":"cum_qty","type":"LONG"},
                 {"name":"price","type":"LONG"},{"name":"avg_px","type":"LONG"},
                 {"name":"created_at","type":"TIMESTAMP"},{"name":"updated_at","type":"TIMESTAMP"}
             ],
             "dataset": [
-                ["22222222-2222-2222-2222-222222222222","ITEM","partially_filled",true,
+                ["22222222-2222-2222-2222-222222222222","ITEM","partially_filled","buy",
                  150000000,50000000,225000000,225000000,
                  "2026-11-04T12:00:00.000000Z","2026-11-04T12:00:01.000000Z"],
-                ["33333333-3333-3333-3333-333333333333","ITEM","canceled",false,
+                ["33333333-3333-3333-3333-333333333333","ITEM","canceled","sell",
                  100000000,0,null,null,
                  "2026-11-04T12:00:02.000000Z","2026-11-04T12:00:02.000000Z"]
             ],

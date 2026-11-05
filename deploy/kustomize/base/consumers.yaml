@@ -46,8 +46,8 @@ spec:
               value: nats://mmx-nats:4222
             - name: QUESTDB_CONF
               value: http::addr=mmx-questdb:9000;
-            - name: QUESTDB_PG_URL
-              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: QUESTDB_URL
+              value: "http://mmx-questdb:9000"
             - name: RUST_LOG
               value: info
             - name: CHECKPOINT_DIR
@@ -123,8 +123,8 @@ spec:
               value: nats://mmx-nats:4222
             - name: QUESTDB_CONF
               value: http::addr=mmx-questdb:9000;
-            - name: QUESTDB_PG_URL
-              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: QUESTDB_URL
+              value: "http://mmx-questdb:9000"
             - name: RUST_LOG
               value: info
             - name: CHECKPOINT_DIR
@@ -200,8 +200,8 @@ spec:
               value: nats://mmx-nats:4222
             - name: QUESTDB_CONF
               value: http::addr=mmx-questdb:9000;
-            - name: QUESTDB_PG_URL
-              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: QUESTDB_URL
+              value: "http://mmx-questdb:9000"
             - name: RUST_LOG
               value: info
             - name: CHECKPOINT_DIR
@@ -276,8 +276,8 @@ spec:
               value: nats://mmx-nats:4222
             - name: QUESTDB_CONF
               value: http::addr=mmx-questdb:9000;
-            - name: QUESTDB_PG_URL
-              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: QUESTDB_URL
+              value: "http://mmx-questdb:9000"
             - name: RUST_LOG
               value: info
           securityContext:

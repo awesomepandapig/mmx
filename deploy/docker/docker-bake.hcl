@@ -97,6 +97,7 @@ target "service" {
       { image = "ticker", bin = "ticker" },
       { image = "candles", bin = "candles" },
       { image = "trade-reporter", bin = "trade-reporter" },
+      { image = "outbox", bin = "outbox" },
       { image = "observer", bin = "sbx-observer" },
     ]
   }

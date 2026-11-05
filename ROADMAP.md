@@ -23,11 +23,10 @@ These decisions are settled:
   Open-source QuestDB is single-node, and that's fine for this role.
 - **Gateways bounce.** Validation, rate limits and enabled markets live there. Only game servers can
   reach gateways, enforced by firewall policy.
-- **A POST is a guarantee.** It's held across a failover and answered with the engine's decision, or a
-  503 with the same order ID after a short deadline. Game servers supply `client_order_id`.
+- **A POST is a guarantee.** It's held across a failover and answered with the engine's decision. If
+  the gateway can't answer, the outcome is unknown: the caller never retries, keeps the funds on hold
+  and asks any gateway for the order's status. Callers supply `client_order_id`.
 - **Failover** uses the term marker in the report stream to tell which in-flight orders landed.
-- **Repeat orders** after a gateway crash are bounced by checking QuestDB, once the recorder has caught
-  up to the current stream position.
 - **Nothing reaches the game until it's durable.** The outbox syncs to disk before sending a webhook.
   Engine state relies on replication, with per-write disk sync off by default.
 - **Escrow lives with the game.** It must always clear for orders that didn't execute, and this must
@@ -56,7 +55,8 @@ Owns `services/api/rest`.
 - [ ] Request shape checks and validation, including tick size
 - [ ] Enabled markets from `markets.yaml`, with hot reload through an explicit reload command
 - [ ] Per-player rate limits in Valkey, with defaults and overrides
-- [ ] Bounce repeat orders by checking QuestDB after the recorder catches up
+- [ ] Remove the repeat-order check and `RETRY_WINDOW_SECS`, since callers don't retry
+- [ ] Unknown-outcome status: define when a missing order is definitely not landed
 - [ ] Cancel an order, and cancel all of a player's orders
 - [ ] `GET` orders
 - [ ] OIDC, with JWT and token introspection modes, mapping users to accounts
@@ -105,6 +105,11 @@ Owns `crates/cluster` and `services/matching-engine`.
 - [ ] Admin cancel-all recovery path
 - [ ] Remove spike-only flags, and engine unit tests
 - [ ] Configurable tape retention, swept to QuestDB by default
+- [x] Report a repeat of a resting order as a duplicate, even on a full book
+- [ ] Recovery plan for an order that panics every node, since replay hits the same panic
+- [ ] Give a full book its own reject reason and an operator alert
+- [ ] Give self-trade cancels their own reason
+- [ ] Clear stale TODOs in `publisher.rs`, `types.rs`, `config.rs` and `handler.rs`
 
 ### 6. Packaging (wave 1)
 
@@ -127,6 +132,8 @@ Owns the new `deploy/`.
 - [ ] Rename SBX to MMX, and remove game-specific references
 - [ ] Retire the `auth` service
 - [ ] Demo trading UI with dummy credentials
+- [ ] Finish `OrderDrawer.tsx`: live status, order updates and error handling
+- [ ] Validate the symbol on the trade page
 - [ ] Demo load bots
 - [ ] Merge the landing page, using zero cookies
 - [ ] Rewrite the docs site, and run the release 1 agent test
