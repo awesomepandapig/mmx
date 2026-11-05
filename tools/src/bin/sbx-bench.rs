@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 use sbe::ReadBuf;
 use sbe::exec_type_enum::ExecTypeEnum;
 use sbe::execution_report_codec::ExecutionReportDecoder;
-use sbe::message_header_codec::MessageHeaderDecoder;
+use sbe::message_header_codec::{ENCODED_LENGTH, MessageHeaderDecoder};
+use sbe::ord_rej_reason_enum::OrdRejReasonEnum;
 
 use serde::Serialize;
 
 use tools::args::Args;
-use tools::wire::NEW_ORDER_LENGTH;
 
 use transport::{AeronExclusivePublication, AeronOfferError, AeronSubscription};
 
@@ -38,6 +38,7 @@ const DRAIN: Duration = Duration::from_millis(100);
 const TRANSACT_TIME_OFFSET: usize = 64;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x100_0000_01b3;
+const NEW_ORDER_TEMPLATE: u16 = 1;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -50,6 +51,9 @@ enum Mode {
 struct Received {
     reports: u64,
     rejected: u64,
+    duplicates: u64,
+    canceled: u64,
+    cancel_rejects: u64,
     first: Option<Instant>,
     last: Option<Instant>,
     latencies: Vec<u64>,
@@ -59,10 +63,15 @@ struct Received {
 #[derive(Serialize)]
 struct Output {
     mode: &'static str,
+    messages: u64,
     orders: u64,
     reports: u64,
     rejected: u64,
+    duplicates: u64,
+    canceled: u64,
+    cancel_rejects: u64,
     seconds: f64,
+    messages_per_second: f64,
     orders_per_second: f64,
     reports_per_second: f64,
     back_pressured: u64,
@@ -92,20 +101,41 @@ fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Returns the order ID and whether it was rejected, if the report answers a new order.
+enum Answer {
+    Accepted(u64),
+    Rejected(u64),
+    Duplicate(u64),
+    Canceled,
+    CancelRejected,
+    Other,
+}
+
+/// Classifies a report. Every new order gets exactly one Accepted, Rejected or Duplicate.
 #[inline]
-fn acknowledged_order(buffer: &[u8]) -> Option<(u64, bool)> {
+fn classify(buffer: &[u8]) -> Answer {
     let header: MessageHeaderDecoder<ReadBuf<'_>> =
         MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
-    if header.template_id() != 3 {
-        return None;
+    match header.template_id() {
+        3 => {}
+        4 => return Answer::CancelRejected,
+        _ => return Answer::Other,
     }
     let report: ExecutionReportDecoder<'_> = ExecutionReportDecoder::default().header(header, 0);
     match report.exec_type() {
-        ExecTypeEnum::New => Some((report.order_id(), false)),
-        ExecTypeEnum::Rejected => Some((report.order_id(), true)),
-        _ => None,
+        ExecTypeEnum::New => Answer::Accepted(report.order_id()),
+        ExecTypeEnum::Rejected if report.ord_rej_reason() == OrdRejReasonEnum::DuplicateOrder => {
+            Answer::Duplicate(report.order_id())
+        }
+        ExecTypeEnum::Rejected => Answer::Rejected(report.order_id()),
+        ExecTypeEnum::Canceled => Answer::Canceled,
+        _ => Answer::Other,
     }
+}
+
+/// The length of the SBE message at the start of `tape`.
+#[inline]
+fn message_length(tape: &[u8]) -> usize {
+    ENCODED_LENGTH + usize::from(u16::from_le_bytes([tape[0], tape[1]]))
 }
 
 fn wait_for_engine(subscription: &AeronSubscription) {
@@ -120,7 +150,7 @@ fn receive(
     channel: &str,
     orders: u64,
     mode: Mode,
-    period_ns: u64,
+    schedule: &[u64],
     ready: &AtomicBool,
     start: &std::sync::OnceLock<Instant>,
 ) -> Received {
@@ -154,12 +184,31 @@ fn receive(
                         received.digest = fnv1a(received.digest, &copy[..length]);
                     }
 
-                    if let Some((order_id, rejected)) = acknowledged_order(buffer) {
+                    let order_id = match classify(buffer) {
+                        Answer::Accepted(order_id) => Some(order_id),
+                        Answer::Rejected(order_id) => {
+                            received.rejected += 1;
+                            Some(order_id)
+                        }
+                        Answer::Duplicate(order_id) => {
+                            received.duplicates += 1;
+                            Some(order_id)
+                        }
+                        Answer::Canceled => {
+                            received.canceled += 1;
+                            None
+                        }
+                        Answer::CancelRejected => {
+                            received.cancel_rejects += 1;
+                            None
+                        }
+                        Answer::Other => None,
+                    };
+                    if let Some(order_id) = order_id {
                         acknowledged += 1;
-                        received.rejected += u64::from(rejected);
                         if mode == Mode::Latency {
                             let started = *start.get().expect("orders arrive after the start");
-                            let scheduled = (order_id - 1) * period_ns;
+                            let scheduled = schedule[order_id as usize - 1];
                             let elapsed = started.elapsed().as_nanos() as u64;
                             received.latencies.push(elapsed.saturating_sub(scheduled));
                         }
@@ -234,17 +283,33 @@ fn main() {
 
     // Reading the whole file up front means playback never touches the disk.
     let tape = fs::read(&path).unwrap_or_else(|err| panic!("can't read {path}: {err}"));
-    assert_eq!(tape.len() % NEW_ORDER_LENGTH, 0, "tape isn't a whole number of records");
-    let orders = args.get("limit", (tape.len() / NEW_ORDER_LENGTH) as u64);
-    let tape = &tape[..orders as usize * NEW_ORDER_LENGTH];
+    let limit: u64 = args.get("limit", u64::MAX);
+
+    // Walks the tape once, so that playback only does the work of sending. `schedule` holds when
+    // each new order is due, by order ID, because only new orders spend one.
+    let mut end = 0;
+    let mut messages = 0;
+    let mut schedule = Vec::new();
+    while end < tape.len() && messages < limit {
+        let is_new_order = u16::from_le_bytes([tape[end + 2], tape[end + 3]]) == NEW_ORDER_TEMPLATE;
+        if is_new_order {
+            schedule.push(messages * period_ns);
+        }
+        end += message_length(&tape[end..]);
+        messages += 1;
+    }
+    assert!(end <= tape.len(), "tape ends partway through a message");
+    let orders = schedule.len() as u64;
+    let tape = Arc::new(tape);
+    let schedule = Arc::new(schedule);
 
     let ready = Arc::new(AtomicBool::new(false));
     let start = Arc::new(std::sync::OnceLock::new());
     let receiver = {
-        let (ready, start) = (Arc::clone(&ready), Arc::clone(&start));
+        let (ready, start, schedule) = (Arc::clone(&ready), Arc::clone(&start), Arc::clone(&schedule));
         thread::Builder::new()
             .name("receiver".to_string())
-            .spawn(move || receive(&exec_channel, orders, mode, period_ns, &ready, &start))
+            .spawn(move || receive(&exec_channel, orders, mode, &schedule, &ready, &start))
             .expect("failed to start the receiver")
     };
 
@@ -263,14 +328,19 @@ fn main() {
     start.set(started).expect("start is only set once");
     let mut back_pressured = 0;
 
-    for (i, message) in tape.chunks_exact(NEW_ORDER_LENGTH).enumerate() {
+    let mut offset = 0;
+    let mut sent = 0u64;
+    while offset < end {
         if mode == Mode::Latency {
-            let due = Duration::from_nanos(i as u64 * period_ns);
+            let due = Duration::from_nanos(sent * period_ns);
             while started.elapsed() < due {
                 spin_loop();
             }
         }
-        back_pressured += offer(&publication, message);
+        let length = message_length(&tape[offset..]);
+        back_pressured += offer(&publication, &tape[offset..offset + length]);
+        offset += length;
+        sent += 1;
     }
 
     let mut received = receiver.join().expect("the receiver panicked");
@@ -279,10 +349,15 @@ fn main() {
 
     let output = Output {
         mode: mode_name,
+        messages,
         orders,
         reports: received.reports,
         rejected: received.rejected,
+        duplicates: received.duplicates,
+        canceled: received.canceled,
+        cancel_rejects: received.cancel_rejects,
         seconds,
+        messages_per_second: messages as f64 / seconds,
         orders_per_second: orders as f64 / seconds,
         reports_per_second: received.reports as f64 / seconds,
         back_pressured,

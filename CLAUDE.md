@@ -17,6 +17,7 @@ tools/scripts/sbx.py up | down | status          # run the local stack
 tools/scripts/sbx.py logs matching-engine        # follow a service's log
 tools/scripts/sbx.py verify --orders 20000 --rate 5000   # seeded load + invariants + crash check
 tools/scripts/bench.py --compare m4-mac-mini     # deterministic tape, fails on a regression
+tools/scripts/profile.py run                     # sweep engine workloads and settings, with charts
 ```
 
 Run `tools/scripts/sbx.py verify` after changing `matching-engine` or `market-data`. It restarts the engine, so don't run it against something you want to keep running.
