@@ -34,9 +34,10 @@ def cluster(*args):
                           capture_output=True, text=True, timeout=60).stdout.strip()
 
 
-def post(body):
+def post(body, player=None):
     request = urllib.request.Request("http://127.0.0.1:8000/api/v1/orders", json.dumps(body).encode(),
-                                     {"content-type": "application/json"})
+                                     {"content-type": "application/json",
+                                      "x-player-id": player or str(uuid.uuid4())})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.status
@@ -47,11 +48,14 @@ def post(body):
 
 
 def place(index, sent):
-    body = {"client_order_id": str(uuid.uuid4()), "product_id": "JSP", "side": "buy" if index % 2 else "sell",
-            "type": "limit", "size": 1, "price": 90 + index % 21}
+    # A player of its own for each order, so that no two orders self-trade. It must not change between
+    # retries, because the engine identifies an order by its player and client order ID.
+    player = str(uuid.uuid4())
+    body = {"client_order_id": str(uuid.uuid4()), "product_id": "ITEM", "side": "buy" if index % 2 else "sell",
+            "type": "limit", "size": "1", "price": str(90 + index % 21)}
     started = time.time()
     while True:
-        status = post(body)
+        status = post(body, player)
         sent.append(1)
         # 503 means the outcome is unknown, so retry with the same ID.
         if status != 503 and status != 0:
@@ -70,7 +74,9 @@ def main():
                             f"aeron:udp?endpoint=localhost:0|control=localhost:{40450 + follower}|session-id=1002"],
                            env=env, stdout=open(RUN / "tap.jsonl", "w"), stderr=subprocess.DEVNULL)
     api = subprocess.Popen([ROOT / "target/release/api"], stdout=open(RUN / "api.log", "w"), stderr=subprocess.STDOUT, env={
-        **env, "CLUSTER_INGRESS_ENDPOINTS": "localhost:20000,localhost:20001,localhost:20002",
+        # This test has no QuestDB or recorder, so repeat orders aren't checked.
+        **env, "RETRY_WINDOW_SECS": "0", "MARKETS_FILE": str(ROOT / "services/api/rest/markets.yaml"),
+        "CLUSTER_INGRESS_ENDPOINTS": "localhost:20000,localhost:20001,localhost:20002",
         "CLUSTER_RESPONSE_CHANNEL": "aeron:udp?endpoint=localhost:20301",
         "CLUSTER_REPORT_CHANNELS": ",".join(
             f"aeron:udp?endpoint=localhost:0|control=localhost:{40450 + i}|session-id=1002" for i in range(3))})
@@ -80,7 +86,7 @@ def main():
             assert time.time() < deadline, "api never started"
             time.sleep(0.2)
 
-        assert post({"product_id": "JSP", "side": "buy", "type": "limit", "size": 1, "price": 1}) == 400, \
+        assert post({"product_id": "ITEM", "side": "buy", "type": "limit", "size": "1", "price": "1"}) == 400, \
             "a missing client_order_id must be refused"
 
         sent = []

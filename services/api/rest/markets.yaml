@@ -1,0 +1,17 @@
+# Markets this gateway accepts orders for. A market that's missing here, or has `enabled: false`, is
+# bounced at the gateway. Open orders in it can still be cancelled.
+#
+# After editing, apply the file with: POST /api/v1/admin/markets/reload
+#
+# Decimals are strings with at most 8 decimal places, so they stay exact.
+#
+#   symbol     1 to 6 letters or digits
+#   tick_size  prices must be a multiple of this (required)
+#   min_size   smallest order size (optional)
+#   max_size   largest order size (optional)
+#   enabled    defaults to true
+markets:
+  - symbol: ITEM
+    tick_size: "0.01"
+    min_size: "0.01"
+    max_size: "1000000"

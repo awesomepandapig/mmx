@@ -1,4 +1,4 @@
-use super::order::{MESSAGE_SIZE, UuidType};
+use super::order::UuidType;
 
 use std::hint::spin_loop;
 use std::sync::mpsc as std_mpsc;
@@ -14,18 +14,36 @@ use transport::{AeronExclusivePublication, AeronOfferError};
 const ORDER_QUEUE_LENGTH: usize = 1024;
 const BACK_PRESSURE_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// What happened to an order, once it's certain.
+/// What happened to a request, once it's certain.
+#[derive(Debug, PartialEq, Eq)]
 pub enum OrderOutcome {
+    /// The engine took the order, or, without a cluster, the order was published.
     Accepted,
+    /// The engine refused the order, so it won't execute.
     Rejected,
-    /// No answer before the deadline. The order may still have landed, so retry with the same ID.
+    /// This order ID already reached the engine, so nothing new happened.
+    Repeat,
+    Canceled,
+    /// There's nothing to cancel, because the order finished or never existed.
+    NotOpen,
+    /// No answer before the deadline. The request may still have landed, so retry with the same ID.
     TimedOut,
     Failed(String),
 }
 
+/// An order is known to the engine by its account and client order ID.
+pub type OrderKey = (UuidType, UuidType);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EngineRequest {
+    New(OrderKey),
+    /// `cancel_id` is this attempt's own ID, which the engine echoes in a reject.
+    Cancel { order: OrderKey, cancel_id: UuidType },
+}
+
 pub struct OutboundOrder {
-    pub cl_ord_id: UuidType,
-    pub message: [u8; MESSAGE_SIZE],
+    pub request: EngineRequest,
+    pub message: Vec<u8>,
     pub published: oneshot::Sender<OrderOutcome>,
 }
 
