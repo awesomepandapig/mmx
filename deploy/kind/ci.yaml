@@ -1,0 +1,8 @@
+# The cluster CI installs the chart on. Three workers, because members can't share a node.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker

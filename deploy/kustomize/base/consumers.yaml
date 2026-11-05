@@ -1,0 +1,296 @@
+# The feeds keep a checkpoint on a volume, because without one they replay the whole tape, which is
+# kept forever by default. trade-reporter resumes from QuestDB, so it doesn't need one.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mmx-level2
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: level2
+    mmx.io/aeron-client: "true"
+spec:
+  serviceName: mmx-level2
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: level2
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mmx
+        app.kubernetes.io/component: level2
+        mmx.io/aeron-client: "true"
+    spec:
+      containers:
+        - name: level2
+          image: ghcr.io/awesomepandapig/mmx/level2:0.1.0
+          envFrom:
+            - secretRef:
+                name: mmx-secrets
+                optional: true
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AERON_DIR
+              value: /dev/shm/aeron
+            - name: CLIENT_HOST
+              value: $(POD_IP)
+            - name: TAPE_ARCHIVES
+              value: mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012
+            - name: TAPE_REPORTS
+              value: mmx-node-0.mmx-node:40450,mmx-node-1.mmx-node:40451,mmx-node-2.mmx-node:40452
+            - name: NATS_URL
+              value: nats://mmx-nats:4222
+            - name: QUESTDB_CONF
+              value: http::addr=mmx-questdb:9000;
+            - name: QUESTDB_PG_URL
+              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: RUST_LOG
+              value: info
+            - name: CHECKPOINT_DIR
+              value: /var/lib/mmx/checkpoints
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /var/lib/mmx
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mmx-ticker
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: ticker
+    mmx.io/aeron-client: "true"
+spec:
+  serviceName: mmx-ticker
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: ticker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mmx
+        app.kubernetes.io/component: ticker
+        mmx.io/aeron-client: "true"
+    spec:
+      containers:
+        - name: ticker
+          image: ghcr.io/awesomepandapig/mmx/ticker:0.1.0
+          envFrom:
+            - secretRef:
+                name: mmx-secrets
+                optional: true
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AERON_DIR
+              value: /dev/shm/aeron
+            - name: CLIENT_HOST
+              value: $(POD_IP)
+            - name: TAPE_ARCHIVES
+              value: mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012
+            - name: TAPE_REPORTS
+              value: mmx-node-0.mmx-node:40450,mmx-node-1.mmx-node:40451,mmx-node-2.mmx-node:40452
+            - name: NATS_URL
+              value: nats://mmx-nats:4222
+            - name: QUESTDB_CONF
+              value: http::addr=mmx-questdb:9000;
+            - name: QUESTDB_PG_URL
+              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: RUST_LOG
+              value: info
+            - name: CHECKPOINT_DIR
+              value: /var/lib/mmx/checkpoints
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /var/lib/mmx
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mmx-candles
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: candles
+    mmx.io/aeron-client: "true"
+spec:
+  serviceName: mmx-candles
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: candles
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mmx
+        app.kubernetes.io/component: candles
+        mmx.io/aeron-client: "true"
+    spec:
+      containers:
+        - name: candles
+          image: ghcr.io/awesomepandapig/mmx/candles:0.1.0
+          envFrom:
+            - secretRef:
+                name: mmx-secrets
+                optional: true
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AERON_DIR
+              value: /dev/shm/aeron
+            - name: CLIENT_HOST
+              value: $(POD_IP)
+            - name: TAPE_ARCHIVES
+              value: mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012
+            - name: TAPE_REPORTS
+              value: mmx-node-0.mmx-node:40450,mmx-node-1.mmx-node:40451,mmx-node-2.mmx-node:40452
+            - name: NATS_URL
+              value: nats://mmx-nats:4222
+            - name: QUESTDB_CONF
+              value: http::addr=mmx-questdb:9000;
+            - name: QUESTDB_PG_URL
+              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: RUST_LOG
+              value: info
+            - name: CHECKPOINT_DIR
+              value: /var/lib/mmx/checkpoints
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /var/lib/mmx
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmx-trade-reporter
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: trade-reporter
+    mmx.io/aeron-client: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: trade-reporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mmx
+        app.kubernetes.io/component: trade-reporter
+        mmx.io/aeron-client: "true"
+    spec:
+      containers:
+        - name: trade-reporter
+          image: ghcr.io/awesomepandapig/mmx/trade-reporter:0.1.0
+          envFrom:
+            - secretRef:
+                name: mmx-secrets
+                optional: true
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AERON_DIR
+              value: /dev/shm/aeron
+            - name: CLIENT_HOST
+              value: $(POD_IP)
+            - name: TAPE_ARCHIVES
+              value: mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012
+            - name: TAPE_REPORTS
+              value: mmx-node-0.mmx-node:40450,mmx-node-1.mmx-node:40451,mmx-node-2.mmx-node:40452
+            - name: NATS_URL
+              value: nats://mmx-nats:4222
+            - name: QUESTDB_CONF
+              value: http::addr=mmx-questdb:9000;
+            - name: QUESTDB_PG_URL
+              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: RUST_LOG
+              value: info
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm

@@ -1,0 +1,80 @@
+{{- $root := . -}}
+{{- range $component, $consumer := .Values.consumers }}
+{{- if $consumer.enabled }}
+{{- $name := printf "%s-%s" (include "mmx.fullname" $root) $component -}}
+{{- $labels := dict "root" $root "component" $component -}}
+{{- $persistence := $consumer.persistence | default dict }}
+---
+apiVersion: apps/v1
+kind: {{ if $persistence.size }}StatefulSet{{ else }}Deployment{{ end }}
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  {{- if $persistence.size }}
+  serviceName: {{ $name }}
+  {{- end }}
+  replicas: {{ $consumer.replicas | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+        mmx.io/aeron-client: "true"
+    spec:
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "mmx.podSecurityContext" $root | nindent 8 }}
+      containers:
+        {{- include "mmx.driverContainer" (dict "root" $root) | nindent 8 }}
+        - name: {{ $component }}
+          image: {{ include "mmx.image" (dict "root" $root "image" $consumer.image) | quote }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          envFrom:
+            {{- include "mmx.secretEnvFrom" $root | nindent 12 }}
+          env:
+            {{- include "mmx.aeronClientEnv" $root | nindent 12 }}
+            - name: SUB_CHANNEL
+              value: {{ include "mmx.reportChannel" (dict "root" $root "id" $root.Values.reportSource) | quote }}
+            - name: SUB_STREAM_ID
+              value: "1002"
+            - name: RUST_LOG
+              value: {{ $consumer.rustLog | default "info" | quote }}
+            {{- range $key, $value := $consumer.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          securityContext:
+            {{- include "mmx.containerSecurityContext" $root | nindent 12 }}
+          resources:
+            {{- include "mmx.resources" (dict "resources" $consumer.resources "guaranteed" false) | nindent 12 }}
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            {{- if $persistence.size }}
+            - name: data
+              mountPath: {{ $persistence.mountPath | default "/data" }}
+            {{- end }}
+      volumes:
+        {{- include "mmx.aeronVolumes" (dict "sizeLimit" ($consumer.sharedMemorySizeLimit | default "1Gi")) | nindent 8 }}
+  {{- if $persistence.size }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $persistence.size }}
+  {{- end }}
+{{- end }}
+{{- end }}

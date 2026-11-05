@@ -1,0 +1,122 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmx-gateway
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: gateway
+spec:
+  selector:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mmx-gateway
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: gateway
+    mmx.io/aeron-client: "true"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mmx
+        app.kubernetes.io/component: gateway
+        mmx.io/aeron-client: "true"
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: mmx
+              app.kubernetes.io/component: gateway
+      containers:
+        - name: gateway
+          image: ghcr.io/awesomepandapig/mmx/api:0.1.0
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - secretRef:
+                name: mmx-secrets
+                optional: true
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AERON_DIR
+              value: /dev/shm/aeron
+            - name: CLUSTER_INGRESS_ENDPOINTS
+              value: mmx-node-0.mmx-node:20000,mmx-node-1.mmx-node:20001,mmx-node-2.mmx-node:20002
+            - name: CLUSTER_RESPONSE_CHANNEL
+              value: aeron:udp?endpoint=$(POD_IP):20301
+            - name: CLUSTER_REPORT_CHANNELS
+              value: aeron:udp?endpoint=$(POD_IP):0|control=mmx-node-0.mmx-node:40450|session-id=1002,aeron:udp?endpoint=$(POD_IP):0|control=mmx-node-1.mmx-node:40451|session-id=1002,aeron:udp?endpoint=$(POD_IP):0|control=mmx-node-2.mmx-node:40452|session-id=1002
+            - name: CLIENT_HOST
+              value: $(POD_IP)
+            - name: TAPE_ARCHIVES
+              value: mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012
+            - name: TAPE_REPORTS
+              value: mmx-node-0.mmx-node:40450,mmx-node-1.mmx-node:40451,mmx-node-2.mmx-node:40452
+            - name: QUESTDB_PG_URL
+              value: postgres://admin:quest@mmx-questdb:8812/qdb
+            - name: VALKEY_URL
+              value: redis://mmx-valkey:6379
+            - name: MARKETS_FILE
+              value: /etc/mmx/markets.yaml
+            - name: RUST_LOG
+              value: info
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # The port only opens once the gateway has a cluster session.
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 512Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: markets
+              mountPath: /etc/mmx
+              readOnly: true
+      volumes:
+        - name: markets
+          configMap:
+            name: mmx-markets
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mmx-gateway
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: gateway
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: gateway

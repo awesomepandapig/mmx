@@ -1,0 +1,116 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fullname := include "mmx.fullname" . -}}
+{{- $instance := dict "app.kubernetes.io/name" "mmx" "app.kubernetes.io/instance" .Release.Name -}}
+{{- $nodes := dict "root" . "component" "node" -}}
+{{- $gateways := dict "root" . "component" "gateway" }}
+# Only game servers reach gateways. Aeron replies on ephemeral UDP ports, so UDP is allowed by peer
+# instead of by port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-gateway
+  labels:
+    {{- include "mmx.labels" $gateways | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $gateways | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8000
+      from:
+        {{- toYaml .Values.networkPolicy.gameServers | nindent 8 }}
+        {{- if and .Values.demo.enabled .Values.ui.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "mmx.selectorLabels" (dict "root" . "component" "web") | nindent 14 }}
+        {{- end }}
+        {{- if and .Values.demo.enabled .Values.demo.bots.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "mmx.selectorLabels" (dict "root" . "component" "demo") | nindent 14 }}
+        {{- end }}
+    - ports:
+        - protocol: UDP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "mmx.selectorLabels" $nodes | nindent 14 }}
+---
+# Members talk to each other, and to the gateways and consumers of this release.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-node
+  labels:
+    {{- include "mmx.labels" $nodes | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $nodes | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: UDP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "mmx.selectorLabels" $nodes | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- toYaml $instance | nindent 14 }}
+              mmx.io/aeron-client: "true"
+---
+# Consumers only receive the report stream. A gateway has its own policy above.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-consumers
+  labels:
+    {{- include "mmx.labels" (dict "root" . "component" "consumers") | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: mmx.io/aeron-client
+        operator: In
+        values: ["true"]
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [{{ .Release.Name | quote }}]
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: ["gateway"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: UDP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "mmx.selectorLabels" $nodes | nindent 14 }}
+---
+# NATS, QuestDB and Valkey only serve this release.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-infrastructure
+  labels:
+    {{- include "mmx.labels" (dict "root" . "component" "infrastructure") | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/instance
+        operator: In
+        values: [{{ .Release.Name | quote }}]
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["nats", "questdb", "valkey"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- toYaml $instance | nindent 14 }}
+{{- end }}

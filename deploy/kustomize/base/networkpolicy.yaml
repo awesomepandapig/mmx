@@ -1,0 +1,107 @@
+# Only game servers reach gateways: by default, any pod labeled mmx.io/role=game-server in any
+# namespace. Patch `from` in an overlay to match your game servers. Aeron replies on ephemeral UDP
+# ports, so UDP is allowed by peer instead of by port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mmx-gateway
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: gateway
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8000
+      from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              mmx.io/role: game-server
+    - ports:
+        - protocol: UDP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mmx
+              app.kubernetes.io/component: node
+---
+# Members talk to each other, and to this stack's gateways and consumers.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mmx-node
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: node
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: node
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: UDP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mmx
+              app.kubernetes.io/component: node
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mmx
+              mmx.io/aeron-client: "true"
+---
+# Consumers only receive the report stream. A gateway has its own policy above.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mmx-consumers
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: consumers
+spec:
+  podSelector:
+    matchExpressions:
+      - key: mmx.io/aeron-client
+        operator: In
+        values: ["true"]
+      - key: app.kubernetes.io/component
+        operator: NotIn
+        values: ["gateway"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - ports:
+        - protocol: UDP
+      from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mmx
+              app.kubernetes.io/component: node
+---
+# NATS, QuestDB and Valkey only serve this stack.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mmx-infrastructure
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: infrastructure
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: ["nats", "questdb", "valkey"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mmx

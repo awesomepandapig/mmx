@@ -1,0 +1,290 @@
+# Production defaults: Linux x86, on nodes prepared as described in deploy/README.md. For a laptop,
+# add values-local.yaml.
+
+image:
+  registry: ghcr.io/awesomepandapig/mmx
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# The Aeron Cluster: a Java node and the Rust engine in each pod.
+cluster:
+  # Must be odd. Changing it on a running cluster isn't supported.
+  replicas: 3
+  id: 0
+  # `required` puts each member on its own Kubernetes node. `preferred` allows sharing.
+  antiAffinity: required
+  # OnDelete, because a pod reports ready before it has caught up with the log, so a rolling update
+  # could take out a quorum. Restart members one at a time, as described in deploy/README.md.
+  updateStrategy: OnDelete
+  # Whole CPUs and equal requests and limits, so kubelet's static CPU manager gives this pod
+  # exclusive cores. Turn off only where that isn't available.
+  guaranteed: true
+  # Moves consensus, sender, receiver and engine threads onto a CPU each.
+  pinThreads: true
+
+  # Tight failover settings. A leader is replaced after `leaderHeartbeatTimeout`, so raise these on
+  # hardware or networks that can stall for that long.
+  leaderHeartbeatTimeout: 500ms
+  leaderHeartbeatInterval: 100ms
+  electionTimeout: 500ms
+  startupCanvassTimeout: 5s
+  sessionTimeout: 30s
+
+  threadingMode: DEDICATED
+  idleStrategy: org.agrona.concurrent.BusySpinIdleStrategy
+  # Keep false in production, so a term buffer can't fault in memory while matching.
+  sparseTermBuffers: false
+  # The kernel caps this at net.core.rmem_max and wmem_max, which are set on the node.
+  socketBuffer: 4m
+  logTermLength: 16m
+  # 0 relies on replication. 1 syncs data and 2 also syncs metadata, on every write.
+  archiveSyncLevel: 0
+  # Any other Aeron properties, which override everything above.
+  extraProperties: {}
+
+  # Holds cnc.dat and every term buffer. It counts against the pod's memory limits below.
+  sharedMemory:
+    sizeLimit: 4Gi
+
+  persistence:
+    # The tape is kept forever by default, so size this for retention.
+    size: 200Gi
+    # Empty uses the cluster's default. Use the fastest local disk available.
+    storageClass: ""
+
+  node:
+    image: node
+    heapMin: 512m
+    heapMax: 2g
+    # Consensus, sender and receiver take a CPU each, and everything else shares the rest. On hosts
+    # with SMT, full-pcpus-only requires a multiple of two.
+    resources:
+      cpu: "6"
+      memory: 8Gi
+
+  engine:
+    image: matching-engine
+    # Resting orders across all symbols. See "Capacity" in STARTUP.md for the memory this needs.
+    maxOrders: 1000000
+    reportTermLength: 64m
+    rustLog: info
+    # Other engine settings, such as TAPE_RETENTION_BYTES or RECOVERY_MODE.
+    env: {}
+    # The main thread takes a CPU, and the Aeron client's threads share the other.
+    resources:
+      cpu: "2"
+      memory: 3Gi
+
+  podDisruptionBudget:
+    enabled: true
+
+# Media driver beside every gateway and consumer. Term buffers in shared memory are charged to the
+# driver that touches them, so memory covers the JVM and the buffers: a gateway reads one 64m report
+# stream per member, which is 576 MB at three terms each.
+driver:
+  threadingMode: SHARED
+  heapMax: 256m
+  socketBuffer: 4m
+  resources:
+    cpu: 500m
+    memory: 1536Mi
+
+gateway:
+  image: api
+  replicas: 2
+  # Must be free on the pod. Cluster responses arrive here.
+  responsePort: 20301
+  rustLog: info
+  env: {}
+  service:
+    type: ClusterIP
+    port: 8000
+    annotations: {}
+  # Set to /readyz once the gateway serves it. Empty uses a TCP check.
+  readinessPath: ""
+  sharedMemory:
+    # It reads a report stream from every cluster member.
+    sizeLimit: 2Gi
+  resources:
+    cpu: "1"
+    memory: 512Mi
+
+# Enabled markets, mounted at /etc/mmx/markets.yaml. Mounted as a directory so edits reach the pod.
+marketsYaml: |
+  markets: []
+
+# Everything that reads the tape. Each entry gets a media driver and the shared environment listed in
+# deploy/README.md. An entry with `persistence.size` becomes a StatefulSet.
+#
+# The feeds keep a checkpoint on a volume, because without one they replay the whole tape, which is
+# kept forever by default. trade-reporter resumes from QuestDB, so it doesn't need one.
+consumers:
+  level2:
+    enabled: true
+    image: level2
+    env:
+      CHECKPOINT_DIR: /var/lib/mmx/checkpoints
+    persistence:
+      size: 5Gi
+      storageClass: ""
+      mountPath: /var/lib/mmx
+    resources:
+      cpu: "1"
+      memory: 512Mi
+  ticker:
+    enabled: true
+    image: ticker
+    env:
+      CHECKPOINT_DIR: /var/lib/mmx/checkpoints
+    persistence:
+      size: 5Gi
+      storageClass: ""
+      mountPath: /var/lib/mmx
+    resources:
+      cpu: "1"
+      memory: 512Mi
+  candles:
+    enabled: true
+    image: candles
+    env:
+      CHECKPOINT_DIR: /var/lib/mmx/checkpoints
+    persistence:
+      size: 5Gi
+      storageClass: ""
+      mountPath: /var/lib/mmx
+    resources:
+      cpu: "1"
+      memory: 512Mi
+  trade-reporter:
+    enabled: true
+    image: trade-reporter
+    resources:
+      cpu: "1"
+      memory: 512Mi
+  # Needs env.WEBHOOK_URL, and WEBHOOK_SECRET in `secrets`.
+  outbox:
+    enabled: false
+    image: outbox
+    env:
+      OUTBOX_DIR: /data
+    persistence:
+      size: 20Gi
+      storageClass: ""
+      mountPath: /data
+    resources:
+      cpu: "1"
+      memory: 1Gi
+  # A development tool that keeps every order in memory.
+  observer:
+    enabled: false
+    image: observer
+    env:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+    resources:
+      cpu: 250m
+      memory: 2Gi
+
+# The member whose report stream `SUB_CHANNEL` reads.
+reportSource: 0
+
+websocket:
+  enabled: true
+  image: websocket
+  replicas: 2
+  port: 8080
+  rustLog: info
+  env: {}
+  service:
+    type: ClusterIP
+    annotations: {}
+  readinessPath: ""
+  resources:
+    cpu: 500m
+    memory: 256Mi
+
+# The web UI.
+ui:
+  enabled: true
+  image: web
+  replicas: 2
+  port: 3000
+  env: {}
+  service:
+    type: ClusterIP
+    annotations: {}
+  resources:
+    cpu: 250m
+    memory: 256Mi
+
+# Rebuilds QuestDB from the tape. This is not part of an install: the job drops every table each time
+# it starts, so it can only be rendered by `helm template`. See deploy/README.md.
+questdbRebuild:
+  enabled: false
+  resources:
+    cpu: "1"
+    memory: 1Gi
+
+# Dummy credentials and demo mode. Turn this off for a real deployment.
+demo:
+  enabled: true
+  credentials:
+    username: demo
+    password: demo
+  # Load bots, which send orders through the gateway.
+  bots:
+    enabled: false
+    image: demo-bots
+    replicas: 1
+    env: {}
+    resources:
+      cpu: 250m
+      memory: 256Mi
+
+# Plain Kubernetes secrets, loaded as environment variables by gateways, consumers and websocket.
+# Set `existingSecret` to manage it yourself, or `values` for the chart to create one.
+secrets:
+  existingSecret: ""
+  values: {}
+  #   OIDC_CLIENT_SECRET: ""
+  #   WEBHOOK_SECRET: ""             # required by outbox
+  #   WS_PLAYER_TOKEN_SECRET: ""     # 32 bytes or more, or websocket turns the user channel off
+
+networkPolicy:
+  enabled: true
+  # Who may reach gateways, as NetworkPolicy peers. Replace this with your game servers' pods or
+  # address ranges. By default, it's any pod labeled mmx.io/role=game-server, in any namespace.
+  gameServers:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          mmx.io/role: game-server
+
+nats:
+  enabled: true
+  image: docker.io/library/nats:2-alpine
+  resources:
+    cpu: 250m
+    memory: 256Mi
+
+questdb:
+  enabled: true
+  image: docker.io/questdb/questdb:8.2.3
+  persistence:
+    size: 50Gi
+    storageClass: ""
+  resources:
+    cpu: "2"
+    memory: 4Gi
+
+valkey:
+  enabled: true
+  image: docker.io/valkey/valkey:8-alpine
+  resources:
+    cpu: 250m
+    memory: 256Mi
+
+tests:
+  image: docker.io/curlimages/curl:8.11.1
