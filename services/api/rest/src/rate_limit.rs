@@ -18,7 +18,7 @@ use tokio::time::timeout;
 
 use uuid::Uuid;
 
-const CHECK_TIMEOUT: Duration = Duration::from_millis(100);
+pub const CHECK_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Counts orders in a fixed window. It runs atomically, so gateways can't race each other.
 const CHECK_SCRIPT: &str = r"
@@ -79,25 +79,19 @@ fn decision(reply: &[i64]) -> Result<Decision, String> {
     }
 }
 
-pub struct Valkey {
+/// Connects on first use, so a gateway can start while Valkey is down.
+pub struct ValkeyLink {
     client: redis::Client,
     connection: OnceCell<ConnectionManager>,
-    script: Script,
-    default_limit: Limit,
 }
 
-impl Valkey {
-    pub fn new(url: &str, default_limit: Limit) -> Result<Self, String> {
-        Ok(Self {
-            client: redis::Client::open(url).map_err(|err| err.to_string())?,
-            connection: OnceCell::new(),
-            script: Script::new(CHECK_SCRIPT),
-            default_limit,
-        })
+impl ValkeyLink {
+    pub fn new(url: &str) -> Result<Self, String> {
+        let client = redis::Client::open(url).map_err(|err| err.to_string())?;
+        Ok(Self { client, connection: OnceCell::new() })
     }
 
-    /// Connects on first use, so a gateway can start while Valkey is down.
-    async fn connection(&self) -> Result<ConnectionManager, String> {
+    pub async fn connection(&self) -> Result<ConnectionManager, String> {
         let config = ConnectionManagerConfig::new()
             .set_connection_timeout(Some(CHECK_TIMEOUT))
             .set_response_timeout(Some(CHECK_TIMEOUT))
@@ -108,9 +102,21 @@ impl Valkey {
             .cloned()
             .map_err(|err| err.to_string())
     }
+}
+
+pub struct Valkey {
+    link: ValkeyLink,
+    script: Script,
+    default_limit: Limit,
+}
+
+impl Valkey {
+    pub fn new(url: &str, default_limit: Limit) -> Result<Self, String> {
+        Ok(Self { link: ValkeyLink::new(url)?, script: Script::new(CHECK_SCRIPT), default_limit })
+    }
 
     async fn count(&self, player: Uuid) -> Result<Decision, String> {
-        let mut connection = self.connection().await?;
+        let mut connection = self.link.connection().await?;
         let reply: Vec<i64> = self
             .script
             .key(count_key(player))

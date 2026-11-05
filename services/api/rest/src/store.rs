@@ -62,6 +62,13 @@ pub struct RecordedOrder {
     pub updated_at: String,
 }
 
+/// An order that's still working, with what a cancel needs to find it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenOrder {
+    pub account: Uuid,
+    pub id: Uuid,
+}
+
 /// A player's orders. `symbol` must already be normalized.
 #[derive(Clone, Debug, Default)]
 pub struct OrderQuery {
@@ -85,6 +92,9 @@ pub trait OrderStore: Send + Sync {
     async fn order_reached_engine(&self, key: &OrderKey, window: Duration) -> Result<bool, String>;
 
     async fn orders(&self, query: &OrderQuery) -> Result<Vec<RecordedOrder>, String>;
+
+    /// Every player's working orders in one market. `symbol` must already be normalized.
+    async fn open_orders_in_market(&self, symbol: &str, limit: usize) -> Result<Vec<OpenOrder>, String>;
 }
 
 #[derive(Deserialize)]
@@ -143,6 +153,37 @@ fn orders_sql(query: &OrderQuery) -> String {
          order by created_at desc limit {}",
         query.limit
     )
+}
+
+/// Two players can share a client order ID, so rows group by account too. They also group by the
+/// engine's order ID, because a rejected repeat of a working order shares its client order ID. The
+/// repeat's reject would otherwise read as the working order's latest state and hide it.
+fn open_orders_sql(symbol: &str, limit: usize) -> String {
+    format!(
+        "select account, cl_ord_id from (select account, cl_ord_id, order_id, \
+         last(ord_status) ord_status from orders where symbol = '{symbol}') \
+         where ord_status in ('new', 'partially_filled') limit {limit}"
+    )
+}
+
+fn parse_open_orders(reply: &ExecReply) -> Result<Vec<OpenOrder>, String> {
+    let column = |name: &str| {
+        reply
+            .columns
+            .iter()
+            .position(|column| column.name == name)
+            .ok_or_else(|| format!("no column {name}"))
+    };
+    let (account, id) = (column("account")?, column("cl_ord_id")?);
+    let uuid = |row: &[Value], at: usize| -> Result<Uuid, String> {
+        let text = row.get(at).and_then(Value::as_str).ok_or("expected a UUID")?;
+        Uuid::parse_str(text).map_err(|err| err.to_string())
+    };
+    reply
+        .dataset
+        .iter()
+        .map(|row| Ok(OpenOrder { account: uuid(row, account)?, id: uuid(row, id)? }))
+        .collect()
 }
 
 fn parse_status(status: &str) -> Result<RecordedStatus, String> {
@@ -275,6 +316,13 @@ impl OrderStore for QuestDb {
             None => Ok(Vec::new()),
         }
     }
+
+    async fn open_orders_in_market(&self, symbol: &str, limit: usize) -> Result<Vec<OpenOrder>, String> {
+        match self.exec(&open_orders_sql(symbol, limit)).await? {
+            Some(reply) => parse_open_orders(&reply),
+            None => Ok(Vec::new()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +397,30 @@ mod tests {
 
         let body = r#"{"columns":[{"name":"writerTxn"}],"dataset":[[7]]}"#;
         assert!(parse_commits(&parse_reply(body).unwrap().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_market_query_spans_players_and_keeps_each_order_apart() {
+        let sql = open_orders_sql("ITEM", 25);
+        assert!(sql.contains("symbol = 'ITEM'"));
+        assert!(!sql.contains("account ="), "every player: {sql}");
+        assert!(sql.contains("select account, cl_ord_id, order_id,"), "{sql}");
+        assert!(sql.contains("ord_status in ('new', 'partially_filled')"));
+        assert!(sql.ends_with("limit 25"));
+    }
+
+    #[test]
+    fn reads_open_orders() {
+        let body = r#"{
+            "columns": [{"name":"account","type":"UUID"},{"name":"cl_ord_id","type":"UUID"}],
+            "dataset": [["11111111-1111-1111-1111-111111111111","22222222-2222-2222-2222-222222222222"]]
+        }"#;
+        let orders = parse_open_orders(&parse_reply(body).unwrap().unwrap()).unwrap();
+        assert_eq!(orders[0].account, account());
+        assert_eq!(orders[0].id, Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+
+        let body = r#"{"columns":[{"name":"account"},{"name":"cl_ord_id"}],"dataset":[[null,"x"]]}"#;
+        assert!(parse_open_orders(&parse_reply(body).unwrap().unwrap()).is_err());
     }
 
     #[test]
