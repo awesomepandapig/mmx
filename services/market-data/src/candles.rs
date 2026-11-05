@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use tape::candle::{Candle, CandleBook};
-use tape::feed::{self, Processor, Update};
+use tape::feed::{Processor, Update};
 use tape::format::format_decimal;
 use tape::messages::{ExecutionReportMessage, symbol_name};
 
@@ -34,7 +34,7 @@ fn format_candle(candle: &Candle) -> Result<Update, serde_json::Error> {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct Candles {
+pub struct Candles {
     book: CandleBook,
 }
 
@@ -54,10 +54,6 @@ impl Processor for Candles {
             }
         }
     }
-}
-
-fn main() {
-    feed::run::<Candles>();
 }
 
 #[cfg(test)]

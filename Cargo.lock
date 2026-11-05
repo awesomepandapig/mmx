@@ -322,16 +322,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "candles"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tape",
- "tracing",
-]
-
-[[package]]
 name = "cc"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1154,17 +1144,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 
 [[package]]
-name = "level2"
-version = "0.1.0"
-dependencies = [
- "sbe",
- "serde",
- "serde_json",
- "tape",
- "tracing",
-]
-
-[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1201,6 +1180,17 @@ name = "log"
 version = "0.4.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
+
+[[package]]
+name = "market-data"
+version = "0.1.0"
+dependencies = [
+ "sbe",
+ "serde",
+ "serde_json",
+ "tape",
+ "tracing",
+]
 
 [[package]]
 name = "matchers"
@@ -2430,17 +2420,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "ticker"
-version = "0.1.0"
-dependencies = [
- "sbe",
- "serde",
- "serde_json",
- "tape",
- "tracing",
 ]
 
 [[package]]

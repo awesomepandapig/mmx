@@ -41,14 +41,8 @@ images:
   - name: ghcr.io/awesomepandapig/mmx/api
     newName: mmx/api
     newTag: dev
-  - name: ghcr.io/awesomepandapig/mmx/level2
-    newName: mmx/level2
-    newTag: dev
-  - name: ghcr.io/awesomepandapig/mmx/ticker
-    newName: mmx/ticker
-    newTag: dev
-  - name: ghcr.io/awesomepandapig/mmx/candles
-    newName: mmx/candles
+  - name: ghcr.io/awesomepandapig/mmx/market-data
+    newName: mmx/market-data
     newTag: dev
   - name: ghcr.io/awesomepandapig/mmx/trade-reporter
     newName: mmx/trade-reporter

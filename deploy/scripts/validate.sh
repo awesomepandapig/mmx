@@ -97,7 +97,7 @@ expect "release names reach member addresses" "$out/renamed.yaml" "other-mmx-nod
 expect "consumers get the tape in host:port form" "$out/default.yaml" \
     'value: "mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012"'
 expect "feeds keep their checkpoints" "$out/default.yaml" "/var/lib/mmx/checkpoints"
-expect_line "candles run by default" "$out/default.yaml" "name: mmx-candles"
+expect_line "market data runs by default" "$out/default.yaml" "name: mmx-market-data"
 refuse "an install never rebuilds QuestDB" "$out/full.yaml" "--rebuild"
 expect "the rebuild job passes the flag" "$out/rebuild.yaml" "--rebuild"
 expect "the rebuild job can't retry" "$out/rebuild.yaml" "backoffLimit: 0"
@@ -130,7 +130,7 @@ refuse "the overlay has no production image left" "$out/overlay.yaml" "image: gh
 
 # The driver must reach every client, whichever kind of workload it is.
 drivers=$(grep -c 'name: aeron-driver' "$out/base.yaml")
-if [ "$drivers" -eq 5 ]; then pass "the driver reaches every client"; else fail "found $drivers drivers, wanted 5"; fi
+if [ "$drivers" -eq 3 ]; then pass "the driver reaches every client"; else fail "found $drivers drivers, wanted 3"; fi
 
 # The two layouts must set the same node settings, or one of them has fallen behind.
 sed -n 's/^\([A-Z_]*\)=.*/\1/p' deploy/kustomize/base/node.env | sort >"$out/kustomize-keys"

@@ -122,9 +122,9 @@ marketsYaml: |
 # The feeds keep a checkpoint on a volume, because without one they replay the whole tape, which is
 # kept forever by default. trade-reporter resumes from QuestDB, so it doesn't need one.
 consumers:
-  level2:
+  market-data:
     enabled: true
-    image: level2
+    image: market-data
     env:
       CHECKPOINT_DIR: /var/lib/mmx/checkpoints
     persistence:
@@ -132,32 +132,9 @@ consumers:
       storageClass: ""
       mountPath: /var/lib/mmx
     resources:
-      cpu: "1"
-      memory: 512Mi
-  ticker:
-    enabled: true
-    image: ticker
-    env:
-      CHECKPOINT_DIR: /var/lib/mmx/checkpoints
-    persistence:
-      size: 5Gi
-      storageClass: ""
-      mountPath: /var/lib/mmx
-    resources:
-      cpu: "1"
-      memory: 512Mi
-  candles:
-    enabled: true
-    image: candles
-    env:
-      CHECKPOINT_DIR: /var/lib/mmx/checkpoints
-    persistence:
-      size: 5Gi
-      storageClass: ""
-      mountPath: /var/lib/mmx
-    resources:
-      cpu: "1"
-      memory: 512Mi
+      cpu: "3"
+      memory: 1536Mi
+  # Required, along with `questdb.enabled`: the gateway answers `GET` orders from QuestDB.
   trade-reporter:
     enabled: true
     image: trade-reporter

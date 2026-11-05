@@ -1,4 +1,4 @@
-use crate::processors::ticker::TickerState;
+use crate::ticker::processors::ticker::TickerState;
 
 use sbe::exec_type_enum::ExecTypeEnum;
 

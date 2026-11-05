@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use tape::book::OrderBook;
-use tape::feed::{self, Processor, Update};
+use tape::feed::{Processor, Update};
 use tape::messages::{ExecutionReportMessage, SymbolType, symbol_map, symbol_name};
 
 #[derive(Default, Serialize, Deserialize)]
-struct Level2 {
+pub struct Level2 {
     #[serde(with = "symbol_map")]
     books: HashMap<SymbolType, OrderBook>,
     last_seen_id: u64,
@@ -28,10 +28,6 @@ impl Processor for Level2 {
             updates.push(Update { subject, payload });
         }
     }
-}
-
-fn main() {
-    feed::run::<Level2>();
 }
 
 #[cfg(test)]

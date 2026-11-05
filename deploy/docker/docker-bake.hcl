@@ -55,7 +55,7 @@ group "default" {
 }
 
 group "core" {
-  targets = ["node", "matching-engine", "api", "websocket", "level2", "ticker", "candles", "trade-reporter"]
+  targets = ["node", "matching-engine", "api", "websocket", "market-data", "trade-reporter"]
 }
 
 target "_common" {
@@ -93,9 +93,7 @@ target "service" {
     item = [
       { image = "api", bin = "api" },
       { image = "websocket", bin = "websocket" },
-      { image = "level2", bin = "level2" },
-      { image = "ticker", bin = "ticker" },
-      { image = "candles", bin = "candles" },
+      { image = "market-data", bin = "market-data" },
       { image = "trade-reporter", bin = "trade-reporter" },
       { image = "outbox", bin = "outbox" },
       { image = "observer", bin = "sbx-observer" },

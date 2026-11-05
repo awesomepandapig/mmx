@@ -27,7 +27,7 @@ REGISTRY=registry.example/mmx TAG=0.1.0 docker buildx bake -f deploy/docker/dock
 |---|---|
 | `node` | JRE and `aeron-all-1.54.0.jar`, as a cluster member or, with `driver`, a media driver |
 | `matching-engine` | The engine in the `dist` profile with `silent`, as benchmarked |
-| `api`, `websocket`, `level2`, `ticker`, `candles`, `trade-reporter`, `observer` | One Rust service each |
+| `api`, `websocket`, `market-data`, `trade-reporter`, `observer` | One Rust service each |
 | `tools` | Every `sbx-*` tool, for debugging a running cluster |
 | `web`, `docs` | The Remix apps. `VITE_` values are baked in, so set them when building |
 | `auth` | Built for now, but not in the chart, because it's being retired |

@@ -10,7 +10,7 @@ add a fill webhook that dedupes on `fill_id`.
 game server -> gateway -> engine (Aeron Cluster) -> tape (Aeron Archive)
                                                      |-> outbox -> webhooks to the game
                                                      |-> trade-reporter -> QuestDB
-                                                     |-> level2, ticker, candles -> NATS -> websocket
+                                                     |-> market-data -> NATS -> websocket
 ```
 
 These decisions are settled:
@@ -19,8 +19,8 @@ These decisions are settled:
   keeps no gateway state. New symbols go live when orders arrive, and trees are never freed.
 - **The tape is the record.** Aeron Archive output is authoritative, byte-identical on every node, and
   kept forever by default. Everything else is a consumer that can lag behind it.
-- **QuestDB is the default query view, not the source of truth.** It's rebuilt from the tape if lost.
-  Open-source QuestDB is single-node, and that's fine for this role.
+- **QuestDB is a required query view, not the source of truth.** `GET` orders reads from it, and it's
+  rebuilt from the tape if lost. Open-source QuestDB is single-node, and that's fine for this role.
 - **Gateways bounce.** Validation, rate limits and enabled markets live there. Only game servers can
   reach gateways, enforced by firewall policy.
 - **A POST is a guarantee.** It's held across a failover and answered with the engine's decision. If
@@ -107,6 +107,7 @@ Owns `crates/cluster` and `services/matching-engine`.
 - [ ] Configurable tape retention, swept to QuestDB by default
 - [x] Report a repeat of a resting order as a duplicate, even on a full book
 - [ ] Recovery plan for an order that panics every node, since replay hits the same panic
+- [ ] Reject a message split across frames instead of panicking; only `sbx-cluster-bench --batch` above about 13 sends one
 - [ ] Give a full book its own reject reason and an operator alert
 - [ ] Give self-trade cancels their own reason
 - [ ] Clear stale TODOs in `publisher.rs`, `types.rs`, `config.rs` and `handler.rs`

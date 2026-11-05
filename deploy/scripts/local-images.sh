@@ -2,7 +2,7 @@
 # Builds the images for a local cluster with Apple `container`, one at a time.
 #
 #   deploy/scripts/local-images.sh                  everything values-local.yaml needs
-#   deploy/scripts/local-images.sh api level2       only these images
+#   deploy/scripts/local-images.sh api market-data       only these images
 #
 # `container` has no Bake, so this is the loop Bake would run. It builds from a copy of the tracked
 # and new files outside /Users, because the builder is very slow when a large directory such as
@@ -25,7 +25,7 @@ build() {
 }
 
 if [ "$#" -eq 0 ]; then
-    set -- node matching-engine api websocket level2 ticker candles trade-reporter web
+    set -- node matching-engine api websocket market-data trade-reporter web
 fi
 
 for image in "$@"; do

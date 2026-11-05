@@ -9,7 +9,7 @@ SBX is an order-book exchange, built for Hypixel SkyBlock and being repositioned
 ```sh
 cargo build --workspace --release          # all Rust services and tools
 cargo build -p matching-engine             # one service
-cargo test --workspace                     # tools and level2 have tests so far
+cargo test --workspace
 cargo test -p tools flags_time_priority    # one test
 cargo clippy --workspace                   # CI runs clippy with --all-features
 
@@ -19,7 +19,7 @@ tools/scripts/sbx.py verify --orders 20000 --rate 5000   # seeded load + invaria
 tools/scripts/bench.py --compare m4-mac-mini     # deterministic tape, fails on a regression
 ```
 
-Run `tools/scripts/sbx.py verify` after changing `matching-engine`, `level2` or `ticker`. It restarts the engine, so don't run it against something you want to keep running.
+Run `tools/scripts/sbx.py verify` after changing `matching-engine` or `market-data`. It restarts the engine, so don't run it against something you want to keep running.
 
 Day to day, use `cargo test` and a short `verify`. Only run `tools/scripts/bench.py` when asked: it takes minutes, and it isn't part of the normal development loop. Its digest proves the engine's output didn't change, which helps for risky engine refactors. Baselines only compare fairly on the machine that made them, at the same tape and `--max-orders`. Other work on the machine skews throughput.
 
@@ -29,9 +29,9 @@ Day to day, use `cargo test` and a short `verify`. Only run `tools/scripts/bench
 
 ```
 api --(aeron udp, stream 1001: NewOrderSingle)--> matching-engine
-matching-engine --(aeron MDC, stream 1002: ExecutionReport)--> level2, ticker, trade-reporter, observer, sbx-* tools
-level2 --(NATS subject "l2.<symbol>")--> websocket --> browser
-ticker --(NATS subject "ticker.<symbol>")--> nothing subscribes yet
+matching-engine --(aeron MDC, stream 1002: ExecutionReport)--> market-data, trade-reporter, outbox, observer, sbx-* tools
+market-data --(NATS subjects "l2.<symbol>", "ticker.<symbol>", "candles.<symbol>")--> websocket --> browser
+outbox --(signed webhooks)--> game
 trade-reporter --> QuestDB (tables are created on first write)
 observer --(OTLP)--> collector
 auth (better-auth + Express) --> Postgres; not connected to api yet
@@ -56,11 +56,9 @@ auth (better-auth + Express) --> Postgres; not connected to api yet
 
 ## Things that bite
 
-- `level2` and `ticker` keep their own in-memory books and assert that order IDs arrive in sequence. Start them before the first order, and restart them together with `matching-engine`.
-- `level2` and `ticker` panic on any template ID other than 3 or 4.
+- `market-data` runs the level2, ticker and candles feeds on one thread each. Without `TAPE_ARCHIVES` they read the live stream with no resume, so start them before the first order and restart them with `matching-engine`.
 - Only new and rejected orders spend an order ID. Every report spends an exec ID, including cancel rejects.
 - See "What doesn't work yet" in `STARTUP.md` for known gaps.
 - `tracing`'s `max_level_*` features are ignored in release builds; use `release_max_level_*`.
-- `level2` and `ticker` duplicate `messages.rs`, so changes need to be made in both.
 - `tests/` is in `.gitignore`, so new top-level test directories won't show up in git without `-f`.
 - Port 8080 is used by another project on the owner's Mac. `tools/scripts/sbx.py` uses 8090 there.

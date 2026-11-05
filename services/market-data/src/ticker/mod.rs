@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use tape::book::OrderBook;
-use tape::feed::{self, Processor, Update};
+use tape::feed::{Processor, Update};
 use tape::messages::{ExecutionReportMessage, SymbolType, symbol_map, symbol_name};
 
 #[derive(Default, Serialize, Deserialize)]
-struct Tickers {
+pub struct Tickers {
     #[serde(with = "symbol_map")]
     markets: HashMap<SymbolType, (OrderBook, TickerState)>,
     last_seen_id: u64,
@@ -32,10 +32,6 @@ impl Processor for Tickers {
             updates.push(Update { subject, payload });
         }
     }
-}
-
-fn main() {
-    feed::run::<Tickers>();
 }
 
 #[cfg(test)]

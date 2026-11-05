@@ -115,6 +115,8 @@ fn main() -> ! {
             });
 
         if fragments_read == 0 {
+            // A slow reader can leave reports waiting after the last order.
+            handler.publisher.drain();
             spin_loop();
         }
     }

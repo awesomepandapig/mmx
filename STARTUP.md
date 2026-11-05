@@ -132,16 +132,15 @@ SUB_CHANNEL='aeron:udp?endpoint=localhost:40123' SUB_STREAM_ID=1001 \
 PUB_CHANNEL='aeron:udp?control=localhost:40456|control-mode=dynamic' PUB_STREAM_ID=1002 \
 MAX_ORDERS=1000000 target/release/matching-engine
 
-target/release/level2
-target/release/ticker
+target/release/market-data
 target/release/trade-reporter
 target/release/sbx-observer
 target/release/api
 WS_ADDR=127.0.0.1:8090 target/release/websocket
 ```
 
-**Order matters.** `level2` and `ticker` expect order IDs to start at 1 and keep their
-book in memory, so start them before the first order, and restart them with `matching-engine`.
+**Order matters.** Without `TAPE_ARCHIVES`, `market-data` reads the live stream with no resume,
+so start it before the first order, and restart it with `matching-engine`.
 
 **This Mac:** nginx from the `gtfs` project owns port 8080. `websocket` can still bind
 `127.0.0.1:8080` and silently take its localhost traffic, so `sbx.py` uses 8090 here.
@@ -151,10 +150,10 @@ book in memory, so start them before the first order, and restart them with `mat
 | Variable | Used by | Default |
 |---|---|---|
 | `AERON_DIR` | All Aeron services | `/Volumes/DevShm/aeron` on macOS, `/dev/shm/aeron` on Linux |
-| `SUB_CHANNEL`, `SUB_STREAM_ID` | `matching-engine` (required), `level2`, `ticker`, `trade-reporter` | See `crates/transport/src/lib.rs` |
+| `SUB_CHANNEL`, `SUB_STREAM_ID` | `matching-engine` (required), `market-data`, `trade-reporter` | See `crates/transport/src/lib.rs` |
 | `PUB_CHANNEL`, `PUB_STREAM_ID` | `matching-engine` (required), `api` | See `crates/transport/src/lib.rs` |
 | `MAX_ORDERS` | `matching-engine` (required), resting orders across all symbols | None |
-| `NATS_URL` | `level2`, `ticker`, `websocket` | `localhost` |
+| `NATS_URL` | `market-data`, `websocket` | `localhost` |
 | `QUESTDB_CONF` | `trade-reporter` | `http::addr=localhost:9000;` |
 | `WS_ADDR` | `websocket` | `127.0.0.1:8080` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `sbx-observer` | `http://localhost:4318` |
@@ -210,7 +209,7 @@ Useful variations:
 ```sh
 tools/scripts/sbx.py verify --orders 1000000                  # as fast as possible
 tools/scripts/sbx.py verify --accounts 1                      # forces self-trade prevention
-tools/scripts/sbx.py verify --without tr,level2,ticker        # isolate a bottleneck
+tools/scripts/sbx.py verify --without tr,market-data        # isolate a bottleneck
 tools/scripts/sbx.py verify --capture /tmp/run.jsonl          # keep every event
 ```
 
@@ -396,12 +395,11 @@ Also known:
 - **Aeron Archive and replay.** Replaying input should rebuild the book, and replaying output
   into `level2` would test it offline. Timestamps will differ, because the engine stamps them
   when it receives each message.
-- **Stop `level2` silently dropping updates.** It discards them when its queue is full.
 
 ## Resource use
 
-`matching-engine`, `level2`, `ticker` and `trade-reporter` poll in a tight loop, so each uses a full CPU core
-even when idle. `sbx-observer`, `sbx-check` and `sbx-book` sleep when idle.
+`matching-engine` and `trade-reporter` poll in a tight loop, so each uses a full CPU core even when idle.
+`market-data` uses one core per feed, so three. `sbx-observer`, `sbx-check` and `sbx-book` sleep when idle.
 
 ## Regenerating SBE codecs
 

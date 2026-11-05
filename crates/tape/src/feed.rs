@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::hint::spin_loop;
 use std::path::Path;
 use std::process;
+use std::sync::Once;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -181,7 +182,8 @@ fn init_tracing() {
 /// Runs a service forever. `rusteron` handles aren't `Send`, so polling stays on this thread and
 /// NATS runs on the tokio runtime.
 pub fn run<P: Processor>() {
-    init_tracing();
+    static TRACING: Once = Once::new();
+    TRACING.call_once(init_tracing);
 
     let config = TapeConfig::from_env(P::REPLAY_STREAM).unwrap_or_else(|e| {
         error!("{}", e);
