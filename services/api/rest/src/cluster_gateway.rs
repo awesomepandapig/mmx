@@ -416,7 +416,11 @@ fn run(
 
         for subscription in &reports {
             let _ = subscription.poll_fn(
-                |buffer, _header| tracker.on_report(buffer, Instant::now()),
+                // Ahead of the answer, so anything that follows it waits for this report too.
+                |buffer, header| {
+                    stream.advance_to(header.position());
+                    tracker.on_report(buffer, Instant::now());
+                },
                 256,
             );
         }

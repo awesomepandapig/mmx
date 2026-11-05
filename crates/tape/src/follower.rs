@@ -117,7 +117,9 @@ fn archive_client() -> Result<archive::Aeron, String> {
 
 pub struct Follower {
     config: TapeConfig,
-    aeron: archive::Aeron,
+    /// Replaced on every move. Closing a subscription leaves its images mapped until the client
+    /// closes, and each one holds 192 MB of shared memory.
+    aeron: Option<archive::Aeron>,
     subscription: Option<archive::AeronArchivePersistentSubscription>,
     node: usize,
     position: i64,
@@ -132,7 +134,7 @@ impl Follower {
         let now = Instant::now();
         Ok(Self {
             config,
-            aeron: archive_client()?,
+            aeron: Some(archive_client()?),
             subscription: None,
             node: 0,
             position,
@@ -143,12 +145,14 @@ impl Follower {
     }
 
     fn open(&mut self) -> Result<archive::AeronArchivePersistentSubscription, String> {
-        if self.aeron.is_closed() {
-            self.aeron = archive_client()?;
-        }
+        let aeron = match self.aeron.take() {
+            Some(aeron) if !aeron.is_closed() => aeron,
+            _ => archive_client()?,
+        };
+        let aeron = self.aeron.insert(aeron);
         let node = self.node;
         let context = archive::AeronArchiveContext::new().map_err(text)?;
-        context.set_aeron(&self.aeron).map_err(text)?;
+        context.set_aeron(aeron).map_err(text)?;
         context
             .set_control_request_channel(&cstring(&self.config.control_request_channel(node))?)
             .map_err(text)?;
@@ -156,7 +160,7 @@ impl Follower {
             .set_control_response_channel(&cstring(&self.config.client_channel())?)
             .map_err(text)?;
 
-        let client = archive::AeronArchiveAsyncConnect::new_with_aeron(&context, &self.aeron)
+        let client = archive::AeronArchiveAsyncConnect::new_with_aeron(&context, aeron)
             .map_err(text)?
             .poll_blocking(CONNECT_TIMEOUT)
             .map_err(text)?;
@@ -167,7 +171,7 @@ impl Follower {
             return Err("the report stream has no recording yet".to_string());
         }
 
-        archive::PersistentSubscriptionBuilder::new_with_aeron(&context, &self.aeron)
+        archive::PersistentSubscriptionBuilder::new_with_aeron(&context, aeron)
             .map_err(text)?
             .live_channel(&self.config.live_channel(node))
             .map_err(text)?
@@ -188,6 +192,7 @@ impl Follower {
     fn move_to_next_node(&mut self, reason: &str) {
         warn!("Tape: leaving node {} at position {}: {}", self.node, self.position, reason);
         self.subscription = None;
+        self.aeron = None;
         self.node = (self.node + 1) % self.config.archives.len();
         self.retry_at = Instant::now() + RETRY_AFTER;
     }
@@ -215,8 +220,10 @@ impl Follower {
         };
 
         let position = &mut self.position;
+        let mut delivered = 0;
         let result = subscription.poll_fn(
             |buffer, header| {
+                delivered += 1;
                 *position = header.position();
                 handler(buffer, *position);
             },
@@ -227,7 +234,8 @@ impl Follower {
             Ok(read) => (read, None),
             Err(e) => (0, Some(text(e))),
         };
-        if read > 0 || subscription.is_live() {
+        // `read` also counts the client's own work, which never stops while a dead node is retried.
+        if delivered > 0 || subscription.is_live() {
             self.last_progress = now;
         }
         let failure = failure

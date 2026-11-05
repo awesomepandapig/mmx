@@ -223,7 +223,10 @@ impl Store {
                 error!("Skipping a candle: {}", e);
             }
         }
-        self.sender.flush(&mut self.rows).map_err(|e| e.to_string())?;
+        // A term marker moves the position with no rows, and the client refuses an empty buffer.
+        if self.rows.row_count() > 0 {
+            self.sender.flush(&mut self.rows).map_err(|e| e.to_string())?;
+        }
 
         if let Some(position) = position {
             self.position_row.clear();
@@ -276,6 +279,12 @@ mod tests {
 
         assert!(store.flush(&mut CandleBook::default(), Some(1)).is_err());
         assert_eq!(store.queued_rows(), 1);
+    }
+
+    #[test]
+    fn a_flush_with_no_rows_succeeds() {
+        let mut store = store();
+        assert_eq!(store.flush(&mut CandleBook::default(), None), Ok(()));
     }
 
     #[test]
