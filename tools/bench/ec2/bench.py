@@ -25,6 +25,10 @@ NODES = 3
 SSH = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
 USER = "admin"
 HEARTBEAT = os.environ.get("LEADER_HEARTBEAT_TIMEOUT", "500ms")
+STORE = os.environ.get("STORE", "/data")  # /data is local NVMe, /var/bench is the gp3 root volume
+ENGINE = os.environ.get("ENGINE", "matching-engine")
+MAX_ORDERS = os.environ.get("MAX_ORDERS", "1000000")
+PINNED = os.environ.get("PINNED", "1") == "1"
 
 # Thread name in the JVM, and the CPU it's pinned to. The engine takes CPU 1.
 PINS = {"sender": 2, "receiver": 3, "consensus-module": 0}
@@ -50,7 +54,7 @@ def properties(i, private):
     idle = os.environ.get("IDLE", "org.agrona.concurrent.BusySpinIdleStrategy")
     return f"""aeron.dir=/dev/shm/aeron
 aeron.dir.delete.on.start=true
-aeron.threading.mode=DEDICATED
+aeron.threading.mode={os.environ.get("THREADING", "DEDICATED")}
 aeron.sender.idle.strategy={idle}
 aeron.receiver.idle.strategy={idle}
 aeron.cluster.idle.strategy={idle}
@@ -59,7 +63,7 @@ aeron.spies.simulate.connection=true
 aeron.socket.so_sndbuf=4m
 aeron.socket.so_rcvbuf=4m
 aeron.rcv.initial.window.length=4m
-aeron.archive.dir=/data/archive
+aeron.archive.dir={STORE}/archive
 aeron.archive.control.channel=aeron:udp?endpoint={me}:{8010+i}
 aeron.archive.control.response.channel=aeron:udp?endpoint={me}:0
 aeron.archive.replication.channel=aeron:udp?endpoint={me}:0
@@ -67,12 +71,12 @@ aeron.archive.threading.mode=SHARED
 aeron.archive.recording.events.enabled=false
 aeron.archive.file.sync.level={os.environ.get("SYNC", "1")}
 aeron.archive.catalog.file.sync.level={os.environ.get("SYNC", "1")}
-aeron.cluster.dir=/data/cluster
+aeron.cluster.dir={STORE}/cluster
 aeron.cluster.id=0
 aeron.cluster.member.id={i}
 aeron.cluster.members={members}
 aeron.cluster.ingress.channel=aeron:udp
-aeron.cluster.log.channel=aeron:udp?term-length=16m|control-mode=manual|control={me}:{20040+i}
+aeron.cluster.log.channel=aeron:udp?term-length={os.environ.get("LOG_TERM_LENGTH", "16m")}|control-mode=manual|control={me}:{20040+i}
 aeron.cluster.replication.channel=aeron:udp?endpoint={me}:0
 aeron.cluster.clock=io.aeron.cluster.NanosecondClusterClock
 aeron.cluster.leader.heartbeat.timeout={HEARTBEAT}
@@ -87,7 +91,8 @@ aeron.cluster.service.count=1
 
 def start_node(i, public, private, wipe=True):
     me = private[f"node{i}"]
-    clean = "sudo rm -rf /data/archive /data/cluster /data/digest /data/timing; " if wipe else ""
+    clean = (f"sudo rm -rf /data/archive /data/cluster /var/bench /data/digest /data/timing; "
+             f"sudo mkdir -p {STORE}; sudo chmod 777 {STORE}; ") if wipe else ""
     ssh(public[f"node{i}"], f"pkill -9 -f [C]lusteredMediaDriver; pkill -9 matching-engine; {clean}"
                             "sudo rm -rf /dev/shm/aeron /dev/shm/aeron-admin; "
                             "cat > /data/node.properties", stdin=properties(i, private), check=False)
@@ -96,19 +101,20 @@ def start_node(i, public, private, wipe=True):
             "-cp /data/aeron-all.jar io.aeron.cluster.ClusteredMediaDriver /data/node.properties "
             "> /data/java.log 2>&1 < /dev/null &")
     ssh(public[f"node{i}"], java)
-    pins = "; ".join(
+    pins = "true" if not PINNED else "; ".join(
         f"for t in $(ps -T -p $J -o tid=,comm= | grep -i {name[:12]} | awk '{{print $1}}'); do taskset -cp {cpu} $t; done"
         for name, cpu in PINS.items())
-    engine_env = (f"CLUSTER_ID=0 AERON_DIR=/dev/shm/aeron MAX_ORDERS=1000000 PUB_STREAM_ID=1002 "
+    engine_env = (f"CLUSTER_ID=0 AERON_DIR=/dev/shm/aeron MAX_ORDERS={MAX_ORDERS} PUB_STREAM_ID=1002 "
                   f"PUB_CHANNEL='aeron:udp?control={me}:{40450+i}|control-mode=dynamic|term-length=64m' "
                   f"ARCHIVE_CONTROL='aeron:udp?endpoint={me}:{8010+i}' DIGEST_FILE=/data/digest "
                   f"TIMING_FILE=/data/timing RUST_BACKTRACE=1 "
                   + ("" if os.environ.get("NO_DIGEST") else "DIGEST=1 "))
+    pin_java = f"taskset -acp {SHARED_CPUS} $J > /dev/null; {pins} > /dev/null; " if PINNED else ""
+    run_engine = f"taskset -c {SHARED_CPUS} /data/{ENGINE}" if PINNED else f"/data/{ENGINE}"
+    pin_engine = "sleep 1; E=$(pgrep -x matching-engine); taskset -cp 1 $E > /dev/null" if PINNED else "true"
     ssh(public[f"node{i}"],
         "until [ -f /dev/shm/aeron/cnc.dat ]; do sleep 0.1; done; sleep 2; J=$(pgrep -f [C]lusteredMediaDriver); "
-        f"taskset -acp {SHARED_CPUS} $J > /dev/null; {pins} > /dev/null; "
-        f"{engine_env} nohup taskset -c {SHARED_CPUS} /data/matching-engine > /data/engine.log 2>&1 < /dev/null & "
-        "sleep 1; E=$(pgrep -x matching-engine); taskset -cp 1 $E > /dev/null")
+        f"{pin_java}{engine_env} nohup {run_engine} > /data/engine.log 2>&1 < /dev/null & {pin_engine}")
 
 
 def main():
@@ -127,7 +133,9 @@ def main():
     elif command == "push":
         source = sys.argv[2]
         for host in hosts:
-            subprocess.run(["rsync", "-az", "-e", " ".join(SSH), f"{source}/", f"{USER}@{host}:/data/"], check=True)
+            # Names the children, because the hosts' /data belongs to root and rsync can't update it.
+            children = [str(path) for path in sorted(Path(source).iterdir())]
+            subprocess.run(["rsync", "-az", "-e", " ".join(SSH), *children, f"{USER}@{host}:/data/"], check=True)
         print("pushed")
     elif command == "up":
         # Stop every node before wiping any, or a wiped node rejoins and copies the old log back.

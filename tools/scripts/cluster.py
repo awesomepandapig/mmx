@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 RUN = ROOT / ".run" / "cluster"
 JAR = Path(os.environ.get("AERON_JAR", ROOT / ".run" / "aeron-all-1.54.0.jar"))
-ENGINE = ROOT / "target" / "dist" / "matching-engine"
+ENGINE = Path(os.environ.get("ENGINE", ROOT / "target" / "dist" / "matching-engine"))
 SHM = Path("/Volumes/DevShm")
 NODES = 3
 MEMBERS = "|".join(
@@ -38,7 +38,7 @@ aeron.cluster.id=0
 aeron.cluster.member.id={i}
 aeron.cluster.members={MEMBERS}
 aeron.cluster.ingress.channel=aeron:udp
-aeron.cluster.log.channel=aeron:udp?term-length=16m|control-mode=manual|control=localhost:{20040+i}
+aeron.cluster.log.channel=aeron:udp?term-length={os.environ.get("LOG_TERM_LENGTH", "16m")}|control-mode=manual|control=localhost:{20040+i}
 aeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0
 aeron.cluster.clock=io.aeron.cluster.NanosecondClusterClock
 aeron.cluster.leader.heartbeat.timeout={HEARTBEAT}
@@ -97,7 +97,7 @@ def start(i):
     if not alive(f"java{i}"):
         sys.exit(f"node {i} exited on startup, see {RUN}/java{i}.log")
     spawn(f"engine{i}", [ENGINE], {
-        "CLUSTER_ID": "0", "AERON_DIR": f"{SHM}/cluster-{i}", "MAX_ORDERS": "1000000",
+        "CLUSTER_ID": "0", "AERON_DIR": f"{SHM}/cluster-{i}", "MAX_ORDERS": os.environ.get("MAX_ORDERS", "1000000"),
         "PUB_CHANNEL": f"aeron:udp?control=localhost:{40450+i}|control-mode=dynamic|term-length=64m",
         "PUB_STREAM_ID": "1002", "NODE_ID": str(i), "RUST_BACKTRACE": "1",
         "ARCHIVE_CONTROL": f"aeron:udp?endpoint=localhost:{8010+i}",

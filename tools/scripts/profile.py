@@ -34,6 +34,10 @@ ENGINE = ROOT / "target" / "dist" / "matching-engine"
 IS_MAC = platform.system() == "Darwin"
 AERON_DIR = "/Volumes/DevShm/aeron-bench" if IS_MAC else "/dev/shm/aeron-bench"
 AERON_BIN = Path(os.environ.get("AERON_BIN", Path.home() / "Projects/aeron/cppbuild/Release/binaries"))
+# Linux only: the driver when there's no aeronmd, core lists for each process, and where perf writes.
+AERON_JAR = os.environ.get("AERON_JAR")
+CPUS = {name: os.environ.get(f"{name}_CPUS") for name in ("ENGINE", "BENCH", "DRIVER")}
+PERF_DIR = os.environ.get("PERF_DIR")
 
 BASE = {"orders": 5_000_000, "seed": 1, "accounts": 1000, "spread": 5, "market_pct": 10, "symbols": 1,
         "cancel_pct": 0, "unknown_cancel_pct": 0, "duplicate_pct": 0, "max_orders": 1_000_000}
@@ -51,7 +55,7 @@ SWEEPS = {
     "tape_size": ("Tape size", "orders", [1_000_000, 5_000_000, 20_000_000], {"max_orders": 5_000_000}),
     "book_depth": ("Book depth: price levels either side of mid", "spread", [5, 50, 500, 5000, 50000],
                    {"max_orders": 5_000_000}),
-    "symbols": ("Symbols sharing one engine", "symbols", [1, 10, 100, 1000, 10000], {}),
+    "symbols": ("Symbols sharing one engine", "symbols", [1, 10, 100, 500, 1000, 2000, 5000, 10000], {}),
     "capacity": ("MAX_ORDERS", "max_orders", [1_000_000, 5_000_000, 10_000_000], {}),
     "market_pct": ("Market orders, percent", "market_pct", [0, 10, 50, 100], {}),
     "cancels": ("Cancels, percent of messages", "cancel_pct", [0, 10, 30, 50], {}),
@@ -84,6 +88,8 @@ def preflight():
 
 
 def build():
+    if os.environ.get("PREBUILT"):
+        return
     run_quiet(["cargo", "build", "--profile", "dist", "-p", "matching-engine", "--features", "silent"], cwd=ROOT)
     run_quiet(["cargo", "build", "--release", "-p", "tools"], cwd=ROOT)
 
@@ -124,6 +130,20 @@ def memory_kb(pid):
     return int(output) if output.isdigit() else 0
 
 
+def pinned(name, command):
+    """Holds a process to its cores. macOS can't, which is one reason its tails can't be trusted."""
+    return ["taskset", "-c", CPUS[name], *command] if CPUS[name] else command
+
+
+def driver_command():
+    if AERON_JAR:
+        return ["java", "--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED", f"-Daeron.dir={AERON_DIR}",
+                "-Daeron.threading.mode=SHARED", "-Daeron.dir.delete.on.start=true", "-cp", AERON_JAR,
+                "io.aeron.driver.MediaDriver"]
+    return [AERON_BIN / "aeronmd", f"-Daeron.dir={AERON_DIR}", "-Daeron.threading.mode=SHARED",
+            "-Daeron.dir.delete.on.start=true"]
+
+
 def wait_until_booted(pid):
     """The engine connects before it finishes touching its memory, so waits for that to settle."""
     last, steady = -1, 0
@@ -138,12 +158,11 @@ def wait_until_booted(pid):
 def measure(config, mode, tape, rate=LATENCY_RATE, limit=None):
     env = {**os.environ, "AERON_DIR": AERON_DIR}
     driver = subprocess.Popen(
-        [AERON_BIN / "aeronmd", f"-Daeron.dir={AERON_DIR}", "-Daeron.threading.mode=SHARED",
-         "-Daeron.dir.delete.on.start=true"],
+        pinned("DRIVER", driver_command()),
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
     time.sleep(1)
     engine = subprocess.Popen(
-        [ENGINE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        pinned("ENGINE", [ENGINE]), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
         env={**env, "SUB_CHANNEL": "aeron:ipc", "SUB_STREAM_ID": "1001", "PUB_CHANNEL": "aeron:ipc",
              "PUB_STREAM_ID": "1002", "MAX_ORDERS": str(config["max_orders"])})
     try:
@@ -153,8 +172,13 @@ def measure(config, mode, tape, rate=LATENCY_RATE, limit=None):
         if limit:
             command += ["--limit", limit]
         load = os.getloadavg()[0]
+        perf = None
+        if PERF_DIR and mode == "digest":
+            perf = subprocess.Popen(["perf", "record", "-q", "-e", "cpu-clock", "-F", "999", "-g", "-p", str(engine.pid),
+                                     "-o", f"{PERF_DIR}/{tape.stem}-{config['max_orders']}.data"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            output = run_quiet(command, env=env, timeout=RUN_TIMEOUT)
+            output = run_quiet(pinned("BENCH", command), env=env, timeout=RUN_TIMEOUT)
         except subprocess.TimeoutExpired:
             return {"failed": f"no answer after {RUN_TIMEOUT}s"}
         except subprocess.CalledProcessError as err:
@@ -165,6 +189,9 @@ def measure(config, mode, tape, rate=LATENCY_RATE, limit=None):
         result.update(load=round(load, 2), boot_kb=boot_kb, end_kb=memory_kb(engine.pid))
         return result
     finally:
+        if perf:
+            perf.terminate()
+            perf.wait()
         engine.kill()
         driver.terminate()
         engine.wait()
@@ -382,7 +409,7 @@ def table(items):
     return "<details><summary>Table</summary><table>" + "".join(lines) + "</table></details>"
 
 
-def load_chart(rows):
+def load_chart(rows, low=2):
     series = [("p50", "p50", "var(--series-1)"), ("p99", "p99", "var(--series-2)"), ("p99_9", "p99.9", "var(--series-3)")]
     rates = sorted({row["rate"] for row in rows if row["mode"] == "load" and "failed" not in row})
     if not rates:
@@ -394,10 +421,9 @@ def load_chart(rows):
 
     import math
     width, height, left, right, bottom = 820, 300, 64, 70, 30
-    low = 2
     high = math.ceil(math.log10(max(max(p.values()) for p in points.values())))
     x = lambda index: left + (width - left - right) * index / max(len(rates) - 1, 1)
-    y = lambda value: (height - bottom) * (1 - (math.log10(max(value, 100)) - low) / (high - low)) + 6
+    y = lambda value: (height - bottom) * (1 - (math.log10(max(value, 10 ** low)) - low) / (high - low)) + 6
     parts = [f'<svg viewBox="0 0 {width} {height}" role="img" aria-label="Latency by offered load, log scale">']
     for power in range(low, high + 1):
         value = 10 ** power
@@ -510,4 +536,5 @@ def main():
         write_report(directory if directory.is_absolute() else RESULTS / directory, args.findings)
 
 
-main()
+if __name__ == "__main__":
+    main()

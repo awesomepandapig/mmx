@@ -69,6 +69,18 @@
       }
     },
     {
+      "Sid": "ChangeOnlyBenchInstances",
+      "Effect": "Allow",
+      "Action": "ec2:ModifyInstanceAttribute",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1",
+          "aws:ResourceTag/Project": "mmx-cluster-bench"
+        }
+      }
+    },
+    {
       "Sid": "ExpiresAutomatically",
       "Effect": "Deny",
       "Action": "*",

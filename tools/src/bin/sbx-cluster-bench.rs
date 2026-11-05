@@ -22,6 +22,8 @@ const USAGE: &str = "sbx-cluster-bench: measure consensus throughput and latency
     --rate N       orders per second, 0 for as fast as possible (default 0)
     --batch N      orders packed into one cluster message (default 1)
     --nodes N      cluster members (default 3)
+    --source N     node to read reports from (default 0)
+    --warmup N     leave the first N orders out of the latency figures (default 0)
     --state-dir D  don't read reports; finish when engines' state files in D stop changing";
 
 /// Member addresses, comma separated, or localhost when they all share a machine.
@@ -110,6 +112,8 @@ fn main() {
     let rate: u64 = args.get("rate", 0);
     let batch: usize = args.get("batch", 1);
     let nodes: usize = args.get("nodes", 3);
+    let source: usize = args.get("source", 0);
+    let warmup: u64 = args.get("warmup", 0);
     let period_ns = if rate > 0 { 1_000_000_000 / rate } else { 0 };
     let state_dir = args.string("state-dir");
     if let Some(dir) = state_dir {
@@ -119,21 +123,18 @@ fn main() {
 
     let acknowledged = Arc::new(AtomicU64::new(0));
     let reports = Arc::new(AtomicU64::new(0));
+    let rejected = Arc::new(AtomicU64::new(0));
     let ready = Arc::new(AtomicBool::new(false));
     let start_ns = Arc::new(AtomicU64::new(0));
     let epoch = Instant::now();
 
     let receiver = {
-        let (acknowledged, reports, ready, start_ns) =
-            (acknowledged.clone(), reports.clone(), ready.clone(), start_ns.clone());
+        let (acknowledged, reports, rejected, ready, start_ns) =
+            (acknowledged.clone(), reports.clone(), rejected.clone(), ready.clone(), start_ns.clone());
         thread::spawn(move || {
             let aeron = transport::connect(on_error).expect("failed to connect");
-            let subscriptions: Vec<_> = (0..1)
-                .map(|i| {
-                    let channel = format!("aeron:udp?endpoint={}:0|control={}:{}|session-id=1002", client_host(), host(i), 40450 + i);
-                    transport::subscription(&aeron, &channel, 1002).expect("failed to subscribe")
-                })
-                .collect();
+            let channel = format!("aeron:udp?endpoint={}:0|control={}:{}|session-id=1002", client_host(), host(source), 40450 + source);
+            let subscription = transport::subscription(&aeron, &channel, 1002).expect("failed to subscribe");
             ready.store(true, Ordering::Release);
 
             let mut latencies = Vec::with_capacity(orders);
@@ -141,34 +142,35 @@ fn main() {
             let mut done = 0u64;
             let mut finished_at = None;
             while done < orders as u64 {
-                for subscription in &subscriptions {
-                    let _ = subscription.poll_fn(
-                        |buffer, _header| {
-                            let header: MessageHeaderDecoder<ReadBuf<'_>> =
-                                MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
-                            if header.template_id() != 3 {
-                                return;
+                let _ = subscription.poll_fn(
+                    |buffer, _header| {
+                        let header: MessageHeaderDecoder<ReadBuf<'_>> =
+                            MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
+                        if header.template_id() != 3 {
+                            return;
+                        }
+                        let report: ExecutionReportDecoder<'_> = ExecutionReportDecoder::default().header(header, 0);
+                        let exec_id = report.exec_id();
+                        if exec_id <= last_exec {
+                            return;
+                        }
+                        last_exec = exec_id;
+                        reports.fetch_add(1, Ordering::Relaxed);
+                        let is_rejected = report.exec_type() == ExecTypeEnum::Rejected;
+                        if report.exec_type() == ExecTypeEnum::New || is_rejected {
+                            done += 1;
+                            acknowledged.store(done, Ordering::Relaxed);
+                            if is_rejected {
+                                rejected.fetch_add(1, Ordering::Relaxed);
                             }
-                            let report: ExecutionReportDecoder<'_> =
-                                ExecutionReportDecoder::default().header(header, 0);
-                            let exec_id = report.exec_id();
-                            if exec_id <= last_exec {
-                                return;
+                            if period_ns > 0 && report.order_id() > warmup {
+                                let due = start_ns.load(Ordering::Relaxed) + (report.order_id() - 1) * period_ns;
+                                latencies.push((epoch.elapsed().as_nanos() as u64).saturating_sub(due));
                             }
-                            last_exec = exec_id;
-                            reports.fetch_add(1, Ordering::Relaxed);
-                            if report.exec_type() == ExecTypeEnum::New || report.exec_type() == ExecTypeEnum::Rejected {
-                                done += 1;
-                                acknowledged.store(done, Ordering::Relaxed);
-                                if period_ns > 0 {
-                                    let due = start_ns.load(Ordering::Relaxed) + (report.order_id() - 1) * period_ns;
-                                    latencies.push((epoch.elapsed().as_nanos() as u64).saturating_sub(due));
-                                }
-                            }
-                        },
-                        4096,
-                    );
-                }
+                        }
+                    },
+                    4096,
+                );
                 if done == orders as u64 {
                     finished_at = Some(Instant::now());
                 }
@@ -229,14 +231,23 @@ fn main() {
     let (mut latencies, finished) = receiver.join().expect("the receiver panicked");
     let seconds = finished.duration_since(started).as_secs_f64();
     print!(
-        "orders/s={:.0} reports/s={:.0} send_seconds={send_seconds:.2} seconds={seconds:.2} ingress_retries={retries}",
+        "orders/s={:.0} reports/s={:.0} send_seconds={send_seconds:.2} seconds={seconds:.2} ingress_retries={retries} rejected={}",
         orders as f64 / seconds,
-        reports.load(Ordering::Relaxed) as f64 / seconds
+        reports.load(Ordering::Relaxed) as f64 / seconds,
+        rejected.load(Ordering::Relaxed)
     );
     if !latencies.is_empty() {
         latencies.sort_unstable();
         let at = |q: f64| latencies[((latencies.len() as f64 * q) as usize).min(latencies.len() - 1)];
-        print!(" p50={}us p99={}us p99.9={}us max={}us", at(0.5) / 1000, at(0.99) / 1000, at(0.999) / 1000, at(1.0) / 1000);
+        print!(
+            " p50={}us p99={}us p99.9={}us p99.99={}us max={}us samples={}",
+            at(0.5) / 1000,
+            at(0.99) / 1000,
+            at(0.999) / 1000,
+            at(0.9999) / 1000,
+            at(1.0) / 1000,
+            latencies.len()
+        );
     }
     println!();
 }

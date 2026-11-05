@@ -4,7 +4,9 @@ shutdown -h +${lifetime_minutes}
 
 set -euxo pipefail
 apt-get update
-apt-get install -y --no-install-recommends openjdk-21-jre-headless procps iproute2 sysstat fio
+apt-get install -y --no-install-recommends openjdk-21-jdk-headless procps iproute2 sysstat fio \
+    linux-perf build-essential clang libclang-dev cmake git curl pkg-config uuid-dev libbsd-dev zlib1g-dev \
+    rsync python3
 
 # Local NVMe for the Archive, so disk sync is measured on a real disk.
 disk=$(lsblk -dpno NAME,MODEL | awk '/Instance Storage/ {print $1; exit}')
