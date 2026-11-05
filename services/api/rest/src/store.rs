@@ -134,9 +134,14 @@ fn repeat_sql(key: &OrderKey, window: Duration) -> String {
     )
 }
 
+/// A rejected repeat shares its original's client order ID, but it says nothing about that order.
+/// Left in, it would read as the latest state of an order that's still working, and a game could
+/// release live escrow. Rows with no reason are null, and they have to stay.
+const NOT_A_REPEAT: &str = "(ord_rej_reason is null or ord_rej_reason != 'duplicate_order')";
+
 /// Values reach this SQL as parsed UUIDs and normalized symbols, so none can contain a quote.
 fn orders_sql(query: &OrderQuery) -> String {
-    let mut filters = format!("account = '{}'", query.account);
+    let mut filters = format!("account = '{}' and {NOT_A_REPEAT}", query.account);
     if let Some(id) = query.cl_ord_id {
         filters.push_str(&format!(" and cl_ord_id = '{id}'"));
     }
@@ -397,6 +402,75 @@ mod tests {
 
         let body = r#"{"columns":[{"name":"writerTxn"}],"dataset":[[7]]}"#;
         assert!(parse_commits(&parse_reply(body).unwrap().unwrap()).is_err());
+    }
+
+    #[test]
+    fn order_queries_leave_out_rejected_repeats() {
+        let sql = orders_sql(&OrderQuery { account: account(), limit: 1, ..Default::default() });
+        assert!(sql.contains(&format!("from orders where account = '{}' and (ord_rej_reason is null or ord_rej_reason != 'duplicate_order')", account())), "{sql}");
+    }
+
+    /// Run by hand against a scratch QuestDB, because it writes rows:
+    /// `QUESTDB_SCRATCH_URL=http://localhost:19000 cargo test -p api real_questdb -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs a scratch QuestDB"]
+    async fn real_questdb_keeps_a_repeated_order_working() {
+        const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS orders (
+            ts TIMESTAMP, symbol SYMBOL, exec_type SYMBOL, ord_status SYMBOL, side SYMBOL,
+            ord_rej_reason SYMBOL, account UUID, cl_ord_id UUID, order_id LONG, exec_id LONG,
+            price LONG, ord_qty LONG, leaves_qty LONG, cum_qty LONG, avg_px LONG
+        ) TIMESTAMP(ts) PARTITION BY DAY WAL DEDUP UPSERT KEYS(ts, exec_id)";
+
+        let db = QuestDb::new(&std::env::var("QUESTDB_SCRATCH_URL").unwrap()).unwrap();
+        db.exec(SCHEMA).await.unwrap();
+
+        // Fresh IDs each run, because rows that share a time and exec ID replace each other.
+        let (player, resting, partial) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let base = i64::from(Uuid::new_v4().as_u128() as u32) * 10;
+        let symbol = format!("T{:05X}", base as u32 & 0xFFFFF);
+        let rows = [
+            (resting, "new", "new", "null", 1, 200, 0),
+            (partial, "new", "new", "null", 2, 200, 0),
+            (partial, "trade", "partially_filled", "null", 2, 150, 50),
+            (resting, "rejected", "rejected", "'duplicate_order'", 3, 200, 0),
+            (partial, "rejected", "rejected", "'duplicate_order'", 4, 200, 0),
+        ];
+        for (at, (id, exec_type, status, reason, order_id, leaves, filled)) in rows.iter().enumerate() {
+            let sql = format!(
+                "insert into orders values ('2026-11-04T12:00:{at:02}.000000Z', '{symbol}', '{exec_type}', \
+                 '{status}', 'buy', {reason}, '{player}', '{id}', {order_id}, {}, 100, 200, {leaves}, \
+                 {filled}, null)",
+                base + at as i64,
+            );
+            db.exec(&sql).await.unwrap();
+        }
+
+        // WAL rows land a moment after the insert.
+        let count = format!("select count() from orders where account = '{player}'");
+        for _ in 0..100 {
+            let reply = db.exec(&count).await.unwrap().unwrap();
+            if first_number(&reply) == Some(rows.len() as i64) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let query = OrderQuery { account: player, limit: 10, ..Default::default() };
+        let listed = db.orders(&query).await.unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed.iter().all(|order| order.status == RecordedStatus::Open), "{listed:?}");
+
+        let open = OrderQuery { open_only: true, ..query.clone() };
+        assert_eq!(db.orders(&open).await.unwrap().len(), 2, "cancel-all must find both");
+
+        let one = OrderQuery { cl_ord_id: Some(partial), limit: 1, ..query };
+        let order = db.orders(&one).await.unwrap().remove(0);
+        assert_eq!(order.status, RecordedStatus::Open);
+        assert_eq!((order.leaves_mantissa, order.filled_mantissa), (150, 50));
+        assert!(order.created_at.contains("12:00:01"), "{}", order.created_at);
+
+        let market = db.open_orders_in_market(&symbol, 10).await.unwrap();
+        assert_eq!(market.len(), 2, "{market:?}");
     }
 
     #[test]
