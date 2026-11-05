@@ -16,3 +16,6 @@ foldhash = "0.2.0"
 [features]
 # Compiles out every log call in release builds. Metrics come from `observer` instead.
 silent = ["tracing/release_max_level_off"]
+# Test runs only. Reads DIGEST, DIGEST_FILE and TIMING_FILE, hashes every report, and reads the
+# clock on every message, so it must never be in a deployed build.
+diagnostics = []
