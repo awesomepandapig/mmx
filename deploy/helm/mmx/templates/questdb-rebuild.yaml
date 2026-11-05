@@ -1,0 +1,56 @@
+{{- /*
+Drops every QuestDB table when it starts, then follows the tape. It must never come back by itself, so
+it's refused on a live install or upgrade, where a later upgrade could recreate it. `lookup` only finds
+anything when Helm is talking to a cluster, which `helm template` doesn't.
+*/ -}}
+{{- if .Values.questdbRebuild.enabled }}
+{{- if lookup "v1" "Namespace" "" "kube-system" }}
+{{- fail "questdbRebuild is only for `helm template --show-only`. See deploy/README.md." }}
+{{- end }}
+{{- $fullname := include "mmx.fullname" . -}}
+{{- $labels := dict "root" . "component" "questdb-rebuild" -}}
+{{- $consumer := index .Values.consumers "trade-reporter" -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $fullname }}-questdb-rebuild
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  # A retry would drop the tables again, so a failure stays failed.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+        mmx.io/aeron-client: "true"
+    spec:
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "mmx.podSecurityContext" . | nindent 8 }}
+      # A native sidecar, so the driver can't keep the pod alive after trade-reporter exits.
+      initContainers:
+        {{- include "mmx.driverContainer" (dict "root" . "native" true) | nindent 8 }}
+      containers:
+        - name: trade-reporter
+          image: {{ include "mmx.image" (dict "root" . "image" $consumer.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["/usr/local/bin/service", "--rebuild"]
+          env:
+            {{- include "mmx.aeronClientEnv" . | nindent 12 }}
+            - name: RUST_LOG
+              value: {{ $consumer.rustLog | default "info" | quote }}
+          securityContext:
+            {{- include "mmx.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- include "mmx.resources" (dict "resources" .Values.questdbRebuild.resources "guaranteed" false) | nindent 12 }}
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        {{- include "mmx.aeronVolumes" (dict "sizeLimit" "1Gi") | nindent 8 }}
+{{- end }}

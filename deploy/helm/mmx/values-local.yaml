@@ -1,0 +1,94 @@
+# A laptop or CI cluster with three workers. Nothing here is exclusive or pinned, and memory is far
+# below production. See "Local cluster" in deploy/README.md.
+
+image:
+  registry: mmx
+  tag: dev
+  # A rebuilt tag isn't picked up with IfNotPresent.
+  pullPolicy: Always
+
+cluster:
+  guaranteed: false
+  pinThreads: false
+  updateStrategy: RollingUpdate
+  # Shared CPUs stall for far longer than the production timeouts.
+  leaderHeartbeatTimeout: 5s
+  electionTimeout: 2s
+  threadingMode: SHARED
+  idleStrategy: ""
+  sparseTermBuffers: true
+  socketBuffer: 2m
+  sharedMemory:
+    sizeLimit: 1Gi
+  persistence:
+    size: 2Gi
+  node:
+    heapMin: 128m
+    heapMax: 512m
+    resources:
+      cpu: 500m
+      memory: 2Gi
+  engine:
+    maxOrders: 100000
+    reportTermLength: 16m
+    resources:
+      cpu: 500m
+      memory: 1Gi
+
+driver:
+  heapMax: 128m
+  socketBuffer: 2m
+  resources:
+    cpu: 100m
+    memory: 768Mi
+
+gateway:
+  replicas: 1
+  sharedMemory:
+    sizeLimit: 1Gi
+  resources:
+    cpu: 100m
+    memory: 256Mi
+
+consumers:
+  level2:
+    persistence:
+      size: 1Gi
+    resources:
+      cpu: 250m
+      memory: 256Mi
+  ticker:
+    persistence:
+      size: 1Gi
+    resources:
+      cpu: 250m
+      memory: 256Mi
+  candles:
+    persistence:
+      size: 1Gi
+    resources:
+      cpu: 250m
+      memory: 256Mi
+  trade-reporter:
+    resources:
+      cpu: 250m
+      memory: 256Mi
+
+websocket:
+  replicas: 1
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+ui:
+  replicas: 1
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+questdb:
+  persistence:
+    size: 2Gi
+  resources:
+    cpu: 500m
+    memory: 1Gi

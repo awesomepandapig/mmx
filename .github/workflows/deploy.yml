@@ -1,0 +1,165 @@
+name: deploy
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+env:
+  BAKE_FILE: deploy/docker/docker-bake.hcl
+
+jobs:
+  validate:
+    name: Check manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: deploy/scripts/validate.sh
+
+  test:
+    name: Cargo test
+    runs-on: ubuntu-24.04
+    env:
+      PLATFORMS: linux/amd64
+      CACHE_SCOPE: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: deps
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: test
+
+  # Each architecture builds natively, because Gradle and CMake are very slow under emulation.
+  images:
+    name: Images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [validate, test]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      PLATFORMS: linux/${{ matrix.arch }}
+      CACHE_SCOPE: ${{ matrix.arch }}
+      CARGO_INCREMENTAL: "0"
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/mmx
+      TAG: ${{ github.sha }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: deps
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          push: ${{ github.event_name != 'pull_request' }}
+
+  chart-install:
+    name: Install the chart
+    runs-on: ubuntu-24.04
+    needs: [validate, test]
+    env:
+      PLATFORMS: linux/amd64
+      CACHE_SCOPE: amd64
+      REGISTRY: mmx
+      TAG: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: azure/setup-helm@v4
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: deps
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: core
+          load: true
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: mmx
+          config: deploy/kind/ci.yaml
+      - name: Load images
+        run: |
+          for image in node matching-engine api websocket level2 ticker candles trade-reporter; do
+            kind load docker-image "mmx/$image:dev" --name mmx
+          done
+      - name: Install
+        run: |
+          helm install mmx deploy/helm/mmx --namespace mmx --create-namespace \
+            -f deploy/helm/mmx/values-local.yaml \
+            --set image.pullPolicy=Never --set ui.enabled=false \
+            --wait --timeout 10m
+      - name: Send an order through a gateway
+        run: helm test mmx --namespace mmx --logs --timeout 3m
+      - name: Show what went wrong
+        if: failure()
+        run: |
+          kubectl get pods --namespace mmx -o wide
+          kubectl describe pods --namespace mmx
+          kubectl logs --namespace mmx --all-containers --prefix --tail=100 \
+            --selector app.kubernetes.io/name=mmx
+
+  publish:
+    name: Multi-arch manifests
+    runs-on: ubuntu-24.04
+    needs: [images, chart-install]
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/mmx
+      SHA: ${{ github.sha }}
+      REF_TYPE: ${{ github.ref_type }}
+      REF_NAME: ${{ github.ref_name }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge architectures
+        run: |
+          for image in node matching-engine api websocket level2 ticker candles trade-reporter observer tools web docs auth; do
+            tags="-t $REGISTRY/$image:$SHA"
+            if [ "$REF_TYPE" = tag ]; then
+              tags="$tags -t $REGISTRY/$image:${REF_NAME#v}"
+            fi
+            docker buildx imagetools create $tags \
+              "$REGISTRY/$image:$SHA-amd64" "$REGISTRY/$image:$SHA-arm64"
+          done

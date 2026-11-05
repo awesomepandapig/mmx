@@ -1,0 +1,61 @@
+# Applied to every workload labeled mmx.io/aeron-client=true.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aeron-client
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: aeron-driver
+          image: ghcr.io/awesomepandapig/mmx/node:0.1.0
+          args: ["driver"]
+          env:
+            - name: AERON_DIR
+              value: /dev/shm/aeron
+            - name: THREADING
+              value: SHARED
+            - name: SOCKET_BUFFER
+              value: 4m
+            - name: JAVA_HEAP_MIN
+              value: 256m
+            - name: JAVA_HEAP_MAX
+              value: 256m
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            exec:
+              command: ["test", "-f", "/dev/shm/aeron/cnc.dat"]
+            periodSeconds: 1
+            failureThreshold: 60
+          # Term buffers in shared memory are charged to the driver that touches them. A gateway
+          # reads one 64m report stream per member, which is 576 MB at three terms each.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 1536Mi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

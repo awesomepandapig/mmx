@@ -1,0 +1,160 @@
+{{- $fullname := include "mmx.fullname" . -}}
+{{- if .Values.nats.enabled }}
+{{- $labels := dict "root" . "component" "nats" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-nats
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-nats
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+    spec:
+      containers:
+        - name: nats
+          image: {{ .Values.nats.image | quote }}
+          ports:
+            - name: client
+              containerPort: 4222
+          readinessProbe:
+            tcpSocket:
+              port: client
+            periodSeconds: 5
+          resources:
+            {{- include "mmx.resources" (dict "resources" .Values.nats.resources "guaranteed" false) | nindent 12 }}
+{{- end }}
+{{- if .Values.questdb.enabled }}
+{{- $labels := dict "root" . "component" "questdb" }}
+---
+# The default query view, which can be rebuilt from the tape. Open-source QuestDB is single-node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-questdb
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http
+    - name: postgres
+      port: 8812
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}-questdb
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  serviceName: {{ $fullname }}-questdb
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+    spec:
+      containers:
+        - name: questdb
+          image: {{ .Values.questdb.image | quote }}
+          ports:
+            - name: http
+              containerPort: 9000
+            - name: postgres
+              containerPort: 8812
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+          resources:
+            {{- include "mmx.resources" (dict "resources" .Values.questdb.resources "guaranteed" false) | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/questdb
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.questdb.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.questdb.persistence.size }}
+{{- end }}
+{{- if .Values.valkey.enabled }}
+{{- $labels := dict "root" . "component" "valkey" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-valkey
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  ports:
+    - name: client
+      port: 6379
+      targetPort: client
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-valkey
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+    spec:
+      containers:
+        - name: valkey
+          image: {{ .Values.valkey.image | quote }}
+          ports:
+            - name: client
+              containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: client
+            periodSeconds: 5
+          resources:
+            {{- include "mmx.resources" (dict "resources" .Values.valkey.resources "guaranteed" false) | nindent 12 }}
+{{- end }}

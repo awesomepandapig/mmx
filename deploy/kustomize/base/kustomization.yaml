@@ -1,0 +1,39 @@
+# The production layout on prepared nodes (see deploy/README.md), for one stack per namespace. The
+# Helm chart in deploy/helm/mmx builds the same thing with flags. Use an overlay to set the image tag.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - node.yaml
+  - gateway.yaml
+  - consumers.yaml
+  - websocket.yaml
+  - infrastructure.yaml
+  - networkpolicy.yaml
+
+# Names stay stable because mmx-lib.sh derives member addresses from them, and so that a markets edit
+# reaches running pods through the mounted directory.
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: mmx-node
+    envs:
+      - node.env
+  - name: mmx-node-extra
+    files:
+      - extra.properties
+  - name: mmx-markets
+    files:
+      - markets.yaml
+
+patches:
+  # Adds the media driver and shared memory to everything that reads the cluster.
+  - path: aeron-client-patch.yaml
+    target:
+      kind: Deployment
+      labelSelector: mmx.io/aeron-client=true
+  - path: aeron-client-patch.yaml
+    target:
+      kind: StatefulSet
+      labelSelector: mmx.io/aeron-client=true

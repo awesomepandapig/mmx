@@ -1,0 +1,158 @@
+# Aeron uses UDP on fixed per-member ports, reached by pod name, so this Service only publishes DNS.
+# Names must exist before pods are ready, because a pod can't start without its peers' names.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mmx-node
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: node
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: node
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mmx-node
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: node
+spec:
+  serviceName: mmx-node
+  replicas: 3
+  # Members can't reach a quorum one at a time, so they have to start together.
+  podManagementPolicy: Parallel
+  # A pod reports ready before it has caught up with the log, so a rolling update could take out a
+  # quorum. Restart members one at a time, as described in deploy/README.md.
+  updateStrategy:
+    type: OnDelete
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mmx
+        app.kubernetes.io/component: node
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: mmx
+                  app.kubernetes.io/component: node
+      containers:
+        - name: node
+          image: ghcr.io/awesomepandapig/mmx/node:0.1.0
+          args: ["cluster"]
+          envFrom:
+            - configMapRef:
+                name: mmx-node
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: EXTRA_PROPS_FILE
+              value: /etc/mmx/extra.properties
+          securityContext: &containerSecurity
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          # There's no liveness probe: the process exits when it fails, and a false positive here
+          # would cost a member.
+          startupProbe:
+            exec:
+              command: ["test", "-f", "/dev/shm/aeron/cnc.dat"]
+            periodSeconds: 2
+            failureThreshold: 180
+          # Whole CPUs and equal requests and limits give this pod Guaranteed QoS, so the static CPU
+          # manager gives it exclusive cores. Consensus, sender and receiver take one each.
+          resources:
+            requests:
+              cpu: "6"
+              memory: 8Gi
+            limits:
+              cpu: "6"
+              memory: 8Gi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /etc/mmx
+              readOnly: true
+        - name: engine
+          image: ghcr.io/awesomepandapig/mmx/matching-engine:0.1.0
+          envFrom:
+            - configMapRef:
+                name: mmx-node
+          securityContext: *containerSecurity
+          # The main thread takes a CPU, and the Aeron client's threads share the other.
+          resources:
+            requests:
+              cpu: "2"
+              memory: 3Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        # Holds cnc.dat and every term buffer. It counts against the memory limits above.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: config
+          configMap:
+            name: mmx-node-extra
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # The tape is kept forever by default, so size this for retention.
+            storage: 200Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mmx-node
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: node
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mmx
+      app.kubernetes.io/component: node

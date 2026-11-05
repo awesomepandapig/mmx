@@ -1,0 +1,10 @@
+# BuildKit reads this because it's named after the Dockerfile, so the repository root needs no
+# .dockerignore. Apple's builder is slow with large excluded directories, so
+# deploy/scripts/local-images.sh exports a clean context instead.
+**/target
+**/node_modules
+**/.cache
+**/.env
+.git
+.run
+.claude
