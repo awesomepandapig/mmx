@@ -1,12 +1,12 @@
-use std::string::ToString;
+use sbe::side_enum::SideEnum;
 
-use crate::messages::{ExecutionReportMessage, SymbolType};
-use crate::orderbook::OrderBook;
+use serde::{Deserialize, Serialize};
 
-use chrono::{Datelike, Duration, TimeZone, Utc, DateTime, SecondsFormat};
-use serde::Serialize;
+use tape::book::OrderBook;
+use tape::format::{format_decimal, format_timestamp};
+use tape::messages::{ExecutionReportMessage, NULL_DECIMAL};
 
-use tracing::info;
+const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 
 #[derive(Serialize, Debug, Clone)]
 pub struct Ticker {
@@ -26,11 +26,10 @@ pub struct Ticker {
     timestamp: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TickerState {
     product_id: String,
     start_24_hr_ts: u64,
-    start_52_w_ts: u64,
     volume_24_h: i64,
     low_24_h: i64,
     high_24_h: i64,
@@ -42,24 +41,9 @@ pub struct TickerState {
 
 impl TickerState {
     pub fn new(product_id: String) -> Self {
-        let now = Utc::now();
-
-        let start_24_hr_ts = Utc
-            .with_ymd_and_hms(now.year(), now.month(), now.day(), 0, 0, 0)
-            .unwrap()
-            .timestamp_nanos_opt()
-            .unwrap() as u64;
-
-        let start_52_w_ts = Utc
-            .with_ymd_and_hms(now.year(), 1, 1, 0, 0, 0)
-            .unwrap()
-            .timestamp_nanos_opt() 
-            .unwrap() as u64;
-
         Self {
             product_id,
-            start_24_hr_ts,
-            start_52_w_ts,
+            start_24_hr_ts: 0,
             volume_24_h: 0,
             low_24_h: i64::MAX,
             high_24_h: i64::MIN,
@@ -70,46 +54,37 @@ impl TickerState {
         }
     }
 
+    /// Windows follow the engine's time, so a rebuild from the tape lands on the same values.
     fn check_and_reset_windows(&mut self, current_ts: u64) {
-        let mut next_day_start_ts = self.start_24_hr_ts + Duration::days(1).num_nanoseconds().unwrap() as u64;
-
-        while current_ts >= next_day_start_ts {
-            self.start_24_hr_ts = next_day_start_ts;
+        let day_start = current_ts - current_ts % NANOS_PER_DAY;
+        if day_start > self.start_24_hr_ts {
+            self.start_24_hr_ts = day_start;
             self.volume_24_h = 0;
             self.low_24_h = i64::MAX;
             self.high_24_h = i64::MIN;
             self.open_24_hr = self.last_price;
-            next_day_start_ts += Duration::days(1).num_nanoseconds().unwrap() as u64;
         }
-
-
-        // let mut year = Utc.timestamp_opt(self.start_52_w_ts, 0).unwrap().year();
-        // let mut next_year_start_ts = Utc.with_ymd_and_hms(year + 1, 1, 1, 0, 0, 0).unwrap().timestamp();
-
-        // while current_ts >= next_year_start_ts {
-        //     info!("loopin");
-        //     self.start_52_w_ts = next_year_start_ts;
-        //     self.low_52_w = i64::MAX;
-        //     self.high_52_w = i64::MIN;
-        //     year += 1;
-        //     next_year_start_ts = Utc.with_ymd_and_hms(year + 1, 1, 1, 0, 0, 0).unwrap().timestamp();
-        // }
     }
 
+    /// Adds a trade. Both sides of a match report it, so only the buy side counts.
     pub fn update_on_match(&mut self, report: &ExecutionReportMessage) {
+        if report.side != SideEnum::Buy || report.last_px == NULL_DECIMAL || report.last_qty == NULL_DECIMAL {
+            return;
+        }
         self.check_and_reset_windows(report.transact_time);
 
-        self.last_price = report.price;
-        self.volume_24_h += report.last_qty;
+        let price = report.last_px;
+        self.last_price = price;
+        self.volume_24_h = self.volume_24_h.saturating_add(report.last_qty);
 
-        self.low_24_h = self.low_24_h.min(report.price);
-        self.high_24_h = self.high_24_h.max(report.price);
+        self.low_24_h = self.low_24_h.min(price);
+        self.high_24_h = self.high_24_h.max(price);
         if self.open_24_hr == 0 {
-            self.open_24_hr = report.price;
+            self.open_24_hr = price;
         }
 
-        self.low_52_w = self.low_52_w.min(report.price);
-        self.high_52_w = self.high_52_w.max(report.price);
+        self.low_52_w = self.low_52_w.min(price);
+        self.high_52_w = self.high_52_w.max(price);
     }
 
     fn calculate_price_percent_change(&self) -> f64 {
@@ -154,54 +129,144 @@ impl TickerState {
 
         Ticker {
             product_id: self.product_id.clone(),
-            price: format_decimal_with_exponent_neg8(&self.last_price),
-            volume_24_h: format_decimal_with_exponent_neg8(&self.volume_24_h),
-            low_24_h: format_decimal_with_exponent_neg8(&low_24h),
-            high_24_h: format_decimal_with_exponent_neg8(&high_24h),
-            open_24_h: format_decimal_with_exponent_neg8(&self.open_24_hr),
-            low_52_w: format_decimal_with_exponent_neg8(&low_52w),
-            high_52_w: format_decimal_with_exponent_neg8(&high_52w),
+            price: format_decimal(self.last_price),
+            volume_24_h: format_decimal(self.volume_24_h),
+            low_24_h: format_decimal(low_24h),
+            high_24_h: format_decimal(high_24h),
+            open_24_h: format_decimal(self.open_24_hr),
+            low_52_w: format_decimal(low_52w),
+            high_52_w: format_decimal(high_52w),
             price_percent_chg_24_h: self.calculate_price_percent_change().to_string(),
-            best_bid: format_decimal_with_exponent_neg8(&best_bid),
-            best_bid_quantity: format_decimal_with_exponent_neg8(&best_bid_quantity),
-            best_ask: format_decimal_with_exponent_neg8(&best_ask),
-            best_ask_quantity: format_decimal_with_exponent_neg8(&best_ask_quantity),
-            timestamp: format_nanosecond_timestamp(&timestamp),
+            best_bid: format_decimal(best_bid),
+            best_bid_quantity: format_decimal(best_bid_quantity),
+            best_ask: format_decimal(best_ask),
+            best_ask_quantity: format_decimal(best_ask_quantity),
+            timestamp: format_timestamp(timestamp),
         }
     }
 }
 
-fn format_decimal_with_exponent_neg8(mantissa: &i64) -> String {
-    const SCALE: i64 = 100_000_000;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let integral = mantissa / SCALE;
-    let fractional_part = (mantissa % SCALE).abs();
+    use sbe::exec_type_enum::ExecTypeEnum;
 
-    if fractional_part == 0 {
-        return integral.to_string();
+    use tape::messages::sample_report;
+
+    const ONE: i64 = 100_000_000;
+
+    fn trade(time: u64, price: i64, quantity: i64, side: SideEnum) -> ExecutionReportMessage {
+        ExecutionReportMessage {
+            exec_type: ExecTypeEnum::Trade,
+            trd_match_id: Some(1),
+            transact_time: time,
+            last_px: price,
+            last_qty: quantity,
+            side,
+            ..sample_report()
+        }
     }
 
-    let mut fractional_str = format!("{:08}", fractional_part);
-    while fractional_str.ends_with('0') {
-        fractional_str.pop();
+    fn matched(state: &mut TickerState, time: u64, price: i64, quantity: i64) {
+        state.update_on_match(&trade(time, price, quantity, SideEnum::Sell));
+        state.update_on_match(&trade(time, price, quantity, SideEnum::Buy));
     }
 
-    if fractional_str.is_empty() {
-        integral.to_string()
-    } else {
-        format!("{}.{}", integral, fractional_str)
+    fn state() -> TickerState {
+        TickerState::new("ITEM".to_string())
     }
-}
 
-fn format_nanosecond_timestamp(timestamp: &u64) -> String {
-    let secs = timestamp / 1_000_000_000;
-    let nanos = (timestamp % 1_000_000_000) as u32;
-    let datetime: DateTime<Utc> = Utc.timestamp_opt(secs.try_into().unwrap(), nanos).unwrap(); // TODO: DONT UNWRAP IN PROD
-    datetime.to_rfc3339_opts(SecondsFormat::Nanos, true)
-}
+    #[test]
+    fn each_match_counts_once() {
+        let mut state = state();
+        matched(&mut state, NANOS_PER_DAY, 10 * ONE, 3 * ONE);
 
-fn format_symbol(symbol_bytes: &[u8; 6]) -> String {
-    String::from_utf8_lossy(symbol_bytes)
-        .trim_end_matches(['\0', ' ']) // Trim both null characters and spaces.
-        .to_string()
+        assert_eq!(state.volume_24_h, 3 * ONE);
+    }
+
+    #[test]
+    fn uses_the_trade_price_rather_than_the_order_limit() {
+        let mut state = state();
+        let report = ExecutionReportMessage {
+            price: 12 * ONE,
+            ..trade(NANOS_PER_DAY, 10 * ONE, ONE, SideEnum::Buy)
+        };
+        state.update_on_match(&report);
+
+        assert_eq!(state.last_price, 10 * ONE);
+        assert_eq!(state.high_24_h, 10 * ONE);
+    }
+
+    #[test]
+    fn a_new_day_resets_the_window_and_opens_at_the_last_price() {
+        let mut state = state();
+        matched(&mut state, NANOS_PER_DAY, 10 * ONE, ONE);
+        matched(&mut state, NANOS_PER_DAY + 1, 20 * ONE, ONE);
+        matched(&mut state, 3 * NANOS_PER_DAY, 15 * ONE, ONE);
+
+        assert_eq!(state.open_24_hr, 20 * ONE);
+        assert_eq!(state.volume_24_h, ONE);
+        assert_eq!(state.high_24_h, 15 * ONE);
+        assert_eq!(state.low_24_h, 15 * ONE);
+        assert_eq!(state.high_52_w, 20 * ONE);
+        assert_eq!(state.low_52_w, 10 * ONE);
+    }
+
+    #[test]
+    fn replaying_old_trades_lands_on_the_same_state() {
+        let build = || {
+            let mut state = state();
+            matched(&mut state, NANOS_PER_DAY + 5, 10 * ONE, ONE);
+            matched(&mut state, 2 * NANOS_PER_DAY + 5, 11 * ONE, ONE);
+            state
+        };
+        assert_eq!(serde_json::to_string(&build()).ok(), serde_json::to_string(&build()).ok());
+        assert_eq!(build().volume_24_h, ONE);
+    }
+
+    #[test]
+    fn percent_change_compares_with_the_open() {
+        let mut state = state();
+        matched(&mut state, NANOS_PER_DAY, 10 * ONE, ONE);
+        matched(&mut state, NANOS_PER_DAY + 1, 11 * ONE, ONE);
+
+        assert!((state.calculate_price_percent_change() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_ticker_with_no_trades_is_all_zeros() {
+        let ticker = state().create_ticker(&OrderBook::new(), 0);
+
+        assert_eq!(ticker.price, "0");
+        assert_eq!(ticker.low_24_h, "0");
+        assert_eq!(ticker.best_bid, "0");
+        assert_eq!(ticker.price_percent_chg_24_h, "0");
+    }
+
+    #[test]
+    fn shows_the_top_of_the_book() {
+        let mut book = OrderBook::new();
+        book.apply(&ExecutionReportMessage { price: 9 * ONE, ord_qty: 2 * ONE, ..sample_report() });
+        book.apply(&ExecutionReportMessage {
+            price: 11 * ONE,
+            ord_qty: ONE,
+            side: SideEnum::Sell,
+            ..sample_report()
+        });
+
+        let ticker = state().create_ticker(&book, 0);
+
+        assert_eq!((ticker.best_bid.as_str(), ticker.best_bid_quantity.as_str()), ("9", "2"));
+        assert_eq!((ticker.best_ask.as_str(), ticker.best_ask_quantity.as_str()), ("11", "1"));
+    }
+
+    #[test]
+    fn missing_prices_are_ignored() {
+        let mut state = state();
+        state.update_on_match(&trade(NANOS_PER_DAY, NULL_DECIMAL, ONE, SideEnum::Buy));
+
+        assert_eq!(state.volume_24_h, 0);
+        assert_eq!(state.last_price, 0);
+    }
 }

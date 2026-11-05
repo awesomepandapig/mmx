@@ -1,140 +1,115 @@
-use crate::messages::ExecutionReportMessage;
-use crate::orderbook::OrderBook;
 use crate::processors::level2::format_l2_update_json;
 
-use std::string::ToString;
-
 use sbe::exec_type_enum::ExecTypeEnum;
-use sbe::side_enum::SideEnum;
 
-use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
+use tape::book::{OrderBook, track_order_id};
+use tape::format::{format_decimal, format_timestamp};
+use tape::messages::ExecutionReportMessage;
 
-use tracing::warn;
+use tracing::{error, warn};
 
 pub fn process_execution_report(
     book: &mut OrderBook,
     last_seen_id: &mut u64,
     report: &ExecutionReportMessage,
 ) -> Option<String> {
-    let mut update_to_send: Option<String> = None;
-    match report.exec_type {
-        ExecTypeEnum::New => {
-            assert_eq!(
-                report.order_id,
-                *last_seen_id + 1,
-                "Error: Recieved id {} expected {}",
-                report.order_id,
-                *last_seen_id + 1
-            );
-            *last_seen_id += 1;
-
-            if report.price != i64::MIN {
-                let new_quantity = book.add_order(&report);
-                update_to_send = Some(
-                    format_l2_update_json(
-                        report.side.to_string().to_lowercase(),
-                        format_nanosecond_timestamp(&report.transact_time),
-                        format_decimal_with_exponent_neg8(&report.price),
-                        format_decimal_with_exponent_neg8(&new_quantity),
-                        format_symbol(&report.symbol),
-                    )
-                    .expect("Failed to serialize L2Update"),
-                ); // TODO: NO EXPECTS
-            }
-        }
-        ExecTypeEnum::Trade => {
-            if report.price != i64::MIN {
-                let price_level_exists = match report.side {
-                    SideEnum::Buy => book.bids.contains_key(&report.price),
-                    SideEnum::Sell => book.asks.contains_key(&report.price),
-                    _ => false,
-                };
-
-                assert!(
-                    price_level_exists,
-                    "Assumption Violation: fill_order called for non-existent price level {} on side {:?}",
-                    report.price, report.side
-                );
-
-                let new_quantity = book.fill_order(&report);
-
-                update_to_send = Some(
-                    format_l2_update_json(
-                        report.side.to_string().to_lowercase(),
-                        format_nanosecond_timestamp(&report.transact_time),
-                        format_decimal_with_exponent_neg8(&report.price),
-                        format_decimal_with_exponent_neg8(&new_quantity),
-                        format_symbol(&report.symbol),
-                    )
-                    .expect("Failed to serialize L2Update"),
-                ); // TODO: NO EXPECTS
-            }
-        }
-        ExecTypeEnum::Canceled => {
-            if report.price != i64::MIN {
-                let new_quantity = book.remove_order(&report);
-
-                update_to_send = Some(
-                    format_l2_update_json(
-                        report.side.to_string().to_lowercase(),
-                        format_nanosecond_timestamp(&report.transact_time),
-                        format_decimal_with_exponent_neg8(&report.price),
-                        format_decimal_with_exponent_neg8(&new_quantity),
-                        format_symbol(&report.symbol),
-                    )
-                    .expect("Failed to serialize L2Update"),
-                ); // TODO: NO EXPECTS
-            }
-        }
-        ExecTypeEnum::Rejected => {
-            assert_eq!(
-                report.order_id,
-                *last_seen_id + 1,
-                "Error: Recieved id {} expected {}",
-                report.order_id,
-                *last_seen_id + 1
-            );
-            *last_seen_id += 1;
-            warn!("Rejected order: {}", report.order_id);
-        }
-        _ => {
-            // Handle other execution types or ignore
-        }
-    }
-    update_to_send
-}
-
-fn format_decimal_with_exponent_neg8(mantissa: &i64) -> String {
-    const SCALE: i64 = 100_000_000;
-
-    let integral = mantissa / SCALE;
-    let fractional_part = (mantissa % SCALE).abs();
-
-    if fractional_part == 0 {
-        return integral.to_string();
+    track_order_id(last_seen_id, report);
+    if report.exec_type == ExecTypeEnum::Rejected {
+        warn!("Rejected order: {}", report.order_id);
     }
 
-    let mut fractional_str = format!("{:08}", fractional_part);
-    while fractional_str.ends_with('0') {
-        fractional_str.pop();
-    }
-
-    if fractional_str.is_empty() {
-        integral.to_string()
-    } else {
-        format!("{}.{}", integral, fractional_str)
+    let new_quantity = book.apply(report)?;
+    let update = format_l2_update_json(
+        report.side.to_string().to_lowercase(),
+        format_timestamp(report.transact_time),
+        format_decimal(report.price),
+        format_decimal(new_quantity),
+    );
+    match update {
+        Ok(update) => Some(update),
+        Err(e) => {
+            error!("Failed to serialize L2Update: {}", e);
+            None
+        }
     }
 }
 
-fn format_nanosecond_timestamp(timestamp: &u64) -> String {
-    let secs = timestamp / 1_000_000_000;
-    let nanos = (timestamp % 1_000_000_000) as u32;
-    let datetime: DateTime<Utc> = Utc.timestamp_opt(secs.try_into().unwrap(), nanos).unwrap(); // TODO: DONT UNWRAP IN PROD
-    datetime.to_rfc3339_opts(SecondsFormat::Nanos, true)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn format_symbol(symbol_bytes: &[u8; 6]) -> String {
-    String::from_utf8_lossy(symbol_bytes)
-        .trim_end_matches(['\0', ' ']) // Trim both null characters and spaces.
-        .to_string()
+    use sbe::side_enum::SideEnum;
+
+    use tape::messages::{NULL_DECIMAL, sample_report};
+
+    const PRICE: i64 = 150_000_000;
+
+    fn new_order(order_id: u64, quantity: i64) -> ExecutionReportMessage {
+        ExecutionReportMessage { order_id, price: PRICE, ord_qty: quantity, ..sample_report() }
+    }
+
+    #[test]
+    fn a_new_order_reports_the_level_total() {
+        let mut book = OrderBook::new();
+        let mut last_seen = 0;
+        process_execution_report(&mut book, &mut last_seen, &new_order(1, 100_000_000));
+        let update = process_execution_report(&mut book, &mut last_seen, &new_order(2, 50_000_000))
+            .expect("the level changed");
+
+        assert_eq!(
+            update,
+            r#"{"side":"buy","event_time":"1970-01-01T00:00:00.000000000Z","price_level":"1.5","new_quantity":"1.5"}"#
+        );
+    }
+
+    #[test]
+    fn a_fill_that_empties_the_level_reports_zero() {
+        let mut book = OrderBook::new();
+        let mut last_seen = 0;
+        process_execution_report(&mut book, &mut last_seen, &new_order(1, 100_000_000));
+        let fill = ExecutionReportMessage {
+            exec_type: ExecTypeEnum::Trade,
+            last_qty: 100_000_000,
+            ..new_order(1, 100_000_000)
+        };
+
+        let update = process_execution_report(&mut book, &mut last_seen, &fill).expect("the level changed");
+
+        assert!(update.contains(r#""new_quantity":"0""#), "{update}");
+    }
+
+    #[test]
+    fn market_orders_and_rejects_publish_nothing() {
+        let mut book = OrderBook::new();
+        let mut last_seen = 0;
+        let market = ExecutionReportMessage { order_id: 1, price: NULL_DECIMAL, ..sample_report() };
+        let reject = ExecutionReportMessage { exec_type: ExecTypeEnum::Rejected, ..new_order(2, 1) };
+
+        assert_eq!(process_execution_report(&mut book, &mut last_seen, &market), None);
+        assert_eq!(process_execution_report(&mut book, &mut last_seen, &reject), None);
+        assert_eq!(last_seen, 2);
+    }
+
+    #[test]
+    fn a_trade_for_an_unknown_level_is_skipped_instead_of_panicking() {
+        let mut book = OrderBook::new();
+        let mut last_seen = 0;
+        let fill = ExecutionReportMessage {
+            exec_type: ExecTypeEnum::Trade,
+            side: SideEnum::Sell,
+            last_qty: 1,
+            ..new_order(9, 1)
+        };
+
+        assert_eq!(process_execution_report(&mut book, &mut last_seen, &fill), None);
+    }
+
+    #[test]
+    fn a_gap_in_order_ids_keeps_going() {
+        let mut book = OrderBook::new();
+        let mut last_seen = 0;
+
+        assert!(process_execution_report(&mut book, &mut last_seen, &new_order(7, 1)).is_some());
+        assert_eq!(last_seen, 7);
+    }
 }
