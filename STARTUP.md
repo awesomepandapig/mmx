@@ -2,10 +2,11 @@
 
 How to install everything, start every service, and check that it works.
 
-**Verified on 2026-11-03** on an Apple M4 running macOS 26.3.1: seeded orders went
-through the engine, `level2`, NATS and `websocket`, and `trade-reporter` wrote them to QuestDB. On Linux,
-the workspace compiles on Alpine (arm64), but the services haven't been run there.
-Steps marked untested haven't been tried.
+**Verified on 2026-11-05** on an Apple M4 running macOS 26.3.1, in cluster mode: orders placed
+over REST traded on a three-node cluster, reached a game webhook with valid signatures, and showed
+up in QuestDB, NATS and the websocket, including while the leader was killed. See
+[Run on a cluster](#run-on-a-cluster). On Linux, the workspace compiles on Alpine (arm64), but the
+services haven't been run there. Steps marked untested haven't been tried.
 
 ## Versions
 
@@ -17,9 +18,11 @@ Steps marked untested haven't been tried.
 | Aeron | 1.54.0 (must match `rusteron-client`) | Media driver |
 | Node / npm | 23.11.0 / 10.9.2 | `auth`, `web`, `docs` |
 | Python | 3, standard library only | `tools/scripts/sbx.py` |
+| Java | OpenJDK 23 | Cluster nodes |
 | Apple `container` | 1.6.1 | Infrastructure on macOS |
 | NATS | `nats:2-alpine` | Market data bus |
 | QuestDB | `questdb/questdb:8.2.3` | Time-series storage |
+| Valkey | `valkey/valkey:8-alpine` | Per-player rate limits, in cluster mode |
 | Postgres | `postgres:16-alpine` | Auth database |
 | Grafana LGTM | `grafana/otel-lgtm:latest` | Optional metrics viewer |
 
@@ -85,7 +88,16 @@ for `tools/scripts/sbx.py`.
 ```sh
 cd ~/Projects/sbx
 cargo build --workspace --release
+cargo build -p matching-engine --profile dist --features silent   # cluster mode only
 for app in auth web docs; do (cd "$app" && npm ci); done
+```
+
+Cluster mode also needs Aeron's Java nodes. Download them to `.run/`, or set `AERON_JAR`:
+
+```sh
+mkdir -p .run
+curl -o .run/aeron-all-1.54.0.jar \
+  https://repo1.maven.org/maven2/io/aeron/aeron-all/1.54.0/aeron-all-1.54.0.jar
 ```
 
 ## 4. Start everything
@@ -113,10 +125,11 @@ The same flags work with `docker run` (untested). These containers have no volum
 their data is lost when they're removed.
 
 **Shared memory.** Aeron's clients and driver communicate through memory-mapped files.
-macOS has no `/dev/shm`, so it needs a 2 GB RAM disk, which disappears on reboot:
+macOS has no `/dev/shm`, so it needs a RAM disk, which disappears on reboot. `sbx.py` makes an
+8 GB one if there's none. It only uses memory as it fills, and a standalone engine needs under 2 GB:
 
 ```sh
-diskutil erasevolume HFS+ DevShm `hdiutil attach -nomount ram://$((2048 * 2048))`
+diskutil erasevolume HFS+ DevShm `hdiutil attach -nomount ram://$((8 * 1024 * 2048))`
 ```
 
 Linux uses `/dev/shm/aeron` automatically.
@@ -164,6 +177,77 @@ with the engine's control address. To run across nodes, replace `localhost` with
 engine's address in the control parameter, and with each subscriber's own address in
 its `endpoint`. Between two VMs, 1,000,000 of 1,000,000 messages arrived, at 0.14M/sec
 with default settings on 2-CPU VMs.
+
+## Run on a cluster
+
+This runs the system as it's designed to run: game server, gateway, three-node Aeron Cluster, tape,
+and every consumer. It doesn't need Postgres, and it doesn't start `sbx-observer`.
+
+```sh
+tools/scripts/sbx.py up --cluster          # carries on from the tape if there is one
+tools/scripts/sbx.py up --cluster --fresh  # wipes the tape and everything built from it
+tools/scripts/sbx.py status
+tools/scripts/sbx.py logs outbox           # also engine0-2, java0-2 and clientdriver
+tools/scripts/sbx.py e2e                   # follow real trades to a webhook, with a failover
+tools/scripts/sbx.py down                  # add --all to remove the infrastructure containers too
+```
+
+`tools/scripts/cluster.py` runs the nodes, and `sbx.py` adds the rest:
+
+| What | Where |
+|---|---|
+| Client Aeron driver | `AERON_DIR=/Volumes/DevShm/cluster-client` |
+| Gateway | <http://localhost:8000>, with markets from `tools/local/markets.yaml` |
+| Websocket | `ws://127.0.0.1:8090` |
+| Outbox | Settings in `tools/local/outbox.env`, journal in `.run/outbox`, status on <http://127.0.0.1:8092/position> |
+| QuestDB | `sbx-cluster-questdb`, console on <http://localhost:9100> |
+| Valkey | `sbx-valkey` on port 6379 |
+| NATS | `sbx-nats` on port 4222, shared with standalone mode |
+
+The tape is on disk under `.run/cluster`, so stopping and starting the stack keeps resting orders,
+ID sequences and undelivered webhooks. QuestDB has no volume, but it's rebuilt from the tape.
+
+QuestDB has its own container because tables made by older builds can't take the current schema,
+and `CREATE TABLE IF NOT EXISTS` leaves them as they are. `sbx-questdb` is untouched by cluster mode.
+
+The webhook URL has nothing listening on it except during `e2e`. That's safe: the outbox holds every
+event and retries, backing off to 30 seconds. So the first `e2e` delivery can take that long, and it
+also receives whatever built up since the last run.
+
+To send orders by hand, name a player and a unique `client_order_id`. Both are UUIDs:
+
+```sh
+curl -X POST localhost:8000/api/v1/orders -H 'content-type: application/json' \
+  -H 'x-player-id: 11111111-1111-4111-8111-111111111111' \
+  -d '{"client_order_id":"aaaaaaaa-0000-4000-8000-000000000001","product_id":"ITEM",
+       "side":"sell","type":"limit","size":"10","price":"100"}'
+```
+
+Settings that `sbx.py` chooses here:
+
+| Setting | Value | Why |
+|---|---|---|
+| `LEADER_HEARTBEAT_TIMEOUT`, election timeout | `500ms` | A failover then fits inside the gateway's 3-second hold, at about 1.3 seconds here |
+| `aeron.image.liveness.timeout` on the client driver | `2s` | Consumers notice a dead node sooner than the default 10 seconds |
+| `RETRY_WINDOW_SECS` | `0` | Callers don't retry. With the check on, new orders wait on the recorder for the gateway's first 5 minutes, so a node loss bounces them with `recorder_behind` |
+
+### What `e2e` checks
+
+It needs a running stack, and exits non-zero with a message on the first failure. It's safe to run
+again and again, and it cancels anything an earlier failed run left resting.
+
+1. A resting sell and a crossing buy, placed over REST with `client_order_id`, are both accepted.
+2. Both fill webhooks arrive with valid signatures. The legs share `match_id`, and each `fill_id` is
+   its own 32 hex characters.
+3. `GET` shows both orders through QuestDB.
+4. Cancelling the rest gives a `canceled` webhook that releases the rest of the order.
+5. Level 2, ticker and candle updates appear on NATS and the websocket.
+6. It kills the leader while 60 orders are flowing, then places another. Every order must be answered.
+7. Each order's webhooks must match how it ended, with none missing and no `fill_id` delivered twice.
+8. Trading, webhooks and market data still work, and the killed node catches up with the leader.
+
+`tools/scripts/sbx.py e2e --kill 0` kills node 0 instead. Consumers start on node 0, so this is the
+one that makes them move. Stopping the whole stack and bringing it back isn't part of `e2e`.
 
 ## 5. Start auth, web and docs
 
@@ -213,12 +297,17 @@ tools/scripts/sbx.py verify --without tr,market-data        # isolate a bottlene
 tools/scripts/sbx.py verify --capture /tmp/run.jsonl          # keep every event
 ```
 
-To send one order by hand:
+To send one order by hand, with `ITEM` enabled in `services/api/rest/markets.yaml`:
 
 ```sh
 curl -X POST localhost:8000/api/v1/orders -H 'content-type: application/json' \
-  -d '{"product_id":"JSP","side":"buy","type":"limit","size":10,"price":100}'
+  -H 'x-player-id: 11111111-1111-4111-8111-111111111111' \
+  -d '{"product_id":"ITEM","side":"buy","type":"limit","size":"10","price":"100"}'
 ```
+
+`verify` starts `trade-reporter` too, so on a QuestDB with tables from an older build, add
+`--without trade-reporter`. `sbx-questdb` on this Mac has such an `orders` table. The cluster check
+is under [Run on a cluster](#run-on-a-cluster).
 
 ## Tools
 
@@ -366,21 +455,39 @@ Confirmed with the tools above:
 - **Subscribers slow the engine.** 1M orders at full speed reached about 151K orders/sec
   with every service, and 585K with only the checker. Each order produces about 2.7
   reports, and that run used a shared-mode driver with logging on.
+- **A 6 GB RAM disk has no room to spare.** The nodes' report stream has a 64 MB term length in
+  `tools/scripts/cluster.py`, so each subscriber holds 192 MB. Consumers need a replay on both sides
+  when they start or move node, and usage briefly hit 100% of 6 GB at startup. Aeron then logs
+  `insufficient usable storage`, and consumers move to the next node, but a restarting node could
+  fail the same way. Use 8 GB, which `sbx.py` makes, although that size hasn't been tried. Settled
+  usage is about 4 GB.
+- **Consumers replace their Aeron client whenever they change node.** Closing a persistent subscription
+  leaves its images mapped until the client closes, which filled a 6 GB disk after 7 failovers and
+  stopped a node rejoining. New clients fix that, with usage flat over 8 failovers, but the reason
+  the images stay mapped hasn't been found.
+- **Reads lag for about 12 seconds when the node a consumer follows dies.** It takes 2 seconds to see
+  that the node is gone, and 10 more before the consumer moves. Orders and webhooks aren't affected,
+  because the gateway and the outbox don't wait on it. `GET` orders can be stale, and cancel-all can
+  answer `recorder_behind` until it catches up. Without the local `aeron.image.liveness.timeout`,
+  as in the Helm chart, allow 20 seconds.
+- **A killed node can't restart for about 10 seconds.** Its archive's mark file still looks alive, so
+  it fails with `active mark file detected`. `sbx.py` and `e2e` wait, but `cluster.py start` doesn't.
+- **A consumer following a restarted node gets thrown off it.** The node republishes from its last
+  snapshot, so the consumer logs `live stream joined at position ... earlier than last seen position`.
+  It moves to another node at the same position, so nothing is lost.
+- **A POST answers at the first report.** A crossing order comes back `open` with `filled_size` 0
+  even when it filled at once. Fills arrive by webhook, and `GET` catches up shortly after.
+- **Valkey checks sometimes miss their 100 ms limit** around a failover on this Mac. Those orders go
+  through unchecked, by design.
 
 Also known:
 
-- **`api` accepts any symbol.** It only checks that it's alphanumeric and at most 6 characters.
-  It should only accept enabled markets, and it has no per-market order limits yet.
-- **The engine doesn't check prices.** `api` rejects non-positive prices but doesn't enforce a
-  tick size yet.
-
-- `trade-reporter` skips filled orders, because it only saves `New`, `PartiallyFilled` and `Canceled`.
-- `web`'s ticker expects `event.tickers`, but `websocket` sends every client `l2_data`.
-- `websocket` doesn't complete the WebSocket close, so clients that wait for it hang.
-- `GET /api/v1/orders` does nothing, and there's no cancel route. The engine cancels correctly,
-  but a cancel must name the owning account, and the API has no auth to establish one.
-- The API has no auth and invents a random account per order. It binds `0.0.0.0:8000`,
-  and the Vite dev servers also bind `0.0.0.0`, so they're reachable from your LAN.
+- **The local stack can't detect a total loss.** `cluster.py` doesn't set `DURABLE_POSITION`, so the
+  engine logs that it can't detect one. The total-loss paths weren't part of this check.
+- **The API has no real auth.** It trusts `x-player-id`, so only game servers may reach it. It binds
+  `0.0.0.0:8000`, and the Vite dev servers also bind `0.0.0.0`, so they're reachable from your LAN.
+- **`web` hasn't been run against the current websocket.** Its components read the same `l2_data` and
+  `tickers` shapes that `websocket` sends, but only from reading the code.
 
 ## Future work
 
@@ -390,7 +497,6 @@ Also known:
   need to change, because it matches whatever arrives. It costs at least one more CPU core per
   engine.
 - **Per-market limits in `api`,** so one market can't fill a shared book.
-- **Per-player rate limits in `api`,** kept in Valkey, with defaults that game owners can override.
 - **Gateway selection.** Decide how game servers pick a gateway: geo, latency tables or round robin.
 - **Aeron Archive and replay.** Replaying input should rebuild the book, and replaying output
   into `level2` would test it offline. Timestamps will differ, because the engine stamps them

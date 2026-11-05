@@ -26,7 +26,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 const ORDERS_COLUMNS: &str = "cl_ord_id, last(symbol) symbol, last(ord_status) ord_status, \
      last(side) side, last(leaves_qty) leaves_qty, last(cum_qty) cum_qty, last(price) price, \
-     last(avg_px) avg_px, min(ts) created_at, max(ts) updated_at";
+     last_not_null(avg_px) avg_px, min(ts) created_at, max(ts) updated_at";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OrderKey {
