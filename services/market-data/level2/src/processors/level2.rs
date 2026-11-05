@@ -13,7 +13,6 @@ pub fn format_l2_update_json(
     event_time: String,
     price_level: String,
     new_quantity: String,
-    product_id: String,
 ) -> Result<String, serde_json::Error> {
     let l2_data = L2Update {
         side,

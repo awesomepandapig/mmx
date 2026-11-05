@@ -305,6 +305,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "candles"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tape",
+ "tracing",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1086,16 +1096,11 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 name = "level2"
 version = "0.1.0"
 dependencies = [
- "async-nats",
- "chrono",
  "sbe",
  "serde",
  "serde_json",
- "tokio",
+ "tape",
  "tracing",
- "tracing-subscriber",
- "transport",
- "uuid",
 ]
 
 [[package]]
@@ -2237,6 +2242,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tape"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "chrono",
+ "rusteron-archive",
+ "sbe",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "transport",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2289,16 +2310,11 @@ dependencies = [
 name = "ticker"
 version = "0.1.0"
 dependencies = [
- "async-nats",
- "chrono",
  "sbe",
  "serde",
  "serde_json",
- "tokio",
+ "tape",
  "tracing",
- "tracing-subscriber",
- "transport",
- "uuid",
 ]
 
 [[package]]
@@ -2566,7 +2582,10 @@ dependencies = [
  "sbe",
  "serde",
  "serde_json",
+ "tape",
+ "tracing",
  "transport",
+ "ureq",
  "uuid",
 ]
 

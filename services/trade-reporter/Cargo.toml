@@ -9,7 +9,11 @@ env_logger = "0.11.8"
 log = "0.4.27"
 questdb-rs = { version = "4.0.4", features = ["chrono_timestamp"] }
 sbe = { workspace = true }
+tape = { workspace = true }
 transport = { workspace = true }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+# `tape` logs with `tracing`, and the `log` feature passes that on to `env_logger`.
+tracing = { version = "0.1.41", features = ["log"] }
+ureq = "2.9"
 uuid = { version = "1.17.0", features = ["v4"] }

@@ -1,139 +1,70 @@
-use sbe::ord_status_enum::OrdStatusEnum;
+mod rows;
+mod store;
 
+use std::env;
 use std::hint::spin_loop;
-use std::time::Instant;
+use std::process::ExitCode;
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
-use sbe::exec_type_enum::ExecTypeEnum;
-use sbe::side_enum::SideEnum;
+use log::{error, info, warn};
 
-use log::{error, info};
+use tape::candle::CandleBook;
+use tape::follower::TapeConfig;
+use tape::frame::{self, Frame};
+use tape::source::Source;
 
-use sbe::ReadBuf;
-use sbe::execution_report_codec::ExecutionReportDecoder;
-use sbe::message_header_codec::MessageHeaderDecoder;
+use store::Store;
 
-const DECIMAL_NULL_VAL: i64 = i64::MIN;
+const FRAGMENT_LIMIT: usize = 1024;
+const REPLAY_STREAM: i32 = 3030;
+const FLUSH_ROWS: usize = 10_000;
+const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const RETRY_AFTER: Duration = Duration::from_secs(1);
 
-use uuid::Uuid;
-
-use questdb::ingress::{Buffer, Sender, TimestampNanos};
-
-fn u64s_to_uuid(uuid: [u64; 2]) -> Uuid {
-    let mut bytes = [0u8; 16];
-    bytes[0..8].copy_from_slice(&uuid[0].to_be_bytes());
-    bytes[8..16].copy_from_slice(&uuid[1].to_be_bytes());
-    Uuid::from_bytes(bytes)
-}
-
-fn aeron_error_handler(code: i32, message: &str) {
-    error!("Aeron: Error {}: {}", code, message);
-}
-
-pub fn read_message(buffer: &[u8], qdb_buffer: &mut Buffer, qdb_sender: &mut Sender) {
-    let read_buf = ReadBuf::new(buffer);
-    let header_decoder: MessageHeaderDecoder<ReadBuf<'_>> =
-        MessageHeaderDecoder::default().wrap(read_buf, 0);
-
-    match header_decoder.template_id() {
-        3 => {
-            let _result = write_to_db(header_decoder, qdb_buffer, qdb_sender);
-            // println!("RESULT: {:?}", result);
-        }
-        4 => {}
-        _ => {}
+/// Sends everything queued. While QuestDB is away, reading stops and this service falls behind
+/// the tape, which is expected.
+fn flush_until_done(store: &mut Store, candles: &mut CandleBook, position: Option<i64>) {
+    while let Err(e) = store.flush(candles, position) {
+        error!("QuestDB: Failed to flush: {}", e);
+        sleep(RETRY_AFTER);
     }
 }
 
-fn write_to_db(
-    header_decoder: MessageHeaderDecoder<ReadBuf<'_>>,
-    qdb_buffer: &mut Buffer,
-    qdb_sender: &mut Sender,
-) -> questdb::Result<()> {
-    let report: ExecutionReportDecoder<'_> =
-        ExecutionReportDecoder::default().header(header_decoder, 0);
-
-    let exec_type = report.exec_type();
-    if !(exec_type == ExecTypeEnum::New || exec_type == ExecTypeEnum::Trade) {
-        return Ok(());
-    }
-
-    let account = u64s_to_uuid(report.account()).to_string();
-    let cl_ord_id = u64s_to_uuid(report.cl_ord_id()).to_string();
-
-    let price_m = report.price_decoder().mantissa();
-    let avg_px_m = report.avg_px_decoder().mantissa();
-
-    let price = if price_m != DECIMAL_NULL_VAL {
-        Some(price_m as f64 / 1e8)
-    } else {
-        None
-    };
-
-    let avg_px = if avg_px_m != DECIMAL_NULL_VAL {
-        Some(avg_px_m as f64 / 1e8)
-    } else {
-        None
-    };
-
-    let leaves_qty = report.leaves_qty_decoder().mantissa() as f64 / 1e8;
-    let cum_qty = report.cum_qty_decoder().mantissa() as f64 / 1e8;
-
-    let ord_status = match report.ord_status() {
-        OrdStatusEnum::New => "new",
-        OrdStatusEnum::PartiallyFilled => "partially_filled",
-        OrdStatusEnum::Canceled => "canceled",
-        _ => return Ok(()),
-    };
-
-    let side_bool = match report.side() {
-        SideEnum::Buy => true,
-        SideEnum::Sell => false,
-        _ => return Ok(()),
-    };
-
-    let symbol_raw = report.symbol();
-    let symbol = match std::str::from_utf8(&symbol_raw) {
-        Ok(s) => s.trim_end_matches('\0'), // strip padding nulls
-        Err(_) => return Ok(()),           // ignore invalid UTF-8
-    };
-
-    let timestamp = TimestampNanos::new(report.transact_time_decoder().time() as i64);
-
-    let mut builder = qdb_buffer
-        .table("orders")?
-        .symbol("symbol", symbol)?
-        .symbol("ord_status", ord_status)?
-        .column_str("account", &account)?
-        .column_str("cl_ord_id", &cl_ord_id)?
-        .column_f64("leaves_qty", leaves_qty)?
-        .column_f64("cum_qty", cum_qty)?
-        .column_bool("side", side_bool)?;
-
-    if let Some(p) = price {
-        builder = builder.column_f64("price", p)?;
-    }
-    if let Some(a) = avg_px {
-        builder = builder.column_f64("avg_px", a)?;
-    }
-
-    builder.at(timestamp)?;
-
-    qdb_sender.flush(qdb_buffer)?;
-    Ok(())
-}
-
-fn main() -> questdb::Result<()> {
+fn main() -> ExitCode {
     env_logger::init();
 
     let start_time = Instant::now();
+    let rebuild = env::args().any(|argument| argument == "--rebuild");
 
-    let (_aeron, subscription) = match transport::subscribe_to_executions(aeron_error_handler) {
-        Ok(client) => client,
+    let config = match TapeConfig::from_env(REPLAY_STREAM) {
+        Ok(config) => config,
         Err(e) => {
-            error!("Aeron: Failed to subscribe: {:?}", e);
-            return Ok(());
+            error!("{}", e);
+            return ExitCode::FAILURE;
         }
     };
+    if rebuild && config.is_none() {
+        error!("--rebuild needs a tape to read, so set TAPE_ARCHIVES and TAPE_REPORTS");
+        return ExitCode::FAILURE;
+    }
+
+    let questdb_conf = transport::env_or("QUESTDB_CONF", "http::addr=localhost:9000;");
+    let mut store = match Store::open(&questdb_conf) {
+        Ok(store) => store,
+        Err(e) => {
+            error!("QuestDB: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    store.prepare(rebuild);
+
+    // A standalone engine records nothing and restarts its IDs, so there's nothing to resume.
+    let (position, mut candles) = match config {
+        Some(_) => store.resume(),
+        None => (0, CandleBook::default()),
+    };
+    let mut source = Source::open(config, position);
 
     let startup_duration = start_time.elapsed();
     info!(
@@ -141,27 +72,28 @@ fn main() -> questdb::Result<()> {
         startup_duration
     );
 
-    let questdb_conf = transport::env_or("QUESTDB_CONF", "http::addr=localhost:9000;");
-    let mut qdb_sender = Sender::from_conf(questdb_conf)?;
-    let mut qdb_buffer = Buffer::new();
-
-    let mut msg_count = 0;
-    let flush_every = 1000;
+    let mut flushed_position = source.position();
+    let mut last_flush = Instant::now();
 
     loop {
-        let fragments_read = subscription
-            .poll_fn(
-                |buffer, _header| {
-                    read_message(buffer, &mut qdb_buffer, &mut qdb_sender);
-                    msg_count += 1;
-                    if msg_count >= flush_every {
-                        let _ = qdb_sender.flush(&mut qdb_buffer);
-                        msg_count = 0;
-                    }
-                },
-                1024,
-            )
-            .expect("Failed to poll Aeron subscription");
+        let fragments_read = source.poll(FRAGMENT_LIMIT, &mut |buffer, _position| match frame::parse(buffer) {
+            Frame::Report(report) => {
+                store.record(&report);
+                candles.apply(&report);
+            }
+            Frame::CancelReject | Frame::TermMarker(_) => {}
+            Frame::Unknown(template_id) => warn!("Skipping unknown template {}", template_id),
+            Frame::Malformed => warn!("Skipping a malformed message of {} bytes", buffer.len()),
+        });
+
+        let position = source.position();
+        let idle_flush_due = last_flush.elapsed() >= FLUSH_INTERVAL;
+        let has_news = store.queued_rows() > 0 || position != flushed_position;
+        if store.queued_rows() >= FLUSH_ROWS || (idle_flush_due && has_news) {
+            flush_until_done(&mut store, &mut candles, position);
+            flushed_position = position;
+            last_flush = Instant::now();
+        }
 
         if fragments_read == 0 {
             spin_loop();
