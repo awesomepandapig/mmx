@@ -1,100 +1,42 @@
-use futures_util::{SinkExt, StreamExt};
+mod auth;
+mod config;
+mod connection;
+mod hub;
+mod nats;
+mod protocol;
+#[cfg(test)]
+mod tests;
 
-use std::net::SocketAddr;
+use config::Config;
+use connection::accept_connection;
+use hub::{Hub, refresh_tickers};
+
 use std::process;
-use std::time::SystemTime;
+use std::sync::Arc;
 
-use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{
-    accept_async,
-    tungstenite::{Error, Message, Result, Utf8Bytes},
-};
-use tokio::time::{interval, Duration, Instant};
-
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-
-use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio::time::{Duration, sleep};
 
 use tracing::Level;
 use tracing::subscriber::set_global_default;
+use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 
-use tracing::{error, info};
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-async fn accept_connection(peer: SocketAddr, stream: TcpStream) {
-    if let Err(e) = handle_connection(peer, stream).await {
-        match e {
-            Error::ConnectionClosed | Error::Protocol(_) | Error::Utf8(_) => (),
-            err => error!("Error processing connection: {}", err),
+async fn serve(listener: TcpListener, hub: Arc<Hub>, config: Arc<Config>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                tokio::spawn(accept_connection(peer, stream, hub.clone(), config.clone()));
+            }
+            // Usually out of file descriptors, which clears as sockets close.
+            Err(e) => {
+                error!("Failed to accept a connection: {}", e);
+                sleep(ACCEPT_RETRY_DELAY).await;
+            }
         }
     }
-}
-
-pub fn format_timestamp_ns(timestamp_ns: u64) -> String {
-    let secs = (timestamp_ns / 1_000_000_000) as i64;
-    let nanos = (timestamp_ns % 1_000_000_000) as u32;
-
-    let naive_dt = NaiveDateTime::from_timestamp_opt(secs, nanos)
-        .unwrap_or_else(|| NaiveDateTime::from_timestamp_opt(0, 0).unwrap()); // Default to epoch if out of range
-
-    let datetime: DateTime<Utc> = Utc.from_utc_datetime(&naive_dt);
-    datetime.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
-}
-
-async fn handle_connection(peer: SocketAddr, stream: TcpStream) -> Result<()> {
-    let mut ws_stream = accept_async(stream).await.expect("Failed to accept");
-
-    info!("New WebSocket connection: {}", peer);
-
-    // Connect to the NATS server
-    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "localhost".to_string());
-    info!("Connecting to NATS server at {}", nats_url);
-    let client = async_nats::connect(nats_url)
-        .await
-        .expect("nats connection failed"); // TODO: Replace expect with explicit handle and trace
-
-    let mut subscriber = client
-        .subscribe("l2.*")
-        .await
-        .expect("Failed to connect to NATS");
-
-    let mut sequence_num = 0;
-    let mut buffer: Vec<Value> = Vec::new();
-    let mut ticker = interval(Duration::from_millis(250));
-
-    while let Some(message) = subscriber.next().await {
-        let product_id = message.subject.as_str().trim_start_matches("l2.").to_string();
-        let inner_json: Value =
-            serde_json::from_slice(&message.payload).expect("Invalid JSON in NATS message payload"); // TODO: HANDLE ERROR
-
-        let timestamp_ns = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap() // TODO: REPLACE UNWRAP WITH ERROR HANDLE
-            .as_nanos() as u64;
-
-        let update_json = json!({
-            "channel": "l2_data",
-            "client_id": "", // TODO:
-            "timestamp": format_timestamp_ns(timestamp_ns),
-            "sequence_num": sequence_num,
-            "events": [{
-                "type": "update",
-                "product_id": product_id,
-                "updates": [inner_json]
-            }]
-        });
-
-        sequence_num += 1;
-
-        let update_str = update_json.to_string();
-        let ws_msg = Message::Text(Utf8Bytes::from(update_str));
-        ws_stream
-            .send(ws_msg)
-            .await
-            .expect("Failed to send message");
-    }
-
-    Ok(())
 }
 
 #[tokio::main]
@@ -108,16 +50,22 @@ async fn main() {
         process::exit(1);
     });
 
+    let config = Arc::new(Config::from_env());
+    let hub = Arc::new(Hub::default());
+
     let addr = std::env::var("WS_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    let listener = TcpListener::bind(&addr).await.expect("Can't listen");
+    let listener = match TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Can't listen on {}: {}", addr, e);
+            process::exit(1);
+        }
+    };
     info!("Listening on: {}", addr);
 
-    while let Ok((stream, _)) = listener.accept().await {
-        let peer = stream
-            .peer_addr()
-            .expect("connected streams should have a peer address");
-        info!("Peer address: {}", peer);
+    let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "localhost".to_string());
+    tokio::spawn(nats::run(nats_url, hub.clone()));
+    tokio::spawn(refresh_tickers(hub.clone(), config.ticker_refresh));
 
-        tokio::spawn(accept_connection(peer, stream));
-    }
+    serve(listener, hub, config).await;
 }
