@@ -71,14 +71,14 @@ Owns `services/api/rest`.
 - [x] Request shape checks and validation, including tick size
 - [x] Enabled markets from `markets.yaml`, with hot reload through an explicit reload command
 - [x] Per-player rate limits in Valkey, with defaults and overrides
-- [ ] Remove the repeat-order check and `RETRY_WINDOW_SECS`, since callers don't retry
-- [ ] Unknown-outcome status: define when a missing order is definitely not landed
+- [x] Remove the repeat-order check and `RETRY_WINDOW_SECS`, since callers don't retry
+- [x] Unknown-outcome status: define when a missing order is definitely not landed
 - [x] Cancel an order, and cancel all of a player's orders
 - [x] `GET` orders
 - [ ] JWT validation on by default, including game-server-only deployments
 - [ ] Optional OIDC, with token introspection, mapping users to accounts
 - [ ] Optional direct player access, off by default
-- [ ] Atomic claim in Valkey with UUIDv7 IDs, so a repeated ID can never execute twice, on any gateway
+- [x] Atomic claim in Valkey with UUIDv7 IDs, so a repeated ID can never execute twice, on any gateway
 
 ### 2. WebSocket (wave 1)
 
@@ -129,6 +129,7 @@ Owns `crates/cluster` and `services/matching-engine`.
 - [x] Remove spike-only flags, and engine unit tests
 - [ ] Configurable tape retention, swept to QuestDB by default: retention exists, sweeping isn't wired
 - [x] Report a repeat of a resting order as a duplicate, even on a full book
+- [ ] Survive a dead archive client: every engine panicked at once in `snapshot.rs` with `aeron_archive_t not connected` after about 1h47m idle. Reconnect instead, then soak a real idle cluster
 - [ ] Recovery plan for an order that panics every node, since replay hits the same panic
 - [ ] Reject a message split across frames instead of panicking; only `sbx-cluster-bench --batch` above about 13 sends one
 - [ ] Give a full book its own reject reason and an operator alert
