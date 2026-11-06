@@ -160,6 +160,7 @@ fn header(text: &str) -> String {
     lines.map(|line| format!("{line}\n")).collect()
 }
 
+#[cfg(test)]
 pub fn read(path: &Path) -> Result<(MarketsFile, String), String> {
     let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
     let file = MarketsFile::parse(&text).map_err(|err| format!("{}: {err}", path.display()))?;
@@ -198,14 +199,90 @@ fn replace_file(target: &Path, text: &str) -> io::Result<()> {
     result
 }
 
-/// Checks the new contents with the gateway's rules, then swaps them in with a rename, so a reader
-/// sees the old file or the new one and never part of either.
-pub fn write(path: &Path, file: &MarketsFile, previous: &str) -> Result<(), String> {
+/// The new contents, checked with the gateway's rules, keeping the comment block from `previous`.
+pub fn render(file: &MarketsFile, previous: &str) -> Result<String, String> {
     let text = file.render(&header(previous))?;
-    MarketsFile::parse(&text).map_err(|err| format!("{}: {err}", path.display()))?;
+    MarketsFile::parse(&text)?;
+    Ok(text)
+}
+
+/// Swaps in the new contents with a rename, so a reader sees the old file or the new one and never
+/// part of either.
+pub fn replace(path: &Path, text: &str) -> Result<(), String> {
     // Renaming over a symlink would replace the link instead of the file it points to.
     let target: PathBuf = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    replace_file(&target, &text).map_err(|err| format!("{}: {err}", path.display()))
+    replace_file(&target, text).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Problem {
+    pub message: String,
+    /// Counting from 1. Not every problem can be tied to a line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+/// The line that names a symbol, for a problem found after parsing.
+fn line_of(text: &str, symbol: &str) -> Option<usize> {
+    let names = |line: &str| {
+        let line = line.trim_start().trim_start_matches("- ");
+        line.strip_prefix("symbol:").is_some_and(|value| {
+            value
+                .trim()
+                .trim_matches(['"', '\''])
+                .eq_ignore_ascii_case(symbol)
+        })
+    };
+    text.lines().position(names).map(|index| index + 1)
+}
+
+/// Checks a whole file as the gateway would, saying where the first problem is.
+pub fn check(text: &str) -> Result<MarketsFile, Problem> {
+    let located = serde_yaml::from_str::<MarketsFile>(text).map_err(|err| Problem {
+        line: err.location().map(|location| location.line()),
+        message: if err.to_string().contains("halted") {
+            format!("{err}. Halts aren't kept in this file: use Halt on the market instead.")
+        } else {
+            err.to_string()
+        },
+    });
+    located?;
+    MarketsFile::parse(text).map_err(|message| {
+        // Problems start with the symbol, and a badly formed one is quoted.
+        let symbol = match message.strip_prefix("Symbol '") {
+            Some(rest) => rest.split('\'').next(),
+            None => message.split(':').next(),
+        };
+        Problem {
+            line: symbol.and_then(|symbol| line_of(text, symbol)),
+            message,
+        }
+    })
+}
+
+/// What a new file would change, for showing before it's saved.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct Changes {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+}
+
+pub fn changes(from: &MarketsFile, to: &MarketsFile) -> Changes {
+    let mut result = Changes::default();
+    for entry in &to.markets {
+        match from.get(&entry.symbol) {
+            None => result.added.push(entry.symbol.clone()),
+            Some(old) if old != entry => result.changed.push(entry.symbol.clone()),
+            Some(_) => {}
+        }
+    }
+    for entry in &from.markets {
+        if to.get(&entry.symbol).is_none() {
+            result.removed.push(entry.symbol.clone());
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -222,6 +299,10 @@ mod tests {
             max_size: None,
             enabled: None,
         }
+    }
+
+    fn write(path: &Path, file: &MarketsFile, previous: &str) -> Result<(), String> {
+        replace(path, &render(file, previous)?)
     }
 
     fn temp_file(text: &str) -> PathBuf {
@@ -284,6 +365,41 @@ mod tests {
         }
         let text = file.render("").unwrap();
         assert_eq!(MarketsFile::parse(&text).unwrap(), file, "{text}");
+    }
+
+    #[test]
+    fn problems_say_which_line_they_are_on() {
+        let text = "markets:\n  - symbol: GOOD\n    tick_size: \"1\"\n  - symbol: BAD\n    tick_size: \"0\"\n";
+        let problem = check(text).unwrap_err();
+        assert_eq!(problem.line, Some(4));
+        assert!(problem.message.contains("tick_size"), "{problem:?}");
+
+        let problem = check("markets:\n  - symbol: A\n    tick_size: [\n").unwrap_err();
+        assert!(problem.line.is_some(), "{problem:?}");
+
+        let text = "markets:\n  - symbol: \"A-B\"\n    tick_size: \"1\"\n";
+        assert_eq!(check(text).unwrap_err().line, Some(2));
+    }
+
+    #[test]
+    fn a_halt_in_the_file_is_explained() {
+        let text = "markets:\n  - symbol: A\n    tick_size: \"1\"\n    halted: true\n";
+        assert!(check(text).unwrap_err().message.contains("use Halt"));
+    }
+
+    #[test]
+    fn changes_name_what_moved() {
+        let parse = |text: &str| MarketsFile::parse(text).unwrap();
+        let from = parse(
+            "markets:\n  - {symbol: A, tick_size: \"1\"}\n  - {symbol: B, tick_size: \"1\"}\n",
+        );
+        let to = parse(
+            "markets:\n  - {symbol: B, tick_size: \"2\"}\n  - {symbol: C, tick_size: \"1\"}\n",
+        );
+        let result = changes(&from, &to);
+        assert_eq!(result.added, ["C"]);
+        assert_eq!(result.removed, ["A"]);
+        assert_eq!(result.changed, ["B"]);
     }
 
     #[test]

@@ -147,13 +147,49 @@ fn render_gateways(body: &Value) -> String {
 fn render_edit(body: &Value) -> String {
     let outcome = if flag(body, "applied") {
         "applied"
+    } else if text(body, "state") == "reaching_gateways" {
+        "saved, reaching gateways"
     } else {
         "written, but not applied everywhere"
     };
+    let name = body.get("symbol").and_then(Value::as_str);
+    let heading = name.map_or_else(|| outcome.to_string(), |name| format!("{name} {outcome}"));
+    format!("{heading}\n{}", render_gateways(body))
+}
+
+fn render_webhook_config(body: &Value) -> String {
+    let advice = match text(body, "state") {
+        "applied" => "the outbox is using this".to_string(),
+        "restart_required" => format!("saved. Restart the outbox: {}", text(body, "restart")),
+        "from_environment" => "the outbox is using settings from its environment".to_string(),
+        "incomplete" => "set both a URL and a secret".to_string(),
+        _ => format!(
+            "can't confirm what the outbox is using. Restart it to be sure: {}",
+            text(body, "restart")
+        ),
+    };
     format!(
-        "{} {outcome}\n{}",
-        text(body, "symbol"),
-        render_gateways(body)
+        "url: {}\nsecret: {}\n{advice}",
+        text(body, "url"),
+        text(body, "secret_hint")
+    )
+}
+
+fn render_auth(body: &Value) -> String {
+    let oidc = body.get("oidc").unwrap_or(&Value::Null);
+    format!(
+        "password login: {}\nsingle sign-on: {}\npublic url: {}",
+        if flag(body, "password_login") {
+            "on"
+        } else {
+            "off"
+        },
+        if flag(oidc, "enabled") {
+            text(oidc, "issuer")
+        } else {
+            "off"
+        },
+        text(body, "public_url"),
     )
 }
 
@@ -349,6 +385,130 @@ impl Admin {
         } else {
             Err("some orders may still be open".to_string())
         }
+    }
+
+    pub async fn reload_markets(&self) -> Result<(), String> {
+        let reply = self
+            .call(self.request(Method::POST, "/admin/v1/markets/reload"))
+            .await?;
+        finish(self.json, &reply, render_edit)
+    }
+
+    async fn markets_file(&self) -> Result<Reply, String> {
+        self.call(self.request(Method::GET, "/admin/v1/config/markets"))
+            .await
+    }
+
+    /// Prints the file itself, so that the output can be saved and applied.
+    pub async fn export_markets(&self) -> Result<(), String> {
+        let reply = self.markets_file().await?;
+        finish(self.json, &reply, |body| {
+            text(body, "yaml").trim_end().to_string()
+        })
+    }
+
+    pub async fn validate_markets(&self, yaml: &str) -> Result<(), String> {
+        let request = self
+            .request(Method::POST, "/admin/v1/config/markets/validate")
+            .json(&json!({ "yaml": yaml }));
+        let reply = self.call(request).await?;
+        finish(self.json, &reply, |body| {
+            if flag(body, "valid") {
+                let mut lines = vec!["valid".to_string()];
+                lines.extend(
+                    list(body, "warnings")
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string),
+                );
+                lines.join("\n")
+            } else {
+                "not valid".to_string()
+            }
+        })?;
+        if flag(&reply.body, "valid") {
+            return Ok(());
+        }
+        let problem = reply.body.get("problem").unwrap_or(&Value::Null);
+        let line = problem.get("line").and_then(Value::as_u64);
+        Err(match line {
+            Some(line) => format!("line {line}: {}", text(problem, "message")),
+            None => text(problem, "message").to_string(),
+        })
+    }
+
+    /// Sends no revision, so this replaces whatever is stored. A file named on the command line is
+    /// meant as the whole truth, unlike an editor that may have opened an older copy.
+    pub async fn apply_markets(&self, yaml: &str) -> Result<(), String> {
+        let request = self
+            .request(Method::PUT, "/admin/v1/config/markets")
+            .json(&json!({ "yaml": yaml }));
+        let reply = self.call(request).await?;
+        finish(self.json, &reply, render_edit)
+    }
+
+    pub async fn show_auth(&self) -> Result<(), String> {
+        let reply = self
+            .call(self.request(Method::GET, "/admin/v1/settings"))
+            .await?;
+        finish(self.json, &reply, render_auth)
+    }
+
+    pub async fn reset_password(&self) -> Result<(), String> {
+        let reply = self
+            .call(self.request(Method::POST, "/admin/v1/password/reset"))
+            .await?;
+        finish(self.json, &reply, |body| {
+            format!(
+                "temporary password: {}\nIt's shown once. Sign in with it to choose a new one.",
+                text(body, "password")
+            )
+        })
+    }
+
+    pub async fn set_password_login(&self, on: bool) -> Result<(), String> {
+        let request = self
+            .request(Method::PUT, "/admin/v1/settings")
+            .json(&json!({ "password_login": on }));
+        let reply = self.call(request).await?;
+        finish(self.json, &reply, render_auth)
+    }
+
+    pub async fn revoke_sessions(&self) -> Result<(), String> {
+        let reply = self
+            .call(self.request(Method::POST, "/admin/v1/sessions/revoke"))
+            .await?;
+        finish(self.json, &reply, |_| {
+            "every session was revoked".to_string()
+        })
+    }
+
+    pub async fn webhook_config(&self) -> Result<(), String> {
+        let reply = self
+            .call(self.request(Method::GET, "/admin/v1/webhooks/config"))
+            .await?;
+        finish(self.json, &reply, render_webhook_config)
+    }
+
+    pub async fn set_webhook_url(&self, url: &str) -> Result<(), String> {
+        let request = self
+            .request(Method::PUT, "/admin/v1/webhooks/config")
+            .json(&json!({ "url": url }));
+        let reply = self.call(request).await?;
+        finish(self.json, &reply, render_webhook_config)
+    }
+
+    pub async fn rotate_webhook_secret(&self) -> Result<(), String> {
+        let reply = self
+            .call(self.request(Method::POST, "/admin/v1/webhooks/secret"))
+            .await?;
+        finish(self.json, &reply, |body| {
+            format!(
+                "signing secret: {}\nIt's shown once.\n{}",
+                text(body, "secret"),
+                render_webhook_config(body)
+            )
+        })
     }
 
     pub async fn activity(&self, key: &str, query: &ActivityQuery) -> Result<(), String> {

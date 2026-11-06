@@ -11,8 +11,9 @@ use reqwest::{Client, Method, RequestBuilder, redirect};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, lookup_host};
 use tokio::time::timeout;
+use tracing::warn;
 use uuid::Uuid;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -25,9 +26,16 @@ const FOLLOW_BATCH: usize = 500;
 const NATS_PORT: u16 = 4222;
 const VALKEY_PORT: u16 = 6379;
 
+/// reqwest panics on the first client without this. A workspace build can link two TLS backends, so
+/// the choice has to be explicit, and installing twice changes nothing.
+pub fn install_tls() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Redirects are off so a bearer token can't follow one anywhere, and proxies are off because these
 /// are all internal addresses.
 pub fn http_client(request_timeout: Option<Duration>) -> Result<Client, String> {
+    install_tls();
     let builder = Client::builder()
         .no_proxy()
         .redirect(redirect::Policy::none())
@@ -225,6 +233,14 @@ pub struct Position {
     pub verified: bool,
     pub halted: Option<String>,
     pub consecutive_failures: u64,
+    /// The URL and a fingerprint of the settings it started with, and whether it has any. These
+    /// are `None` from an outbox too old to say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured: Option<bool>,
 }
 
 impl Position {
@@ -232,7 +248,9 @@ impl Position {
     /// as much as it can say.
     pub fn view(&self) -> Value {
         let backlog = (self.durable_position - self.delivered_position).max(0);
-        let state = if self.halted.is_some() {
+        let state = if self.configured == Some(false) {
+            "not_configured"
+        } else if self.halted.is_some() {
             "halted"
         } else if !self.verified {
             "verifying"
@@ -405,6 +423,9 @@ fn questdb_version(build: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct Targets {
     pub gateways: Vec<String>,
+    /// A headless Service, as `host:port`. Its addresses replace `gateways`, because a normal
+    /// Service reaches one pod per call and a reload has to reach all of them.
+    pub gateway_dns: Option<String>,
     pub outbox: String,
     pub questdb: String,
     pub nats: String,
@@ -426,6 +447,28 @@ impl Upstreams {
         })
     }
 
+    /// Every gateway right now. Pods come and go, so this resolves on each call. If the name won't
+    /// resolve it's kept as a target, so the failure shows up against it.
+    pub async fn gateway_urls(&self) -> Vec<String> {
+        let Some(name) = &self.targets.gateway_dns else {
+            return self.targets.gateways.clone();
+        };
+        match lookup_host(name.as_str()).await {
+            Ok(addresses) => {
+                let mut urls: Vec<String> = addresses
+                    .map(|address| format!("http://{address}"))
+                    .collect();
+                urls.sort_unstable();
+                urls.dedup();
+                urls
+            }
+            Err(err) => {
+                warn!("Gateways: can't resolve {name}: {err}");
+                vec![format!("http://{name}")]
+            }
+        }
+    }
+
     fn gateway_request(&self, method: Method, gateway: &str, path: &str) -> RequestBuilder {
         let request = self.http.request(method, format!("{gateway}{path}"));
         match &self.token {
@@ -434,7 +477,7 @@ impl Upstreams {
         }
     }
 
-    async fn gateway_call(&self, method: Method, gateway: &str, path: &str) -> GatewayResult {
+    pub async fn gateway_call(&self, method: Method, gateway: &str, path: &str) -> GatewayResult {
         GatewayResult::new(
             gateway,
             send(self.gateway_request(method, gateway, path)).await,
@@ -443,9 +486,8 @@ impl Upstreams {
 
     /// Makes the same call on every gateway at once, and keeps each answer.
     pub async fn each_gateway(&self, method: Method, path: &str) -> Vec<GatewayResult> {
-        let calls = self
-            .targets
-            .gateways
+        let gateways = self.gateway_urls().await;
+        let calls = gateways
             .iter()
             .map(|gateway| self.gateway_call(method.clone(), gateway, path));
         join_all(calls).await
@@ -458,7 +500,7 @@ impl Upstreams {
     pub async fn cancel_all(&self, symbol: &str) -> Vec<GatewayResult> {
         let path = format!("/api/v1/admin/markets/{symbol}/cancel-all");
         let mut attempts = Vec::new();
-        for gateway in &self.targets.gateways {
+        for gateway in &self.gateway_urls().await {
             let request = self
                 .gateway_request(Method::POST, gateway, &path)
                 .timeout(CANCEL_ALL_TIMEOUT);
@@ -569,11 +611,15 @@ impl Upstreams {
         let halted = position
             .as_ref()
             .and_then(|position| position.halted.clone());
+        let waiting = position
+            .as_ref()
+            .is_some_and(|position| position.configured == Some(false))
+            .then(|| "No webhook is configured yet.".to_string());
         ServiceStatus {
             reachable: true,
             ready: reply.ok(),
             checks: position.map(|position| position.view()),
-            error: halted.or((!reply.ok()).then(|| reply.error())),
+            error: waiting.or(halted).or((!reply.ok()).then(|| reply.error())),
             ..status
         }
     }
@@ -668,11 +714,8 @@ impl Upstreams {
     }
 
     pub async fn status(&self) -> Vec<ServiceStatus> {
-        let gateways = self
-            .targets
-            .gateways
-            .iter()
-            .map(|gateway| self.gateway_status(gateway));
+        let urls = self.gateway_urls().await;
+        let gateways = urls.iter().map(|gateway| self.gateway_status(gateway));
         let valkey = async {
             match &self.targets.valkey {
                 Some(url) => Some(self.valkey_status(url).await),
@@ -774,6 +817,9 @@ mod tests {
             verified,
             halted: halted.map(str::to_string),
             consecutive_failures: failures,
+            webhook_url: None,
+            config_id: None,
+            configured: None,
         };
         assert_eq!(
             position(Some("bad"), false, 3, 200).view()["state"],
