@@ -274,7 +274,7 @@ function LogLine({
 }) {
   const event = eventOf(row);
   const reason = row.kind === "order" && row.reason && row.reason !== "none" ? row.reason : null;
-  const status = row.kind === "order" ? row.status : "filled";
+  const status = row.kind === "order" ? row.status : "";
   const result = reason ?? (status === "partially_filled" ? "partial" : status);
   return (
     <button

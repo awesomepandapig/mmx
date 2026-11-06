@@ -168,7 +168,7 @@ enum Command {
         #[command(subcommand)]
         command: WebhookCommand,
     },
-    /// Follow markets, orders, trades and webhook delivery as they change
+    /// Follow markets, webhook delivery and a sample of orders and trades as they change
     Watch,
 }
 

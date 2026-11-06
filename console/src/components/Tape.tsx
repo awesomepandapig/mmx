@@ -70,7 +70,7 @@ export function TapeLine({ row, onOpen }: { row: TapeRow; onOpen: () => void }) 
       <SideText side={row.side} />
       <span className={eventClass(event)}>{event}</span>
       <span className={cn("truncate", reason ? "text-bad" : "text-muted")} title={reason ?? ""}>
-        {reason ?? order?.status ?? "filled"}
+        {reason ?? order?.status ?? "-"}
       </span>
       <span>{row.size ?? "-"}</span>
       <span>{row.price ?? "market"}</span>

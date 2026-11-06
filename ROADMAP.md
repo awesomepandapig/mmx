@@ -153,6 +153,9 @@ Owns the new `deploy/`.
 - [x] Per-market cancel-all, across every player
 - [x] `mmx` CLI: status, health, markets and config
 - [x] Console: first-run setup, sessions and OIDC login, and a YAML market editor backed by the Kubernetes API
+- [x] Console: roles from provider groups, recent sign-in for destructive actions, a provider set at install, and no public URL setting
+- [x] Console: market page with a live book and log, search over thousands of markets, and a sampled activity feed
+- [ ] Book snapshots from `market-data`, so opening a market doesn't scan its history on the tape
 - [x] Seed the markets ConfigMap only when it's missing, so `helm upgrade` can't overwrite console edits
 - [x] `mmx` in the chart, with RBAC limited to one ConfigMap and one Secret by name
 - [ ] Console API keys
