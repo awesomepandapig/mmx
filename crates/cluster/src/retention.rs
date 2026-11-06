@@ -5,7 +5,7 @@
 //! it has taken `keep_snapshots` more. Purging never touches matching, so nodes may differ here.
 
 use std::collections::VecDeque;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 
 use crate::NodeConfig;
@@ -164,10 +164,21 @@ impl Housekeeper {
         thread::Builder::new()
             .name("housekeeper".to_string())
             .spawn(move || {
-                let archive = snapshot::connect(&config);
+                let mut archive = snapshot::connect(&config);
                 let mut ledger = Ledger::new(retention.keep_snapshots);
-                for snapshot in taken {
+                loop {
+                    let snapshot = match taken.recv_timeout(crate::ARCHIVE_KEEP_ALIVE) {
+                        Ok(snapshot) => snapshot,
+                        Err(RecvTimeoutError::Timeout) => {
+                            archive.keep_alive();
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    };
                     if let Some(floors) = ledger.add(snapshot) {
+                        if !archive.is_connected() {
+                            archive = snapshot::connect(&config);
+                        }
                         purge(&archive, retention, floors);
                     }
                 }
