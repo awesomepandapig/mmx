@@ -41,6 +41,9 @@ const CONSENSUS_MODULE_STREAM_ID: i32 = 105;
 const SERVICE_ID: i32 = 0;
 
 const FRAGMENT_LIMIT: usize = 256;
+/// How often a held Archive connection reads what it's been sent.
+const ARCHIVE_KEEP_ALIVE: Duration = Duration::from_millis(100);
+const KEEP_ALIVE_CHECK_LOOPS: u64 = 1024;
 const HEADER_LENGTH: usize = 8;
 pub const SESSION_HEADER_LENGTH: usize = 32;
 
@@ -192,6 +195,7 @@ impl ActiveLog {
 struct Agent<'a, S: ClusteredService> {
     aeron: &'a Aeron,
     archive: snapshot::ArchiveClient,
+    config: &'a NodeConfig,
     service: &'a mut S,
     consensus: AeronPublication,
     control_toggle: &'a AtomicI64,
@@ -296,6 +300,10 @@ impl<S: ClusteredService> Agent<'_, S> {
                 self.cluster_time = read_i64(body, 16);
                 if read_i32(body, 24) == ACTION_SNAPSHOT {
                     let log_position = read_i64(body, 8);
+                    if !self.archive.is_connected() {
+                        eprintln!("the archive connection dropped, reconnecting for this snapshot");
+                        self.archive = snapshot::connect(self.config);
+                    }
                     let (recording_id, tape, timing) = snapshot::take(&self.archive, self.service);
                     self.ack(log_position, recording_id);
                     self.schedule.on_snapshot(log_position, self.cluster_time);
@@ -378,6 +386,7 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
     let mut agent = Agent {
         aeron,
         archive,
+        config,
         service,
         consensus,
         control_toggle,
@@ -399,6 +408,8 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
     agent.ack(agent.log_position, aeron.client_id());
 
     let mut log: Option<(AeronSubscription, AeronImage)> = None;
+    let mut loops = 0u64;
+    let mut last_keep_alive = Instant::now();
 
     loop {
         control_subscription
@@ -450,6 +461,12 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
         }
 
         agent.service.do_background_work(&agent.archive);
+        loops = loops.wrapping_add(1);
+        // Checked rarely, because this loop runs between messages.
+        if loops.is_multiple_of(KEEP_ALIVE_CHECK_LOOPS) && last_keep_alive.elapsed() >= ARCHIVE_KEEP_ALIVE {
+            agent.archive.keep_alive();
+            last_keep_alive = Instant::now();
+        }
         agent.request_snapshot_if_due();
 
         if polled == 0 {

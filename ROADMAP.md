@@ -129,7 +129,7 @@ Owns `crates/cluster` and `services/matching-engine`.
 - [x] Remove spike-only flags, and engine unit tests
 - [ ] Configurable tape retention, swept to QuestDB by default: retention exists, sweeping isn't wired
 - [x] Report a repeat of a resting order as a duplicate, even on a full book
-- [ ] Survive a dead archive client: every engine panicked at once in `snapshot.rs` with `aeron_archive_t not connected` after about 1h47m idle. Reconnect instead, then soak a real idle cluster
+- [x] Keep held Archive connections alive and reconnect before a snapshot if one has dropped. Unread pings filled a 64 KB term in about 17 minutes, so every timed snapshot panicked every node
 - [ ] Recovery plan for an order that panics every node, since replay hits the same panic
 - [ ] Reject a message split across frames instead of panicking; only `sbx-cluster-bench --batch` above about 13 sends one
 - [ ] Give a full book its own reject reason and an operator alert
@@ -186,6 +186,7 @@ the raw APIs or an SDK.
 
 ### Cross-cutting
 
+- [ ] Remove every `.expect`, `unwrap` and panic on a runtime path outside the matching engine, with an explicit handler for each invariant. Services never panic unless it's truly unrecoverable. The engine may panic on a real safety violation, because stopping is safer than continuing
 - [ ] Consistent logging, traces, config and startup across services
 - [ ] `/healthz`, `/readyz` and `/metrics` on every service: gateway has all three, outbox and `mmx` have health only
 - [x] Local end-to-end check with `sbx.py e2e`: a signed fill webhook through a leader kill
@@ -210,6 +211,21 @@ the raw APIs or an SDK.
 ### Direct lane (plan)
 
 - [ ] Authenticated SBE sessions into the cluster for trusted partners, with per-session sequence numbers, skipping REST gateways and Valkey
+
+### From the infra review (plan)
+
+- [ ] Cluster page: members, leader, log position, snapshot age, every consumer's lag, and failed checks named on screen
+- [ ] Stale data never looks live: "as of" times, and a market reads "cannot trade" when the engine is down
+- [ ] Finer permissions: separate create, update, halt and cancel-all, so developers can add markets without deleting them
+- [ ] A separate gateway credential, since the admin token in gateway pods makes a gateway compromise a console admin
+- [ ] Refuse to delete a market with open orders, add a global halt with reasons, and make halts survive Valkey loss
+- [ ] Last-known-good markets, so a bad ConfigMap can't take down the console or stop gateways starting
+- [ ] Chart overrides: `nodeSelector`, tolerations, annotations, labels, `extraEnv`, volumes and security contexts, including bundled dependencies
+- [ ] GitOps-safe chart: no `lookup` state, an external control Secret, an unmanaged config mode, and secrets that fit Vault
+- [ ] Metrics on every service, alert rules, dashboards, traces and JSON logs
+- [ ] Durable audit log, market revision history with rollback, named service accounts and expiring API tokens
+- [ ] Gateway `/readyz` as the default probe, probes on consumers, and backup, restore and upgrade docs
+- [ ] Tagged, signed releases with an OCI chart
 
 ## Later
 

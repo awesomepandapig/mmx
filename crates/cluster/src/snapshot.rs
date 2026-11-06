@@ -91,6 +91,18 @@ pub fn connect(config: &NodeConfig) -> ArchiveClient {
 }
 
 impl ArchiveClient {
+    /// Reads whatever the Archive has sent. It pings every client each second over a 64 KB term, so
+    /// a client that never reads fills that term in about 17 minutes, and the Archive then closes
+    /// the session. Holding one connection open means this has to run for as long as it's held.
+    pub(crate) fn keep_alive(&self) {
+        // An error means the session is gone, which `is_connected` reports where it matters.
+        let _ = self.client.poll_for_recording_signals();
+    }
+
+    pub(crate) fn is_connected(&self) -> bool {
+        self.client.get_control_response_subscription().is_connected()
+    }
+
     /// Records a deterministic output stream from `position`, truncating anything newer that a
     /// previous run wrote, and returns the channel to publish on. The replayed log regenerates
     /// identical bytes from that point.
