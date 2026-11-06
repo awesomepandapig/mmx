@@ -50,6 +50,13 @@ function subtract(ask?: string, bid?: string) {
   return (Number(ask) - Number(bid)).toFixed(places);
 }
 
+/** Prices to the market's tick, so a column of them lines up. */
+function priced(price: string, tick: string) {
+  const places = (tick.split(".")[1] ?? "").length;
+  const [whole, fraction = ""] = price.split(".");
+  return places ? `${whole}.${fraction.padEnd(places, "0")}` : price;
+}
+
 function BookRow({
   price,
   size,
@@ -82,7 +89,15 @@ function BookRow({
 }
 
 /** The largest size in view sets the scale, so depth reads at a glance without any numbers. */
-function OrderBook({ frame, failed }: { frame: BookFrame | null; failed: string | null }) {
+function OrderBook({
+  frame,
+  failed,
+  tick,
+}: {
+  frame: BookFrame | null;
+  failed: string | null;
+  tick: string;
+}) {
   const [box, { height }] = useSize<HTMLDivElement>();
   const rows = Math.max(3, Math.floor((height - 32) / 2 / BOOK_ROW));
   const asks = frame?.asks.slice(0, rows) ?? [];
@@ -129,7 +144,7 @@ function OrderBook({ frame, failed }: { frame: BookFrame | null; failed: string 
               {[...asks].reverse().map(([price, size]) => (
                 <BookRow
                   key={price}
-                  price={price}
+                  price={priced(price, tick)}
                   size={size}
                   side="ask"
                   width={Number(width(size))}
@@ -144,7 +159,7 @@ function OrderBook({ frame, failed }: { frame: BookFrame | null; failed: string 
               {bids.map(([price, size]) => (
                 <BookRow
                   key={price}
-                  price={price}
+                  price={priced(price, tick)}
                   size={size}
                   side="bid"
                   width={Number(width(size))}
@@ -264,7 +279,8 @@ function LogLine({
 }) {
   const event = eventOf(row);
   const reason = row.kind === "order" && row.reason && row.reason !== "none" ? row.reason : null;
-  const result = reason ?? (row.kind === "order" ? row.status : "filled");
+  const status = row.kind === "order" ? row.status : "filled";
+  const result = reason ?? (status === "partially_filled" ? "partial" : status);
   return (
     <button
       type="button"
@@ -543,7 +559,7 @@ function Live({
             live={last}
           />
           <div className="flex min-h-0 flex-1 flex-col border-t border-line xl:flex-row">
-            <OrderBook frame={book} failed={failed} />
+            <OrderBook frame={book} failed={failed} tick={market.tick_size} />
             <div className="flex-none border-t border-line xl:w-[260px] xl:border-l xl:border-t-0">
               <section aria-label="Limits" className="border-b border-line p-4">
                 <Facts

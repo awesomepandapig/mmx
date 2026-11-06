@@ -93,6 +93,8 @@ With Kustomize, create an overlay that sets the image tag, like `kustomize/overl
 | `ui.enabled` | `true` | The web UI |
 | `console.replicas` | `2` | `mmx serve`. Replicas share everything through the Kubernetes API |
 | `console.adminPasswordSecret` | Empty | A Secret holding the first password. Empty generates one |
+| `console.oidc` | Off | Connects an OpenID Connect provider at install. See [Identity](#identity) |
+| `console.passwordLogin` | `true` | `false` with a provider means nobody sees a password screen |
 | `marketsYaml`, `webhookUrl` | Empty | Seeds for the first install only. The console owns them after that |
 | `demo.enabled` | `false` | Demo mode for the web UI, with a generated password in the `demo` Secret |
 | `demo.bots.enabled` | `false` | Load bots, which need a `demo-bots` image |
@@ -125,9 +127,12 @@ speaks plain HTTP. **TLS is your job**: terminate it in front of anything that l
 | `mmx-web` | 3000 | Traders, if `ui.enabled` | Behind TLS |
 | `mmx-outbox` | 8092 | `mmx serve` only | Never: it has no auth |
 
-When the console is behind TLS, set its public URL in Settings to the `https://` address. Session
-cookies are only marked `Secure` once that's set, or if your proxy sends `X-Forwarded-Proto: https`.
-A proxy must allow long-lived responses on `/admin/v1/events`, which Activity reads as a stream.
+The console is an internal service: keep it on `ClusterIP`, and put a local domain in front of it. Its
+address comes from each request, so there's nothing to configure. A proxy that terminates TLS must send
+`X-Forwarded-Proto: https`, which marks session cookies `Secure`, and `X-Forwarded-Host` if it rewrites
+`Host`. A forged header can't do harm: the redirect URI is checked by the provider, and these headers
+aren't used to decide who anyone is. A proxy must allow long-lived responses on `/admin/v1/events` and
+`/admin/v1/markets/*/stream`, which are streams.
 
 ## The console
 
@@ -172,11 +177,57 @@ kubectl rollout restart statefulset/mmx-outbox --namespace mmx
 
 On a first setup it then delivers the whole tape so far, so expect a large first batch.
 
-**Single sign-on.** Configure an OpenID Connect provider under Settings, with an issuer, client ID,
-client secret and a list of who may sign in. Register the redirect URI it shows. The list is required
-and everyone on it is a full admin. Emails only count if the provider marks them verified.
-Turning off password login needs a sign-in through the provider first, and `mmx auth password-login on`
-turns it back on. Sign-on is for the console: gateways don't use it.
+### Identity
+
+Connect your OpenID Connect provider, and passwords are only for first install and break-glass. With the
+chart, create a Secret holding the client secret, then:
+
+```yaml
+console:
+  passwordLogin: false
+  oidc:
+    enabled: true
+    issuer: https://id.example
+    clientId: mmx-console
+    clientSecret: { name: mmx-oidc, key: client-secret }
+    displayName: Example SSO
+    groups:
+      admin: [mmx-admins]
+      operator: [mmx-operators]
+      viewer: [mmx-viewers]
+```
+
+People go straight to the provider and never see a password screen. A provider set this way can't be
+changed from the console. Without these values, connect one under Settings instead.
+
+Register `https://<the address people use>/admin/v1/oidc/callback` as the redirect URI. Settings shows the
+exact value. The provider's comparison with that registered URI is what enforces the address, so a request
+that claims another host can't complete a sign-in.
+
+**Roles.** The ID token's `groups` claim, or the one named in `groupsClaim`, maps to a role:
+
+| Role | Can |
+|---|---|
+| `viewer` | Read everything except Settings |
+| `operator` | Also change markets, halt, resume and cancel all |
+| `admin` | Also change webhooks, Settings and sign-in |
+
+Names match exactly, and someone in several groups gets the highest role. Anyone in no listed group is
+refused, and the error names the groups the provider sent. A role is read at sign-in, so changing the
+mapping signs everyone else out. Entra leaves groups out of the token past a limit: that sign-in fails by
+name, and the fix is to send only the groups assigned to the application.
+
+**Recent sign-in.** Rotating the signing secret, deleting a market, removing one by saving the file, cancel
+all, signing out everyone, and changing sign-in settings all need a sign-in in the last 5 minutes. A
+password session types the password again. An OIDC session goes back to the provider with `prompt=login`,
+and the ID token's `auth_time` must be recent, so a provider must send `auth_time`.
+
+**The CLI** uses `MMX_ADMIN_TOKEN`, which is the admin role and isn't asked to sign in again: a script has
+nobody at a prompt, and the token already needs read access to the `mmx-control` Secret. Treat it as the
+break-glass credential. Every write is logged by `mmx serve` with who made it, as `Audit:` lines.
+
+**Break-glass.** With the token, `mmx auth password-login on` turns passwords back on, on any install, and
+`mmx auth reset-password` prints a temporary password. Sign-on is for the console: gateways don't use it.
 
 The Kustomize base doesn't include `mmx`, because only the chart has been brought up to date.
 

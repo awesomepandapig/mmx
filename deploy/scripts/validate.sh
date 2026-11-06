@@ -73,6 +73,10 @@ helm lint "$chart" -f "$chart/values-local.yaml" >/dev/null && pass "helm lint, 
 helm template mmx "$chart" >"$out/default.yaml"
 helm template mmx "$chart" -f "$chart/values-local.yaml" >"$out/local.yaml"
 helm template mmx "$chart" --set ui.enabled=false --set demo.enabled=false >"$out/bare.yaml"
+helm template mmx "$chart" --set console.oidc.enabled=true --set console.passwordLogin=false \
+    --set console.oidc.issuer=https://id.example --set console.oidc.clientId=mmx \
+    --set console.oidc.clientSecret.name=mmx-oidc --set "console.oidc.groups.admin={ops-admin}" \
+    --set "console.oidc.groups.viewer={support,audit}" >"$out/oidc.yaml"
 helm template mmx "$chart" --set demo.enabled=true --set demo.bots.enabled=true \
     --set webhookUrl=https://game.example/webhook \
     --set consumers.observer.enabled=true >"$out/full.yaml"
@@ -92,6 +96,15 @@ refuse "no password is written down in values" deploy/helm/mmx/values.yaml "pass
 expect "turning on the demo generates its password" "$out/full.yaml" "DEMO_PASSWORD"
 expect "the webhook URL can be seeded" "$out/full.yaml" "WEBHOOK_URL: \"https://game.example/webhook\""
 expect_line "the console is in the chart" "$out/default.yaml" "name: mmx-console"
+refuse "no provider is connected by default" "$out/default.yaml" "MMX_OIDC_ISSUER"
+expect "a provider can be connected at install" "$out/oidc.yaml" "MMX_OIDC_ISSUER"
+expect "the client secret comes from a Secret" "$out/oidc.yaml" "name: mmx-oidc"
+expect "groups reach each role" "$out/oidc.yaml" 'value: "support,audit"'
+expect "passwords can start off" "$out/oidc.yaml" "MMX_PASSWORD_LOGIN"
+rejects "a provider needs an admin group" --set console.oidc.enabled=true \
+    --set console.oidc.issuer=https://id.example --set console.oidc.clientId=mmx \
+    --set console.oidc.clientSecret.name=mmx-oidc
+rejects "passwords can't be off with no provider" --set console.passwordLogin=false
 expect "RBAC names the one ConfigMap" "$out/default.yaml" 'resourceNames: ["mmx-config"]'
 expect "RBAC names the one Secret" "$out/default.yaml" 'resourceNames: ["mmx-control"]'
 refuse "the console can't create or list anything" "$out/default.yaml" 'verbs: ["list"'

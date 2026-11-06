@@ -79,6 +79,14 @@
   }
 }
 
+/* The browser's own arrow is the one thing here that doesn't match. */
+.select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='m1 1 4 4 4-4' fill='none' stroke='%238f92ad' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-position: right 0.65rem center;
+  background-repeat: no-repeat;
+  background-size: 10px 6px;
+}
+
 @keyframes skeleton {
   50% {
     opacity: 0.45;

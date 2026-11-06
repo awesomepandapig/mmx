@@ -47,9 +47,7 @@ export function Card({ className, children }: { className?: string; children: Re
 }
 
 export function Page({ className, children }: { className?: string; children: ReactNode }) {
-  return (
-    <div className={cn("mx-auto w-full max-w-[1312px] p-4 lg:p-6", className)}>{children}</div>
-  );
+  return <div className={cn("w-full p-4 lg:p-6", className)}>{children}</div>;
 }
 
 export function PageHeader({
@@ -224,7 +222,7 @@ export function Select({
     <select
       aria-label={label}
       {...props}
-      className={cn(inputClass, "w-auto pr-7 font-medium", className)}
+      className={cn(inputClass, "select w-auto appearance-none pr-8", className)}
     >
       {children}
     </select>

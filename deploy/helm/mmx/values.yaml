@@ -127,6 +127,28 @@ console:
   adminPasswordSecret:
     name: ""
     key: password
+  # Set this to false with `oidc.enabled`, and people only ever see the provider. It's a first-install
+  # default: `mmx auth password-login on` still works as a way back in, and wins over this value.
+  passwordLogin: true
+  # Connects an OpenID Connect provider at install time. It can't be changed from the console then.
+  # Register https://<the address people use>/admin/v1/oidc/callback with the provider.
+  oidc:
+    enabled: false
+    issuer: ""
+    clientId: ""
+    # A Secret you create, holding the client secret.
+    clientSecret:
+      name: ""
+      key: client-secret
+    # The name on the sign-in button.
+    displayName: ""
+    # The ID token claim holding the person's groups.
+    groupsClaim: groups
+    # Provider groups for each role, by exact name. Anyone in none of them is refused.
+    groups:
+      admin: []
+      operator: []
+      viewer: []
   service:
     type: ClusterIP
     annotations: {}

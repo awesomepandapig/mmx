@@ -64,4 +64,7 @@ auth (better-auth + Express) --> Postgres; not connected to api yet
 - `tracing`'s `max_level_*` features are ignored in release builds; use `release_max_level_*`.
 - `tests/` is in `.gitignore`, so new top-level test directories won't show up in git without `-f`.
 - `mmx` embeds `console/dist` when it compiles, so rebuild the console first, then `mmx`.
+- The console's browser only ever talks to `mmx serve`. Its book comes from `feed.rs`, which subscribes to one market's `l2.*`, `ticker.*` and `candles.*` while someone watches it, and seeds levels from the tape because `level2` keeps no snapshot anyone can ask for.
+- `/admin/v1/events` is a sample, capped per table per second, so its cost doesn't grow with the order rate. Don't add a route that reads every row.
+- Roles are enforced in one table, `required_role` in `auth.rs`, and unknown routes take admin. `needs_step_up` beside it lists what needs a recent sign-in.
 - Port 8080 is used by another project on the owner's Mac. `tools/scripts/sbx.py` uses 8090 there.

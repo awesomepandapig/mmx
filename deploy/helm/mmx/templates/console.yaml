@@ -4,6 +4,16 @@
 {{- $configName := include "mmx.configName" . -}}
 {{- $secretName := include "mmx.controlSecretName" . -}}
 {{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName -}}
+{{- if $console.oidc.enabled }}
+  {{- if not (and $console.oidc.issuer $console.oidc.clientId $console.oidc.clientSecret.name) }}
+    {{- fail "console.oidc needs issuer, clientId and clientSecret.name" }}
+  {{- end }}
+  {{- if not $console.oidc.groups.admin }}
+    {{- fail "console.oidc.groups.admin can't be empty, or nobody could run this install" }}
+  {{- end }}
+{{- else if not $console.passwordLogin }}
+  {{- fail "console.passwordLogin can only be false with console.oidc.enabled" }}
+{{- end }}
 # The admin token gateways and the console share, generated once. The console adds its own keys here,
 # so an upgrade writes back everything that's there. Under `helm template` and a client-side dry run
 # `lookup` is empty, so a value shown there is never the real one.
@@ -128,6 +138,33 @@ spec:
                 secretKeyRef:
                   name: {{ . }}
                   key: {{ $console.adminPasswordSecret.key }}
+            {{- end }}
+            {{- if not $console.passwordLogin }}
+            - name: MMX_PASSWORD_LOGIN
+              value: "false"
+            {{- end }}
+            {{- if $console.oidc.enabled }}
+            - name: MMX_OIDC_ISSUER
+              value: {{ $console.oidc.issuer | quote }}
+            - name: MMX_OIDC_CLIENT_ID
+              value: {{ $console.oidc.clientId | quote }}
+            - name: MMX_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $console.oidc.clientSecret.name }}
+                  key: {{ $console.oidc.clientSecret.key }}
+            {{- with $console.oidc.displayName }}
+            - name: MMX_OIDC_DISPLAY_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            - name: MMX_OIDC_GROUPS_CLAIM
+              value: {{ $console.oidc.groupsClaim | quote }}
+            - name: MMX_OIDC_ADMIN_GROUPS
+              value: {{ join "," $console.oidc.groups.admin | quote }}
+            - name: MMX_OIDC_OPERATOR_GROUPS
+              value: {{ join "," $console.oidc.groups.operator | quote }}
+            - name: MMX_OIDC_VIEWER_GROUPS
+              value: {{ join "," $console.oidc.groups.viewer | quote }}
             {{- end }}
             - name: MMX_BIND
               value: "0.0.0.0:{{ $console.port }}"

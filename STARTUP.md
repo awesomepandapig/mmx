@@ -232,7 +232,8 @@ target/release/mmx webhook listen --port 8095 --secret local-development-secret 
    password is only printed on the first start. `MMX_ADMIN_TOKEN=dev target/release/mmx auth
    reset-password` issues another.
 2. Under Markets, choose New market, and create `IRON` with a tick size of `0.01`.
-3. Open Activity, then in another terminal trade between two players:
+3. Search for `IRON` at the top of the console, which opens its market page, then in another terminal
+   trade between two players:
 
    ```sh
    tools/demo/mmx_client.py --symbol IRON trade
@@ -247,7 +248,8 @@ touch `tools/local`, which only provides the first copy. `rm -rf .run/mmx` start
 scratch, including its password. `tools/scripts/sbx.py restart outbox` applies a saved webhook.
 
 `console/` has `npm run dev` on port 5190, which proxies the API. Set `MMX_URL` to use a server other
-than `http://127.0.0.1:8093`.
+than `http://127.0.0.1:8093`, in the environment or in `console/.env.local`, which also repoints a dev
+server that's already running.
 
 To send orders by hand, name a player and a unique `client_order_id`. Both are UUIDs:
 
