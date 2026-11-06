@@ -501,10 +501,7 @@ async fn reload_everywhere(state: &AppState, expected: &[(String, bool)]) -> (St
         return (code, body);
     }
 
-    let (file, _) = match read_file(state).await {
-        Ok(read) => read,
-        Err(_) => (MarketsFile::default(), String::new()),
-    };
+    let (file, _) = read_file(state).await.unwrap_or_default();
     let live = state.up.live_markets().await;
     let applied = live.iter().all(|(_, markets)| {
         markets

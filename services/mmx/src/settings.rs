@@ -258,6 +258,10 @@ fn webhook_state(
             _ => "incomplete",
         };
     };
+    // One that started with no webhook certainly isn't using this one.
+    if running.is_some_and(|position| position.configured == Some(false)) {
+        return "restart_required";
+    }
     match running.and_then(|position| position.config_id.as_deref()) {
         Some(id) if id == webhook_fingerprint(url, secret) => "applied",
         Some(_) => "restart_required",
@@ -370,6 +374,12 @@ mod tests {
         let stale = position(Some("different"), url, Some(true));
         assert_eq!(webhook_state(url, secret, Some(&stale)), "restart_required");
 
+        let unconfigured = position(None, None, Some(false));
+        assert_eq!(
+            webhook_state(url, secret, Some(&unconfigured)),
+            "restart_required"
+        );
+
         let old_build = position(None, None, None);
         assert_eq!(webhook_state(url, secret, Some(&old_build)), "unknown");
         assert_eq!(webhook_state(url, secret, None), "unknown");
@@ -377,6 +387,16 @@ mod tests {
         assert_eq!(webhook_state(url, None, None), "incomplete");
         let own = position(Some("x"), url, Some(true));
         assert_eq!(webhook_state(None, None, Some(&own)), "from_environment");
+    }
+
+    // From Python's hashlib, and the same value is checked in `services/outbox`:
+    // hashlib.sha256(b"https://game.example/fills\0secret").hexdigest()[:16]
+    #[test]
+    fn the_fingerprint_matches_the_outbox() {
+        assert_eq!(
+            webhook_fingerprint("https://game.example/fills", "secret"),
+            "7beb90646192c9b7"
+        );
     }
 
     #[test]

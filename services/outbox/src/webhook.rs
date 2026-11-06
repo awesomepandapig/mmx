@@ -91,6 +91,17 @@ pub fn fill_id(position: i64, frame: &[u8]) -> String {
     hex(&hash.finalize()[..16])
 }
 
+/// A fingerprint of the settings in use, which `mmx serve` compares with what's saved. It must match
+/// `webhook_fingerprint` in `services/mmx`. It's cut short, and a generated secret has 256 bits, so
+/// this can't be used to recover one.
+pub fn config_id(url: &str, secret: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(url.as_bytes());
+    hash.update([0]);
+    hash.update(secret.as_bytes());
+    hex(&hash.finalize()[..8])
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -200,4 +211,15 @@ pub fn hmac_hex(secret: &[u8], message: &[&[u8]]) -> String {
 /// fresh on every attempt, so a game can refuse old replays without refusing long retries.
 pub fn signature(secret: &[u8], timestamp: u64, body: &[u8]) -> String {
     format!("v1={}", hmac_hex(secret, &[timestamp.to_string().as_bytes(), b".", body]))
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    // From Python's hashlib, and the same value is checked in `services/mmx`.
+    #[test]
+    fn config_id_matches_what_mmx_computes() {
+        assert_eq!(config_id("https://game.example/fills", "secret"), "7beb90646192c9b7");
+    }
 }

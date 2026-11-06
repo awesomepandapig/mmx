@@ -1,0 +1,56 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --canvas: 246 245 240;
+    --surface: 255 255 255;
+    --raised: 239 238 232;
+    --line: 224 223 215;
+    --ink: 18 20 18;
+    --muted: 96 101 95;
+    /* In light mode the bright colour can't carry text, so the accent is ink on lime only where
+       it's a fill. */
+    --accent: 217 242 75;
+    --on-accent: 18 20 18;
+    --good: 22 121 72;
+    --warn: 158 98 0;
+    --bad: 196 44 44;
+    color-scheme: light;
+  }
+
+  .dark {
+    --canvas: 12 15 13;
+    --surface: 20 24 21;
+    --raised: 30 35 31;
+    --line: 41 47 43;
+    --ink: 236 239 232;
+    --muted: 146 154 147;
+    --accent: 217 242 75;
+    --on-accent: 18 20 18;
+    --good: 86 214 148;
+    --warn: 240 184 76;
+    --bad: 255 124 118;
+    color-scheme: dark;
+  }
+
+  html {
+    @apply bg-canvas text-ink;
+    font-feature-settings: "cv11", "ss03";
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    @apply min-h-dvh font-sans text-[15px] leading-6;
+  }
+
+  :focus-visible {
+    @apply outline outline-2 outline-offset-2 outline-ink;
+  }
+
+  /* Numbers line up in tables, so columns of prices can be scanned. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}

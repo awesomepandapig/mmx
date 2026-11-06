@@ -175,10 +175,10 @@ impl LocalStore {
         }
         fs::create_dir_all(&self.dir)?;
         let mut data = doc.data.clone();
-        if let Some(text) = data.remove(MARKETS_KEY) {
-            if current.data.get(MARKETS_KEY) != Some(&text) {
-                markets::replace(&self.markets_file, &text).map_err(StoreError::Failed)?;
-            }
+        if let Some(text) = data.remove(MARKETS_KEY)
+            && current.data.get(MARKETS_KEY) != Some(&text)
+        {
+            markets::replace(&self.markets_file, &text).map_err(StoreError::Failed)?;
         }
         let text = serde_json::to_string_pretty(&data)
             .map_err(|err| StoreError::Failed(format!("can't serialize the settings: {err}")))?;
