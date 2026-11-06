@@ -1,14 +1,14 @@
 //! A small HTTP endpoint for the engine's startup check and for operators.
 //!
-//! - `GET /position`: the durable position, as JSON
+//! - `GET /position`: the durable position and the webhook settings in use, as JSON
 //! - `GET /journal?from=P&limit=N`: journal records after position `P`, in the journal's own format
 //! - `GET /healthz`: 200 while the process is up
-//! - `GET /readyz`: 200 while delivery is allowed, otherwise 503
+//! - `GET /readyz`: 200 while delivery is allowed, otherwise 503, including with no webhook set
 //!
 //! It only starts once the journal has been recovered, so every answer reflects the disk.
 
 use crate::journal::JournalReader;
-use crate::outbox::Shared;
+use crate::outbox::{Position, Shared};
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -16,9 +16,28 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
+
 const MAX_REQUEST: usize = 4096;
 const TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_LIMIT: usize = 100_000;
+
+/// What this process started with. The URL isn't secret, and `config_id` lets `mmx serve` tell
+/// whether saved settings have been picked up, without either side showing the signing secret.
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct WebhookStatus {
+    pub configured: bool,
+    pub webhook_url: Option<String>,
+    pub config_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PositionReply {
+    #[serde(flatten)]
+    position: Position,
+    #[serde(flatten)]
+    webhook: WebhookStatus,
+}
 
 struct Response {
     status: &'static str,
@@ -52,13 +71,14 @@ fn journal_after(dir: &Path, shared: &Shared, from: i64, limit: usize) -> io::Re
     Ok(body)
 }
 
-fn route(target: &str, dir: &Path, shared: &Shared) -> Response {
+fn route(target: &str, dir: &Path, shared: &Shared, webhook: &WebhookStatus) -> Response {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     match path {
         "/position" => Response {
             status: "200 OK",
             content_type: "application/json",
-            body: serde_json::to_vec(&shared.position()).expect("position serializes"),
+            body: serde_json::to_vec(&PositionReply { position: shared.position(), webhook: webhook.clone() })
+                .expect("position serializes"),
         },
         "/journal" => {
             let from = query_value(query, "from").unwrap_or(0);
@@ -69,7 +89,7 @@ fn route(target: &str, dir: &Path, shared: &Shared) -> Response {
             }
         }
         "/healthz" => Response::text("200 OK", "ok"),
-        "/readyz" if shared.may_deliver() => Response::text("200 OK", "ready"),
+        "/readyz" if webhook.configured && shared.may_deliver() => Response::text("200 OK", "ready"),
         "/readyz" => Response::text("503 Service Unavailable", "not ready"),
         _ => Response::text("404 Not Found", "not found"),
     }
@@ -93,11 +113,11 @@ fn read_request_target(stream: &mut TcpStream) -> io::Result<Option<String>> {
     })
 }
 
-fn handle(mut stream: TcpStream, dir: &Path, shared: &Shared) -> io::Result<()> {
+fn handle(mut stream: TcpStream, dir: &Path, shared: &Shared, webhook: &WebhookStatus) -> io::Result<()> {
     stream.set_read_timeout(Some(TIMEOUT))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
     let response = match read_request_target(&mut stream)? {
-        Some(target) => route(&target, dir, shared),
+        Some(target) => route(&target, dir, shared, webhook),
         None => Response::text("405 Method Not Allowed", "only GET is supported"),
     };
     let head = format!(
@@ -111,9 +131,9 @@ fn handle(mut stream: TcpStream, dir: &Path, shared: &Shared) -> io::Result<()> 
 }
 
 /// Serves until the process exits, one request at a time.
-pub fn serve(listener: &TcpListener, dir: PathBuf, shared: Arc<Shared>) {
+pub fn serve(listener: &TcpListener, dir: PathBuf, shared: Arc<Shared>, webhook: WebhookStatus) {
     for stream in listener.incoming() {
-        let result = stream.and_then(|stream| handle(stream, &dir, &shared));
+        let result = stream.and_then(|stream| handle(stream, &dir, &shared, &webhook));
         if let Err(error) = result {
             eprintln!("status request failed: {error}");
         }

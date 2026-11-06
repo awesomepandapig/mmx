@@ -442,7 +442,8 @@ fn the_status_endpoint_reports_the_durable_position_and_serves_the_tail() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
     let address = listener.local_addr().expect("address");
     let (status_dir, status_shared) = (dir.0.clone(), outbox.shared());
-    thread::spawn(move || status::serve(&listener, status_dir, status_shared));
+    let webhook = status::WebhookStatus { configured: true, ..Default::default() };
+    thread::spawn(move || status::serve(&listener, status_dir, status_shared, webhook));
 
     // Undurable frames must not count.
     for (position, frame) in &tape {

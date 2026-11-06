@@ -1,7 +1,7 @@
 # Sample markets for `tools/scripts/sbx.py up --cluster`. The format is described in
-# services/api/rest/markets.yaml. After editing, apply it with:
+# services/api/rest/markets.yaml. Edit them in the console, or edit this file and apply it with:
 #
-#   curl -X POST localhost:8000/api/v1/admin/markets/reload
+#   target/release/mmx markets reload
 markets:
   - symbol: ITEM
     tick_size: "0.01"

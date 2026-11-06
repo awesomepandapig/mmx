@@ -10,8 +10,13 @@ Linux x86 is the first-party target, and images are also built for arm64.
 | `scripts/validate.sh` | Static checks, with no cluster or containers |
 | `scripts/local-images.sh` | Image builds with Apple `container` |
 
-**None of this has been run yet.** The manifests, chart and scripts pass static checks only. No image
-has been built, and nothing has been installed on a cluster. See [First real run](#first-real-run).
+**Most of this hasn't been run yet.** One part has: on a one-node `container cluster`, the `mmx` image
+was built with `local-images.sh` and the chart installed. The console ran there with its real
+ServiceAccount, and a saved market reached two stand-in gateway pods in about 70 seconds. Those pods
+read the real mounted ConfigMap, but they weren't real gateways. RBAC, seeding, and keeping edits across
+`helm upgrade`, uninstall and reinstall were checked on that API server. Every other image, the rest of
+the chart, OIDC against a real provider and NetworkPolicy enforcement have only had static checks.
+See [First real run](#first-real-run).
 
 ## Images
 
@@ -27,7 +32,8 @@ REGISTRY=registry.example/mmx TAG=0.1.0 docker buildx bake -f deploy/docker/dock
 |---|---|
 | `node` | JRE and `aeron-all-1.54.0.jar`, as a cluster member or, with `driver`, a media driver |
 | `matching-engine` | The engine in the `dist` profile with `silent`, as benchmarked |
-| `api`, `websocket`, `market-data`, `trade-reporter`, `observer` | One Rust service each |
+| `api`, `websocket`, `market-data`, `trade-reporter`, `outbox`, `observer` | One Rust service each |
+| `mmx` | `mmx serve` and the CLI, with the console built in. It needs no Aeron and no media driver |
 | `tools` | Every `sbx-*` tool, for debugging a running cluster |
 | `web`, `docs` | The Remix apps. `VITE_` values are baked in, so set them when building |
 | `auth` | Built for now, but not in the chart, because it's being retired |
@@ -69,10 +75,15 @@ A NetworkPolicy does nothing without a CNI that enforces it, so check yours befo
 ## Installing
 
 ```sh
-helm install mmx deploy/helm/mmx --namespace mmx --create-namespace \
-  --set image.tag=0.1.0 --set-file marketsYaml=markets.yaml
+helm install mmx deploy/helm/mmx --namespace mmx --create-namespace --set image.tag=0.1.0
 helm test mmx --namespace mmx     # sends an order through a gateway
+kubectl logs --namespace mmx --selector app.kubernetes.io/component=console | grep 'first-run'
+kubectl port-forward --namespace mmx service/mmx-console 8093:8093
 ```
+
+Open <http://localhost:8093>, sign in with the logged password and choose a real one. See
+[The console](#the-console). A port-forward is fine for this first step, and exposing it properly is
+up to you.
 
 With Kustomize, create an overlay that sets the image tag, like `kustomize/overlays/local`, and run
 `kubectl apply -k` on it. The base is one stack per namespace, with three members.
@@ -80,21 +91,94 @@ With Kustomize, create an overlay that sets the image tag, like `kustomize/overl
 | Value | Default | Meaning |
 |---|---|---|
 | `ui.enabled` | `true` | The web UI |
-| `demo.enabled` | `true` | Dummy credentials and demo mode. Turn this off for real trading |
+| `console.replicas` | `2` | `mmx serve`. Replicas share everything through the Kubernetes API |
+| `console.adminPasswordSecret` | Empty | A Secret holding the first password. Empty generates one |
+| `marketsYaml`, `webhookUrl` | Empty | Seeds for the first install only. The console owns them after that |
+| `demo.enabled` | `false` | Demo mode for the web UI, with a generated password in the `demo` Secret |
 | `demo.bots.enabled` | `false` | Load bots, which need a `demo-bots` image |
 | `networkPolicy.gameServers` | Pods labeled `mmx.io/role=game-server` | Who may reach gateways |
 | `cluster.leaderHeartbeatTimeout` | `500ms` | How fast a leader is replaced, along with `electionTimeout` |
 | `cluster.archiveSyncLevel` | `1` | A commit is on a quorum's disks, which must survive power loss. 0 relies on replication, and 2 also syncs metadata |
 | `cluster.engine.maxOrders` | `1000000` | Sets the engine's memory, as shown in `STARTUP.md` |
 | `cluster.persistence.size` | `200Gi` | The tape is kept forever by default |
-| `secrets.existingSecret` | Empty | A plain Kubernetes secret, loaded as environment variables |
+| `secrets.existingSecret` | Empty | A plain Kubernetes secret you create, loaded as environment variables |
 
-Set `WEBHOOK_SECRET` and `WS_PLAYER_TOKEN_SECRET` in that secret, or in `secrets.values`. The second
-must be at least 32 bytes, or `websocket` turns off the user channel. `outbox` is off until you set
-`consumers.outbox.env.WEBHOOK_URL` and `WEBHOOK_SECRET`.
+Secrets never go in a values file. Create `existingSecret` yourself, with `WS_PLAYER_TOKEN_SECRET` in
+it, which must be at least 32 bytes or `websocket` turns off the user channel. The admin token is
+generated for you, and the webhook's signing secret comes from the console.
 
 Expose gateways however suits your network, through `gateway.service`, then add your game servers to
 `networkPolicy.gameServers`. Pods are one option, and an `ipBlock` works for servers outside the cluster.
+The console's pods can always reach gateways, and they're the only thing that can reach the outbox's
+status port.
+
+## Ports and TLS
+
+The chart creates Services and no Ingress, so what's exposed, and how, is your choice. Every binary
+speaks plain HTTP. **TLS is your job**: terminate it in front of anything that leaves the cluster.
+
+| Service | Port | Who needs it | Exposing it |
+|---|---|---|---|
+| `mmx-console` | 8093 | Operators, for the console and CLI | Behind TLS, and ideally a VPN or an allow list |
+| `mmx-gateway` | 8000 | Game servers only | Never to players: it trusts `x-player-id` |
+| `mmx-websocket` | 8080 | Game clients | Behind TLS |
+| `mmx-web` | 3000 | Traders, if `ui.enabled` | Behind TLS |
+| `mmx-outbox` | 8092 | `mmx serve` only | Never: it has no auth |
+
+When the console is behind TLS, set its public URL in Settings to the `https://` address. Session
+cookies are only marked `Secure` once that's set, or if your proxy sends `X-Forwarded-Proto: https`.
+A proxy must allow long-lived responses on `/admin/v1/events`, which Activity reads as a stream.
+
+## The console
+
+`mmx serve` is the control plane, and the console is built into it, so there's no extra pod. The CLI
+uses the same `/admin/v1` API with `MMX_ADMIN_TOKEN`, which the chart generates once and keeps across
+upgrades in the `mmx-control` Secret. Point the CLI at a port-forward:
+
+```sh
+export MMX_URL=http://127.0.0.1:8093
+export MMX_ADMIN_TOKEN=$(kubectl get secret mmx-control --namespace mmx \
+  -o jsonpath='{.data.MMX_ADMIN_TOKEN}' | base64 -d)
+```
+
+**First password.** There's no default. The first start reads the Secret in
+`console.adminPasswordSecret`, or generates a password and logs it once. With two replicas it's in the
+log of whichever got there first, and the selector above reads both. It only opens first-run setup.
+Only a hash is stored. `mmx auth reset-password` issues a new temporary one if the password is lost.
+
+**What it stores.** One ConfigMap, `mmx-config`, and one Secret, `mmx-control`, through a ServiceAccount
+that can only `get` and `patch` those two by name. Writes are conditional, so a `kubectl apply` in
+between is a conflict and not a lost edit. Both carry `helm.sh/resource-policy: keep`, so uninstalling
+leaves them, and the next install adopts them. To start again, delete both by hand.
+
+**Markets.** The console owns markets after install. `marketsYaml` seeds the ConfigMap only if it's
+missing, using `lookup`, so `helm upgrade` can't overwrite edits. `lookup` is empty under `helm template`
+and client-side dry runs, so tools built on those, such as Argo CD, show the seed and a fresh token
+instead. Use `kubectl apply` or the console for markets there, and don't let them manage these two
+objects.
+
+An applied ConfigMap shows up in the console. The kubelet takes up to about a minute to deliver any
+change to gateways, so a save reads "saved, reaching gateways" until they have it. `mmx serve` checks
+every 5 seconds and reloads any gateway that differs. Halts live in Valkey, apart from the file, so a
+reload can't lift one.
+
+**Webhooks.** Set the URL and generate a signing secret in the console. The secret is shown once. The
+outbox reads both at start, and waits without them, so restart it to apply a change. The console shows
+whether that's still needed, and the exact command:
+
+```sh
+kubectl rollout restart statefulset/mmx-outbox --namespace mmx
+```
+
+On a first setup it then delivers the whole tape so far, so expect a large first batch.
+
+**Single sign-on.** Configure an OpenID Connect provider under Settings, with an issuer, client ID,
+client secret and a list of who may sign in. Register the redirect URI it shows. The list is required
+and everyone on it is a full admin. Emails only count if the provider marks them verified.
+Turning off password login needs a sign-in through the provider first, and `mmx auth password-login on`
+turns it back on. Sign-on is for the console: gateways don't use it.
+
+The Kustomize base doesn't include `mmx`, because only the chart has been brought up to date.
 
 ## How the pods fit together
 
@@ -199,7 +283,7 @@ PLATFORMS=linux/amd64 docker buildx bake -f deploy/docker/docker-bake.hcl core -
 
 # 2. The chart installs, and an order goes through
 kind create cluster --name mmx --config deploy/kind/ci.yaml
-for image in node matching-engine api websocket level2 ticker candles trade-reporter; do
+for image in node matching-engine api mmx outbox websocket market-data trade-reporter; do
   kind load docker-image "mmx/$image:dev" --name mmx
 done
 helm install mmx deploy/helm/mmx --namespace mmx --create-namespace \

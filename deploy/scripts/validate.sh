@@ -73,9 +73,9 @@ helm lint "$chart" -f "$chart/values-local.yaml" >/dev/null && pass "helm lint, 
 helm template mmx "$chart" >"$out/default.yaml"
 helm template mmx "$chart" -f "$chart/values-local.yaml" >"$out/local.yaml"
 helm template mmx "$chart" --set ui.enabled=false --set demo.enabled=false >"$out/bare.yaml"
-helm template mmx "$chart" --set demo.bots.enabled=true --set consumers.outbox.enabled=true \
-    --set consumers.outbox.env.WEBHOOK_URL=https://game.example/webhook \
-    --set consumers.observer.enabled=true --set secrets.values.WEBHOOK_SECRET=x >"$out/full.yaml"
+helm template mmx "$chart" --set demo.enabled=true --set demo.bots.enabled=true \
+    --set webhookUrl=https://game.example/webhook \
+    --set consumers.observer.enabled=true >"$out/full.yaml"
 helm template mmx "$chart" --set questdbRebuild.enabled=true \
     --show-only templates/questdb-rebuild.yaml >"$out/rebuild.yaml"
 helm template other "$chart" --namespace elsewhere >"$out/renamed.yaml"
@@ -87,7 +87,20 @@ expect "pod names stay stable before ready" "$out/default.yaml" "publishNotReady
 expect "members start together" "$out/default.yaml" "podManagementPolicy: Parallel"
 expect "threads are pinned in production" "$out/default.yaml" 'PIN_THREADS: "true"'
 expect_line "the UI is on by default" "$out/default.yaml" "name: mmx-web"
-expect_line "the demo is on by default" "$out/default.yaml" "name: mmx-demo"
+refuse "the demo is off by default" "$out/default.yaml" "mmx-demo"
+refuse "no password is written down in values" deploy/helm/mmx/values.yaml "password: demo"
+expect "turning on the demo generates its password" "$out/full.yaml" "DEMO_PASSWORD"
+expect "the webhook URL can be seeded" "$out/full.yaml" "WEBHOOK_URL: \"https://game.example/webhook\""
+expect_line "the console is in the chart" "$out/default.yaml" "name: mmx-console"
+expect "RBAC names the one ConfigMap" "$out/default.yaml" 'resourceNames: ["mmx-config"]'
+expect "RBAC names the one Secret" "$out/default.yaml" 'resourceNames: ["mmx-control"]'
+refuse "the console can't create or list anything" "$out/default.yaml" 'verbs: ["list"'
+refuse "the chart makes no Ingress" "$out/default.yaml" "kind: Ingress"
+expect "the admin token is generated" "$out/default.yaml" "MMX_ADMIN_TOKEN:"
+expect "uninstalling keeps what operators made" "$out/default.yaml" "helm.sh/resource-policy: keep"
+expect "every gateway can be found" "$out/default.yaml" "name: mmx-gateway-pods"
+expect "gateways only mount the markets" "$out/default.yaml" "path: markets.yaml"
+expect "the console reaches the outbox" "$out/default.yaml" "MMX_OUTBOX_URL"
 expect "only game servers reach gateways" "$out/default.yaml" "mmx.io/role: game-server"
 refuse_line "the UI flag removes the UI" "$out/bare.yaml" "name: mmx-web"
 refuse "the demo flag removes the demo" "$out/bare.yaml" "mmx-demo"
@@ -109,9 +122,6 @@ rejects "fractional CPUs are refused when guaranteed" --set cluster.engine.resou
 rejects "pinning without exclusive CPUs is refused" --set cluster.guaranteed=false
 rejects "an unknown anti-affinity is refused" --set cluster.antiAffinity=sometimes
 rejects "an unknown report source is refused" --set reportSource=3
-rejects "outbox without a webhook is refused" --set consumers.outbox.enabled=true
-rejects "outbox without a secret is refused" --set consumers.outbox.enabled=true \
-    --set consumers.outbox.env.WEBHOOK_URL=https://game.example/webhook
 
 kustomize_build deploy/kustomize/base >"$out/base.yaml"
 kustomize_build deploy/kustomize/overlays/local >"$out/overlay.yaml"

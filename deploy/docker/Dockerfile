@@ -72,12 +72,19 @@ RUN --mount=type=cache,id=mmx-cargo-index-${TARGETARCH},target=/usr/local/cargo/
     --mount=type=cache,id=mmx-gradle-${TARGETARCH},target=/root/.gradle,sharing=locked \
     cargo chef cook --release --workspace --locked --recipe-path /recipe.json
 
+# The console is embedded in `mmx` by its build script, so it's built before any Rust is.
+FROM ${NODE_IMAGE} AS console-build
+WORKDIR /app
+COPY console/ ./
+RUN --mount=type=cache,id=mmx-npm,target=/root/.npm,sharing=locked npm ci && npm run build
+
 FROM deps-release AS sources-release
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY services services
 COPY tools/Cargo.toml tools/Cargo.toml
 COPY tools/src tools/src
+COPY --from=console-build /app/dist console/dist
 
 # Building the whole workspace once means one Cargo run per architecture however many images are
 # built, and one set of unified features, so the dependencies above are always reused. Incremental

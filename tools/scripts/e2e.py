@@ -692,7 +692,7 @@ def check_exactly_once(game, orders, start_position):
 
 
 def outbox_position():
-    address = sbx.read_env_file(sbx.OUTBOX_ENV_FILE)["OUTBOX_HTTP"]
+    address = sbx.outbox_settings()["OUTBOX_HTTP"]
     with urllib.request.urlopen(f"http://{address}/position", timeout=5) as response:
         return json.loads(response.read())
 
@@ -737,7 +737,7 @@ def preflight():
 
 def run(target):
     preflight()
-    settings = sbx.read_env_file(sbx.OUTBOX_ENV_FILE)
+    settings = sbx.outbox_settings()
     game = Game(settings["WEBHOOK_URL"], settings["WEBHOOK_SECRET"])
     threading.Thread(target=game.serve_forever, daemon=True).start()
     nats = NatsWatch([f"l2.{SYMBOL}", f"ticker.{SYMBOL}", f"candles.{SYMBOL}"])

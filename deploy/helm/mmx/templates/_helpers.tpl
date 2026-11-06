@@ -140,6 +140,24 @@ capabilities:
 {{- end }}
 {{- end -}}
 
+{{/* The one ConfigMap and one Secret the console may write. */}}
+{{- define "mmx.configName" -}}
+{{- printf "%s-config" (include "mmx.fullname" .) -}}
+{{- end -}}
+
+{{- define "mmx.controlSecretName" -}}
+{{- printf "%s-control" (include "mmx.fullname" .) -}}
+{{- end -}}
+
+{{/* Only this key, because the same Secret holds the console's password hash and signing keys. */}}
+{{- define "mmx.adminTokenEnv" -}}
+- name: MMX_ADMIN_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ include "mmx.controlSecretName" . }}
+      key: MMX_ADMIN_TOKEN
+{{- end -}}
+
 {{- define "mmx.secretName" -}}
 {{- if .Values.secrets.existingSecret -}}
 {{- .Values.secrets.existingSecret -}}
@@ -233,16 +251,6 @@ periodSeconds: 5
 {{- end -}}
 {{- if not (has .Values.cluster.antiAffinity (list "required" "preferred")) -}}
 {{- fail "cluster.antiAffinity must be required or preferred" -}}
-{{- end -}}
-{{- with .Values.consumers.outbox -}}
-{{- if .enabled -}}
-{{- if not (dig "env" "WEBHOOK_URL" "" .) -}}
-{{- fail "consumers.outbox.env.WEBHOOK_URL is required when outbox is enabled" -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- if and .Values.consumers.outbox.enabled (not .Values.secrets.existingSecret) (not (hasKey .Values.secrets.values "WEBHOOK_SECRET")) -}}
-{{- fail "outbox needs WEBHOOK_SECRET, in secrets.values or secrets.existingSecret" -}}
 {{- end -}}
 {{- if ge (int .Values.reportSource) $replicas -}}
 {{- fail "reportSource must be a cluster member" -}}

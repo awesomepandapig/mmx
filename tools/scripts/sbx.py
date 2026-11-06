@@ -6,12 +6,14 @@
     tools/scripts/sbx.py down        stop the Rust services (add --all for infrastructure too)
     tools/scripts/sbx.py status      show what's running
     tools/scripts/sbx.py logs matching-engine     follow a service's log
+    tools/scripts/sbx.py restart outbox   on a cluster, restart one service
     tools/scripts/sbx.py verify      restart the engine, run seeded load and check invariants
     tools/scripts/sbx.py observe     start Grafana, Prometheus and an OTLP collector on localhost
     tools/scripts/sbx.py e2e         on a running cluster, follow a real trade to a game webhook
 
 Build first with `cargo build --workspace --release`. Cluster mode also needs
-`cargo build -p matching-engine --profile dist --features silent`.
+`cargo build -p matching-engine --profile dist --features silent`, and for the console,
+`npm ci && npm run build` in console/ before building `mmx`.
 """
 
 import argparse
@@ -94,6 +96,15 @@ CLUSTER_SHARED_MEMORY_GB = 5
 OUTBOX_DIR = RUN / "outbox"
 CHECKPOINT_DIR = RUN / "checkpoints"
 OUTBOX_ENV_FILE = ROOT / "tools" / "local" / "outbox.env"
+# What `mmx serve` writes. Edits stay out of git, because tools/local only holds the starting point.
+MMX_STATE = RUN / "mmx"
+SAMPLE_MARKETS = ROOT / "tools" / "local" / "markets.yaml"
+MARKETS_FILE = MMX_STATE / "markets.yaml"
+MMX_ENV_FILE = MMX_STATE / "outbox.env"
+MMX_BIND = os.environ.get("MMX_BIND", "127.0.0.1:8093")
+MMX_PORT = int(MMX_BIND.rsplit(":")[-1])
+# Local only. The gateway and `mmx serve` must agree on it.
+ADMIN_TOKEN = os.environ.get("MMX_ADMIN_TOKEN", "dev")
 
 CLUSTER_INFRASTRUCTURE = {
     "sbx-nats": NATS,
@@ -108,6 +119,18 @@ def read_env_file(path):
     return dict(line.split("=", 1) for line in lines if line and not line.startswith("#"))
 
 
+def outbox_settings():
+    """The sample settings, overridden by what's been saved in the console."""
+    saved = read_env_file(MMX_ENV_FILE) if MMX_ENV_FILE.exists() else {}
+    return {**read_env_file(OUTBOX_ENV_FILE), **saved}
+
+
+def seed_markets():
+    MMX_STATE.mkdir(parents=True, exist_ok=True)
+    if not MARKETS_FILE.exists():
+        shutil.copy(SAMPLE_MARKETS, MARKETS_FILE)
+
+
 def cluster_services():
     nodes = range(CLUSTER_NODES)
     tape = {"AERON_DIR": CLUSTER_AERON_DIR,
@@ -120,11 +143,12 @@ def cluster_services():
         ("trade-reporter", [BIN / "trade-reporter"],
          {**tape, "QUESTDB_CONF": f"http::addr={questdb};"}, "Startup complete"),
         ("outbox", [BIN / "outbox"],
-         {**read_env_file(OUTBOX_ENV_FILE), "AERON_DIR": CLUSTER_AERON_DIR,
+         {**outbox_settings(), "AERON_DIR": CLUSTER_AERON_DIR,
           "OUTBOX_DIR": str(OUTBOX_DIR)}, "outbox open"),
         ("websocket", [BIN / "websocket"], {"WS_ADDR": WS_ADDR}, "Listening on"),
         ("api", [BIN / "api"], {
-            "AERON_DIR": CLUSTER_AERON_DIR, "MARKETS_FILE": str(ROOT / "tools/local/markets.yaml"),
+            "AERON_DIR": CLUSTER_AERON_DIR, "MARKETS_FILE": str(MARKETS_FILE),
+            "MMX_ADMIN_TOKEN": ADMIN_TOKEN,
             "QUESTDB_URL": f"http://{questdb}", "VALKEY_URL": "redis://localhost:6379",
             # The same value `cluster.py` gives the nodes.
             "CLUSTER_SESSION_TIMEOUT": "30s",
@@ -133,6 +157,13 @@ def cluster_services():
             "CLUSTER_REPORT_CHANNELS": ",".join(
                 f"aeron:udp?endpoint=localhost:0|control=localhost:{40450 + i}|session-id=1002"
                 for i in nodes)}, "Startup complete"),
+        ("mmx", [BIN / "mmx", "serve"], {
+            "MMX_ADMIN_TOKEN": ADMIN_TOKEN, "MARKETS_FILE": str(MARKETS_FILE),
+            "MMX_STATE_DIR": str(MMX_STATE), "QUESTDB_URL": f"http://{questdb}",
+            "VALKEY_URL": "redis://localhost:6379", "MMX_GATEWAY_URLS": "http://localhost:8000",
+            "MMX_BIND": MMX_BIND,
+            "MMX_OUTBOX_URL": f"http://{read_env_file(OUTBOX_ENV_FILE)['OUTBOX_HTTP']}",
+            "MMX_OUTBOX_RESTART": "tools/scripts/sbx.py restart outbox"}, "Admin API listening"),
     ]
 
 
@@ -294,7 +325,7 @@ def start_cluster_nodes(fresh):
 
 
 def up_cluster(fresh):
-    for path in (BIN / "api", ROOT / "target/dist/matching-engine",
+    for path in (BIN / "api", BIN / "mmx", ROOT / "target/dist/matching-engine",
                  Path(os.environ.get("AERON_JAR", RUN / "aeron-all-1.54.0.jar"))):
         if not path.exists():
             sys.exit(f"missing {path}, see STARTUP.md")
@@ -312,8 +343,8 @@ def up_cluster(fresh):
                      f"{CLUSTER_SHARED_MEMORY_GB} GB, see STARTUP.md")
         time.sleep(0.2)
 
-    outbox = read_env_file(OUTBOX_ENV_FILE)
-    ports = [8000, int(WS_ADDR.rsplit(":")[-1]), int(outbox["OUTBOX_HTTP"].rsplit(":")[-1])]
+    outbox = outbox_settings()
+    ports = [8000, MMX_PORT, int(WS_ADDR.rsplit(":")[-1]), int(outbox["OUTBOX_HTTP"].rsplit(":")[-1])]
     taken = [port for port in ports if port_open(port)]
     if taken:
         sys.exit(f"something else is listening on {taken}")
@@ -324,6 +355,7 @@ def up_cluster(fresh):
         shutil.rmtree(OUTBOX_DIR, ignore_errors=True)
         shutil.rmtree(CHECKPOINT_DIR, ignore_errors=True)
     OUTBOX_DIR.mkdir(exist_ok=True)
+    seed_markets()
 
     start_cluster_nodes(fresh)
     deadline = time.time() + 60
@@ -337,6 +369,22 @@ def up_cluster(fresh):
         # The tape is new, so anything QuestDB holds came from an older one.
         rebuild = ["--rebuild"] if fresh and name == "trade-reporter" else []
         start(name, [*command, *rebuild], extra_env, ready)
+    announce_console()
+
+
+def announce_console():
+    """The first password is only ever logged once, so it's easy to lose in a log."""
+    print(f"console on http://127.0.0.1:{MMX_PORT}")
+    for line in (RUN / "mmx.log").read_text(errors="replace").splitlines():
+        if "first-run admin password" in line:
+            print(f"first-run password: {line.rsplit(' ', 1)[-1]}")
+
+
+def cmd_restart(args):
+    """Restarts one service in place, for settings it only reads at start."""
+    service = next(item for item in cluster_services() if item[0] == args.service)
+    stop(args.service)
+    start(*service)
 
 
 def cmd_up(args):
@@ -446,6 +494,10 @@ def main():
     names = dict.fromkeys(name for name, *_ in [*SERVICES, *cluster_services()])
     logs.add_argument("service", choices=[*names, *NODE_LOGS])
     logs.set_defaults(run=cmd_logs)
+
+    restart = commands.add_parser("restart")
+    restart.add_argument("service", choices=[name for name, *_ in cluster_services()])
+    restart.set_defaults(run=cmd_restart)
 
     verify = commands.add_parser("verify")
     for flag, default in (("orders", "100000"), ("seed", "1"), ("rate", "0"), ("accounts", "100"),

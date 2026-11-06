@@ -1,28 +1,29 @@
 //! `mmx serve`: the admin API under `/admin/v1`. The CLI and the console are both clients of this.
 
+use crate::auth::{self, Auth};
+use crate::console;
 use crate::events;
-use crate::markets::{self, MarketEntry, MarketsFile, normalize_symbol};
+use crate::markets::{self, MarketEntry, MarketsFile, Problem, normalize_symbol};
+use crate::settings;
+use crate::store::{ConfigStore, Delivery, MARKETS_KEY, StoreError, text_revision};
 use crate::upstream::{
     Filter, GatewayResult, LiveMarket, ORDERS, TRADES, Table, Upstreams, reloaded_symbols, verdict,
 };
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::{JsonRejection, QueryRejection};
-use axum::extract::{Path, Query, Request, State};
-use axum::http::{StatusCode, header};
-use axum::middleware::{self, Next};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -30,24 +31,25 @@ use uuid::Uuid;
 pub const DEFAULT_PORT: u16 = 8093;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
+/// How often gateways are checked against the store when the kubelet delivers the file.
+const RECONCILE_EVERY: Duration = Duration::from_secs(5);
+/// The kubelet usually takes about a minute. Past this, something is wrong.
+const DELIVERY_STALLED: Duration = Duration::from_secs(180);
+/// Shown to operators as what to expect.
+const DELIVERY_EXPECTED_SECS: u64 = 90;
 
 pub struct AppState {
     pub up: Arc<Upstreams>,
-    pub markets_file: PathBuf,
-    /// Hashed, so that comparing doesn't reveal the token's length.
-    pub token: Option<[u8; 32]>,
+    pub store: Arc<ConfigStore>,
+    pub auth: Arc<Auth>,
     pub poll_every: Duration,
-    /// Keeps edits in order, so two can't overwrite each other or reload out of turn. One server
-    /// should own the file.
+    /// Keeps edits in order, so two can't overwrite each other or reload out of turn. Across
+    /// replicas, the store's conditional writes do the same job.
     pub edits: Mutex<()>,
-}
-
-fn digest(token: &str) -> [u8; 32] {
-    Sha256::digest(token.as_bytes()).into()
-}
-
-pub fn hash_token(token: Option<&str>) -> Option<[u8; 32]> {
-    token.map(digest)
+    /// When gateways were first seen to differ from the store.
+    pub behind_since: std::sync::Mutex<Option<Instant>>,
+    /// What an operator runs to restart the outbox here.
+    pub outbox_restart: String,
 }
 
 /// Works out the listen address and whether a token is required. No token is only allowed on the
@@ -91,7 +93,7 @@ pub struct ApiError {
     message: String,
 }
 
-fn error(status: StatusCode, code: &'static str, message: impl Into<String>) -> ApiError {
+pub fn error(status: StatusCode, code: &'static str, message: impl Into<String>) -> ApiError {
     ApiError {
         status,
         code,
@@ -99,16 +101,27 @@ fn error(status: StatusCode, code: &'static str, message: impl Into<String>) -> 
     }
 }
 
-fn invalid(message: impl Into<String>) -> ApiError {
+pub fn invalid(message: impl Into<String>) -> ApiError {
     error(StatusCode::BAD_REQUEST, "invalid_request", message)
 }
 
-fn upstream_failed(message: impl Into<String>) -> ApiError {
+pub fn upstream_failed(message: impl Into<String>) -> ApiError {
     error(StatusCode::BAD_GATEWAY, "upstream_failed", message)
 }
 
 fn file_failed(message: String) -> ApiError {
     error(StatusCode::INTERNAL_SERVER_ERROR, "markets_file", message)
+}
+
+pub fn store_failed(err: StoreError) -> ApiError {
+    match err {
+        StoreError::Conflict => error(
+            StatusCode::CONFLICT,
+            "conflict",
+            "Something else changed this first. Reload and try again.",
+        ),
+        StoreError::Failed(message) => file_failed(message),
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -127,40 +140,11 @@ impl IntoResponse for ApiError {
     }
 }
 
-async fn require_token(
-    State(state): State<Arc<AppState>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let Some(expected) = &state.token else {
-        return next.run(request).await;
-    };
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    let matches = presented.is_some_and(|token| bool::from(digest(token).ct_eq(expected)));
-    if !matches {
-        let refused = error(
-            StatusCode::UNAUTHORIZED,
-            "unauthenticated",
-            "A valid bearer token is required.",
-        );
-        let mut response = refused.into_response();
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            header::HeaderValue::from_static("Bearer"),
-        );
-        return response;
-    }
-    next.run(request).await
-}
-
 pub fn router(state: Arc<AppState>) -> Router {
     let admin = Router::new()
         .route("/status", get(status))
         .route("/markets", get(list_markets))
+        .route("/markets/reload", post(reload_markets))
         .route(
             "/markets/{symbol}",
             get(get_market).put(put_market).delete(delete_market),
@@ -168,22 +152,57 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/markets/{symbol}/halt", post(halt))
         .route("/markets/{symbol}/resume", post(resume))
         .route("/markets/{symbol}/cancel-all", post(cancel_all))
+        .route(
+            "/config/markets",
+            get(get_markets_file).put(put_markets_file),
+        )
+        .route("/config/markets/validate", post(validate_markets_file))
         .route("/orders", get(orders))
         .route("/trades", get(trades))
         .route("/webhooks", get(webhooks))
+        .route(
+            "/webhooks/config",
+            get(settings::webhook_config).put(settings::put_webhook_config),
+        )
+        .route("/webhooks/secret", post(settings::rotate_webhook_secret))
         .route("/events", get(activity))
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
+        .route(
+            "/settings",
+            get(settings::get_settings).put(settings::put_settings),
+        )
+        .route("/settings/oidc", axum::routing::put(settings::put_oidc))
+        .route("/settings/oidc/test", post(settings::test_oidc))
+        .route("/sessions/revoke", post(auth::revoke_sessions))
+        .route("/password/reset", post(auth::reset_password))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_admin,
+        ));
+    // Open to someone holding only the temporary password.
+    let setup = Router::new()
+        .route("/password", post(auth::change_password))
+        .route("/logout", post(auth::logout))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_signed_in,
+        ));
+    let public = Router::new()
+        .route("/session", get(auth::current_session))
+        .route("/login", post(auth::login))
+        .route("/oidc/start", get(auth::oidc_start))
+        .route("/oidc/callback", get(auth::oidc_callback));
     Router::new()
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
         .route("/readyz", get(ready))
-        .nest("/admin/v1", admin)
+        .nest("/admin/v1", admin.merge(setup).merge(public))
+        .fallback(console::serve)
         .with_state(state)
 }
 
 /// Ready means this server can do its own job. It doesn't depend on the services it reports on, or
 /// an outage elsewhere would take down the tool used to look into it.
 async fn ready(State(state): State<Arc<AppState>>) -> Response {
-    let file = markets::read(&state.markets_file).is_ok();
+    let file = read_file(&state).await.is_ok();
     let status = if file {
         StatusCode::OK
     } else {
@@ -257,6 +276,18 @@ fn gateway_matches(entry: Option<&MarketEntry>, market: Option<&LiveMarket>) -> 
 
 type Live = Vec<(String, Result<Vec<LiveMarket>, String>)>;
 
+/// Whether one gateway holds exactly what the file says.
+fn gateway_in_sync(file: &MarketsFile, markets: &[LiveMarket]) -> bool {
+    let listed = file.markets.iter().all(|entry| {
+        let market = markets.iter().find(|market| market.symbol == entry.symbol);
+        gateway_matches(Some(entry), market)
+    });
+    listed
+        && markets
+            .iter()
+            .all(|market| gateway_matches(file.get(&market.symbol), Some(market)))
+}
+
 fn market_view(symbol: &str, file: &MarketsFile, live: &Live) -> MarketView {
     let entry = file.get(symbol);
     let gateways: Vec<GatewayView> = live
@@ -310,8 +341,73 @@ fn market_view(symbol: &str, file: &MarketsFile, live: &Live) -> MarketView {
     }
 }
 
-fn read_file(state: &AppState) -> Result<(MarketsFile, String), ApiError> {
-    markets::read(&state.markets_file).map_err(file_failed)
+fn markets_text(data: &crate::store::Data) -> String {
+    data.get(MARKETS_KEY)
+        .cloned()
+        .unwrap_or_else(|| "markets: []\n".to_string())
+}
+
+async fn read_file(state: &AppState) -> Result<(MarketsFile, String), ApiError> {
+    let doc = state.store.config().await.map_err(store_failed)?;
+    let text = markets_text(&doc.data);
+    let file = MarketsFile::parse(&text).map_err(file_failed)?;
+    Ok((file, text))
+}
+
+/// Applies an edit to the stored file. It's re-run on a fresh copy if something else wrote first.
+async fn edit_file<F>(state: &AppState, edit: F) -> Result<(), ApiError>
+where
+    F: Fn(&mut MarketsFile),
+{
+    state
+        .store
+        .update_config(|data| {
+            let previous = markets_text(data);
+            let mut file = MarketsFile::parse(&previous).map_err(StoreError::Failed)?;
+            edit(&mut file);
+            let text = markets::render(&file, &previous).map_err(StoreError::Failed)?;
+            data.insert(MARKETS_KEY.to_string(), text);
+            Ok(())
+        })
+        .await
+        .map_err(store_failed)?;
+    Ok(())
+}
+
+/// How far the stored file has got. In Kubernetes a gap is normal for a minute or so, and only
+/// becomes a problem if it lasts.
+fn delivery_view(state: &AppState, file: &MarketsFile, live: &Live) -> Value {
+    let behind: Vec<&str> = live
+        .iter()
+        .filter(|(_, markets)| {
+            !markets
+                .as_ref()
+                .is_ok_and(|markets| gateway_in_sync(file, markets))
+        })
+        .map(|(gateway, _)| gateway.as_str())
+        .collect();
+    let mode = state.store.info().delivery;
+    let mut since = state
+        .behind_since
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if behind.is_empty() {
+        *since = None;
+        return json!({ "mode": mode, "state": "in_sync", "behind": behind });
+    }
+    let waited = since.get_or_insert_with(Instant::now).elapsed();
+    let phase = match mode {
+        Delivery::Immediate => "out_of_sync",
+        Delivery::Eventual if waited < DELIVERY_STALLED => "reaching_gateways",
+        Delivery::Eventual => "stalled",
+    };
+    json!({
+        "mode": mode,
+        "state": phase,
+        "behind": behind,
+        "waited_secs": waited.as_secs(),
+        "expected_secs": DELIVERY_EXPECTED_SECS,
+    })
 }
 
 fn symbol(raw: &str) -> Result<String, ApiError> {
@@ -319,7 +415,7 @@ fn symbol(raw: &str) -> Result<String, ApiError> {
 }
 
 async fn list_markets(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let (file, _) = read_file(&state)?;
+    let (file, _) = read_file(&state).await?;
     let live = state.up.live_markets().await;
 
     // A market can be on a gateway and not in the file, which is what's worth seeing here.
@@ -340,7 +436,8 @@ async fn list_markets(State(state): State<Arc<AppState>>) -> Result<Json<Value>,
         .iter()
         .map(|symbol| market_view(symbol, &file, &live))
         .collect();
-    Ok(Json(json!({ "markets": views })))
+    let delivery = delivery_view(&state, &file, &live);
+    Ok(Json(json!({ "markets": views, "delivery": delivery })))
 }
 
 async fn get_market(
@@ -348,7 +445,7 @@ async fn get_market(
     Path(raw): Path<String>,
 ) -> Result<Json<MarketView>, ApiError> {
     let symbol = symbol(&raw)?;
-    let (file, _) = read_file(&state)?;
+    let (file, _) = read_file(&state).await?;
     let live = state.up.live_markets().await;
     let view = market_view(&symbol, &file, &live);
     if !view.in_file && view.gateways.iter().all(|gateway| gateway.market.is_none()) {
@@ -363,37 +460,100 @@ async fn get_market(
 
 /// Checks that a reload really changed what the gateway serves. A gateway reads its own copy of the
 /// file and answers 200 either way, so a copy that isn't the one edited would otherwise go unseen.
-fn confirm_reload(result: &mut GatewayResult, symbol: &str, expected: bool) {
+fn confirm_reload(result: &mut GatewayResult, expected: &[(String, bool)]) {
     if !result.ok {
         return;
     }
-    let listed = reloaded_symbols(&result.body).map(|symbols| symbols.contains(&symbol));
-    if listed != Some(expected) {
+    let listed = reloaded_symbols(&result.body);
+    let wrong = expected.iter().find(|(symbol, enabled)| {
+        listed
+            .as_ref()
+            .map(|symbols| symbols.contains(&symbol.as_str()))
+            != Some(*enabled)
+    });
+    if let Some((symbol, _)) = wrong {
         result.fail(format!(
             "reloaded, but {symbol} didn't change there, so it isn't reading the edited file"
         ));
     }
 }
 
-/// `applied` says every gateway took the edit. The file has changed either way, so a failed gateway
-/// needs another reload, not another edit.
-async fn reload_everywhere(state: &AppState, symbol: &str, expected: bool) -> Response {
+/// `applied` says every gateway took the edit. The store has changed either way, so a failed gateway
+/// needs another reload, not another edit. In Kubernetes the reload usually comes before the kubelet
+/// has delivered the file, which isn't a failure: the reconciler keeps going until it lands.
+async fn reload_everywhere(state: &AppState, expected: &[(String, bool)]) -> (StatusCode, Value) {
     let mut gateways = state
         .up
         .each_gateway(Method::POST, "/api/v1/admin/markets/reload")
         .await;
-    for result in &mut gateways {
-        confirm_reload(result, symbol, expected);
+    if state.store.info().delivery == Delivery::Immediate {
+        for result in &mut gateways {
+            confirm_reload(result, expected);
+        }
+        let applied = gateways.iter().all(|result| result.ok);
+        let (code, phase) = if applied {
+            (StatusCode::OK, "applied")
+        } else {
+            (StatusCode::BAD_GATEWAY, "failed")
+        };
+        let body =
+            json!({ "written": true, "applied": applied, "state": phase, "gateways": gateways });
+        return (code, body);
     }
-    let applied = gateways.iter().all(|result| result.ok);
-    let code = if applied {
-        StatusCode::OK
-    } else {
-        StatusCode::BAD_GATEWAY
-    };
-    let body =
-        json!({ "symbol": symbol, "written": true, "applied": applied, "gateways": gateways });
+
+    let (file, _) = read_file(state).await.unwrap_or_default();
+    let live = state.up.live_markets().await;
+    let applied = live.iter().all(|(_, markets)| {
+        markets
+            .as_ref()
+            .is_ok_and(|markets| gateway_in_sync(&file, markets))
+    });
+    if applied {
+        let body =
+            json!({ "written": true, "applied": true, "state": "applied", "gateways": gateways });
+        return (StatusCode::OK, body);
+    }
+    let body = json!({
+        "written": true,
+        "applied": false,
+        "state": "reaching_gateways",
+        "expected_secs": DELIVERY_EXPECTED_SECS,
+        "gateways": gateways,
+    });
+    (StatusCode::ACCEPTED, body)
+}
+
+fn edit_response(symbol: &str, (code, mut body): (StatusCode, Value)) -> Response {
+    body["symbol"] = json!(symbol);
     (code, Json(body)).into_response()
+}
+
+/// In Kubernetes, nothing else tells a gateway the ConfigMap changed. Reloading is harmless, so any
+/// gateway that differs from the store is asked to, including after a `kubectl apply`.
+pub fn spawn_reconciler(state: Arc<AppState>) {
+    if state.store.info().delivery != Delivery::Eventual {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(RECONCILE_EVERY).await;
+            let Ok((file, _)) = read_file(&state).await else {
+                continue;
+            };
+            for (gateway, markets) in state.up.live_markets().await {
+                let in_sync = markets
+                    .as_ref()
+                    .is_ok_and(|markets| gateway_in_sync(&file, markets));
+                if !in_sync {
+                    let path = "/api/v1/admin/markets/reload";
+                    let result = state.up.gateway_call(Method::POST, &gateway, path).await;
+                    if let Some(error) = result.error {
+                        warn!("Markets: {gateway} didn't reload: {error}");
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[derive(Deserialize, Debug)]
@@ -424,11 +584,10 @@ async fn put_market(
     let enabled = entry.is_enabled();
 
     let _edit = state.edits.lock().await;
-    let (mut file, previous) = read_file(&state)?;
-    file.upsert(entry);
-    markets::write(&state.markets_file, &file, &previous).map_err(file_failed)?;
+    edit_file(&state, |file| file.upsert(entry.clone())).await?;
     info!("Markets: Set {symbol}");
-    Ok(reload_everywhere(&state, &symbol, enabled).await)
+    let outcome = reload_everywhere(&state, &[(symbol.clone(), enabled)]).await;
+    Ok(edit_response(&symbol, outcome))
 }
 
 /// Stops new orders only. Orders resting in the market stay in the engine, so cancel them first.
@@ -439,17 +598,141 @@ async fn delete_market(
     let symbol = symbol(&raw)?;
 
     let _edit = state.edits.lock().await;
-    let (mut file, previous) = read_file(&state)?;
-    if !file.remove(&symbol) {
+    let (file, _) = read_file(&state).await?;
+    if file.get(&symbol).is_none() {
         return Err(error(
             StatusCode::NOT_FOUND,
             "market_not_found",
             format!("No market {symbol} in the file."),
         ));
     }
-    markets::write(&state.markets_file, &file, &previous).map_err(file_failed)?;
+    edit_file(&state, |file| {
+        file.remove(&symbol);
+    })
+    .await?;
     info!("Markets: Removed {symbol}");
-    Ok(reload_everywhere(&state, &symbol, false).await)
+    let outcome = reload_everywhere(&state, &[(symbol.clone(), false)]).await;
+    Ok(edit_response(&symbol, outcome))
+}
+
+/// Asks every gateway to read the file again, for after a hand edit.
+async fn reload_markets(State(state): State<Arc<AppState>>) -> Result<Response, ApiError> {
+    let (file, _) = read_file(&state).await?;
+    let expected: Vec<(String, bool)> = file
+        .markets
+        .iter()
+        .map(|entry| (entry.symbol.clone(), entry.is_enabled()))
+        .collect();
+    let (code, body) = reload_everywhere(&state, &expected).await;
+    Ok((code, Json(body)).into_response())
+}
+
+/// The file as stored, even if it no longer parses: a `kubectl apply` can put anything there, and
+/// the editor is how an operator fixes it.
+async fn get_markets_file(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    let doc = state.store.config().await.map_err(store_failed)?;
+    let text = markets_text(&doc.data);
+    let info = state.store.info();
+    let problem = markets::check(&text).err();
+    Ok(Json(json!({
+        "yaml": text,
+        "revision": text_revision(&text),
+        "valid": problem.is_none(),
+        "problem": problem,
+        "backend": info.backend,
+        "location": info.config,
+        "delivery": info.delivery,
+    })))
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct MarketsFileBody {
+    yaml: String,
+    #[serde(default)]
+    revision: Option<String>,
+}
+
+fn problem_response(problem: &Problem) -> ApiError {
+    let message = match problem.line {
+        Some(line) => format!("Line {line}: {}", problem.message),
+        None => problem.message.clone(),
+    };
+    error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_markets", message)
+}
+
+/// Names what a save would do, and warns about what stays behind in the engine.
+async fn validate_markets_file(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MarketsFileBody>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(body) = body.map_err(|rejection| invalid(rejection.body_text()))?;
+    let new = match markets::check(&body.yaml) {
+        Ok(new) => new,
+        Err(problem) => return Ok(Json(json!({ "valid": false, "problem": problem }))),
+    };
+    let doc = state.store.config().await.map_err(store_failed)?;
+    let current = MarketsFile::parse(&markets_text(&doc.data)).unwrap_or_default();
+    let changes = markets::changes(&current, &new);
+    let mut warnings = Vec::new();
+    if !changes.removed.is_empty() {
+        warnings.push(format!(
+            "Removing {} stops new orders. Open orders stay in the engine, so cancel them first.",
+            changes.removed.join(", ")
+        ));
+    }
+    if !changes.changed.is_empty() {
+        warnings.push(format!(
+            "Changing {} doesn't touch open orders, which keep their old price and size.",
+            changes.changed.join(", ")
+        ));
+    }
+    Ok(Json(
+        json!({ "valid": true, "changes": changes, "warnings": warnings }),
+    ))
+}
+
+/// Saves the text exactly as written, comments included, if nothing has changed since it was read.
+async fn put_markets_file(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MarketsFileBody>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|rejection| invalid(rejection.body_text()))?;
+    let new = markets::check(&body.yaml).map_err(|problem| problem_response(&problem))?;
+
+    let _edit = state.edits.lock().await;
+    let mut doc = state.store.config().await.map_err(store_failed)?;
+    let current = markets_text(&doc.data);
+    if body
+        .revision
+        .is_some_and(|revision| revision != text_revision(&current))
+    {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "markets_changed",
+            "The markets changed since you opened this. Reload to see them, then edit again.",
+        ));
+    }
+    let old = MarketsFile::parse(&current).unwrap_or_default();
+    doc.data.insert(MARKETS_KEY.to_string(), body.yaml.clone());
+    state.store.put_config(&doc).await.map_err(store_failed)?;
+    info!("Markets: Saved the whole file");
+
+    // Markets that left the file are expected to be gone, so they're checked too.
+    let mut expected: Vec<(String, bool)> = new
+        .markets
+        .iter()
+        .map(|entry| (entry.symbol.clone(), entry.is_enabled()))
+        .collect();
+    expected.extend(
+        old.markets
+            .iter()
+            .filter(|entry| new.get(&entry.symbol).is_none())
+            .map(|entry| (entry.symbol.clone(), false)),
+    );
+    let (code, mut outcome) = reload_everywhere(&state, &expected).await;
+    outcome["revision"] = json!(text_revision(&body.yaml));
+    Ok((code, Json(outcome)).into_response())
 }
 
 /// A refusal every gateway agrees on, like an unknown market, passes through as it is. Anything
@@ -590,19 +873,40 @@ async fn activity(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     events::sse(state.up.clone(), state.poll_every)
 }
 
+/// Kubernetes stops a pod with SIGTERM.
+async fn stopping() {
+    let interrupted = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminated = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminated = std::future::pending::<()>();
+    tokio::select! {
+        () = interrupted => {}
+        () = terminated => {}
+    }
+}
+
 pub async fn serve(state: Arc<AppState>, address: SocketAddr) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|err| format!("can't bind {address}: {err}"))?;
-    if state.token.is_none() {
+    if !state.auth.has_token() {
         warn!("Admin API has no token, on a loopback address only");
     }
     info!("Admin API listening on {address}");
-    let stopping = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(stopping)
+    let service = router(state).into_make_service_with_connect_info::<SocketAddr>();
+    axum::serve(listener, service)
+        .with_graceful_shutdown(stopping())
         .await
         .map_err(|err| format!("server failed: {err}"))
 }

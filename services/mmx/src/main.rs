@@ -1,12 +1,17 @@
 //! `mmx`: control and test a running exchange from one command. `mmx serve` is the control plane,
 //! and every other subcommand is a client, of it or of a gateway.
 
+mod auth;
 mod client;
+mod console;
 mod decimal;
 mod events;
 mod markets;
+mod oidc;
 mod output;
 mod server;
+mod settings;
+mod store;
 mod upstream;
 mod watch;
 mod webhook;
@@ -17,16 +22,17 @@ mod tests;
 use client::{ActivityQuery, Admin, NewOrder, Orders};
 use output::line;
 use server::AppState;
+use store::{ConfigStore, KubeStore, LocalStore};
 use upstream::{Targets, Upstreams};
 
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
@@ -34,6 +40,8 @@ use uuid::Uuid;
 
 const DEFAULT_URL: &str = "http://127.0.0.1:8093";
 const TOKEN_ENV: &str = "MMX_ADMIN_TOKEN";
+const PASSWORD_ENV: &str = "MMX_ADMIN_PASSWORD";
+const LOCAL_OUTBOX_RESTART: &str = "tools/scripts/sbx.py restart outbox";
 const NATS_PORT: u16 = 4222;
 const VALKEY_PORT: u16 = 6379;
 
@@ -70,6 +78,11 @@ struct Services {
         default_value = "http://localhost:8000"
     )]
     gateways: Vec<String>,
+
+    /// A headless Service as host:port, resolved on every call to find each gateway. Replaces
+    /// --gateway, because a normal Service reaches only one pod per call
+    #[arg(long, global = true, env = "MMX_GATEWAY_DNS")]
+    gateway_dns: Option<String>,
 
     /// Outbox status URL
     #[arg(
@@ -126,6 +139,11 @@ enum Command {
         #[command(subcommand)]
         command: MarketsCommand,
     },
+    /// Console sign-in, for an admin who can't reach the console
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Inspect configuration
     Config {
         #[command(subcommand)]
@@ -166,6 +184,32 @@ struct ServeArgs {
     /// How often `/events` polls, in milliseconds
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(100..))]
     poll_ms: u64,
+
+    /// Where settings and secrets are kept
+    #[arg(long, env = "MMX_STORE", value_enum, default_value_t = StoreKind::Local)]
+    store: StoreKind,
+
+    /// With the local store, the directory for settings and secrets
+    #[arg(long, env = "MMX_STATE_DIR", default_value = ".run/mmx")]
+    state_dir: PathBuf,
+
+    /// With the Kubernetes store, the one ConfigMap this server may write
+    #[arg(long, env = "MMX_CONFIGMAP", default_value = "mmx-config")]
+    configmap: String,
+
+    /// With the Kubernetes store, the one Secret this server may write
+    #[arg(long, env = "MMX_SECRET", default_value = "mmx-control")]
+    secret: String,
+
+    /// What an operator runs to restart the outbox, shown in the console
+    #[arg(long, env = "MMX_OUTBOX_RESTART", default_value = LOCAL_OUTBOX_RESTART)]
+    outbox_restart: String,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StoreKind {
+    Local,
+    Kubernetes,
 }
 
 #[derive(Args)]
@@ -206,6 +250,35 @@ enum MarketsCommand {
     Resume { symbol: String },
     /// Cancel every open order in a market. Halt it first, or new orders can arrive behind this
     CancelAll { symbol: String },
+    /// Ask every gateway to read the markets file again. Halts stay in place
+    Reload,
+    /// Print the stored markets file
+    Export,
+    /// Check a markets file with the gateway's rules, without saving it
+    Validate { file: PathBuf },
+    /// Replace the stored markets file, then reload every gateway
+    Apply { file: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Show how the console can be signed in to
+    Show,
+    /// Replace the console password with a temporary one, printed once, and sign everyone out
+    ResetPassword,
+    /// Turn password login on or off. Use this to get back in if a provider breaks
+    PasswordLogin {
+        #[arg(value_enum)]
+        state: Switch,
+    },
+    /// Sign out every console session
+    RevokeSessions,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Switch {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -251,6 +324,12 @@ enum OrderCommand {
 enum WebhookCommand {
     /// Show outbox delivery status
     Status,
+    /// Show the configured URL and whether the outbox has picked it up
+    Config,
+    /// Set the webhook URL. The outbox needs a restart to use it
+    SetUrl { url: String },
+    /// Generate a new signing secret, printed once. The outbox needs a restart to use it
+    RotateSecret,
     /// Act as a game: receive webhooks, verify them, dedupe and print them
     Listen {
         #[arg(long)]
@@ -291,6 +370,7 @@ impl Services {
         }
         Ok(Targets {
             gateways,
+            gateway_dns: self.gateway_dns.clone(),
             outbox: base_url("outbox", &self.outbox)?,
             questdb: base_url("questdb", &self.questdb)?,
             nats: self.nats.clone(),
@@ -336,14 +416,37 @@ async fn serve(cli: &Cli, args: &ServeArgs, token: Option<String>) -> Result<(),
     tracing::subscriber::set_global_default(subscriber).map_err(|err| err.to_string())?;
 
     let address = server::listen_address(token.as_deref(), args.insecure_local, args.bind)?;
-    let state = AppState {
+    let store = Arc::new(match args.store {
+        StoreKind::Local => ConfigStore::Local(LocalStore {
+            markets_file: cli.services.markets_file.clone(),
+            dir: args.state_dir.clone(),
+        }),
+        StoreKind::Kubernetes => ConfigStore::Kube(KubeStore::in_cluster(
+            args.configmap.clone(),
+            args.secret.clone(),
+        )?),
+    });
+    let password = env::var(PASSWORD_ENV).ok().filter(|text| !text.is_empty());
+    let auth = auth::Auth::start(
+        store.clone(),
+        token.as_deref(),
+        args.insecure_local,
+        password,
+    )
+    .await?;
+    auth.spawn_refresh();
+
+    let state = Arc::new(AppState {
         up: Arc::new(Upstreams::new(cli.services.targets()?, token.clone())?),
-        markets_file: cli.services.markets_file.clone(),
-        token: server::hash_token(token.as_deref()),
+        store,
+        auth,
         poll_every: Duration::from_millis(args.poll_ms),
         edits: Mutex::new(()),
-    };
-    server::serve(Arc::new(state), address).await
+        behind_since: StdMutex::new(None),
+        outbox_restart: args.outbox_restart.clone(),
+    });
+    server::spawn_reconciler(state.clone());
+    server::serve(state, address).await
 }
 
 async fn run_markets(admin: &Admin, command: &MarketsCommand) -> Result<(), String> {
@@ -373,6 +476,25 @@ async fn run_markets(admin: &Admin, command: &MarketsCommand) -> Result<(), Stri
         MarketsCommand::Halt { symbol } => admin.market_action(symbol, "halt").await,
         MarketsCommand::Resume { symbol } => admin.market_action(symbol, "resume").await,
         MarketsCommand::CancelAll { symbol } => admin.cancel_all(symbol).await,
+        MarketsCommand::Reload => admin.reload_markets().await,
+        MarketsCommand::Export => admin.export_markets().await,
+        MarketsCommand::Validate { file } => admin.validate_markets(&read_text(file)?).await,
+        MarketsCommand::Apply { file } => admin.apply_markets(&read_text(file)?).await,
+    }
+}
+
+fn read_text(path: &PathBuf) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+async fn run_auth(admin: &Admin, command: &AuthCommand) -> Result<(), String> {
+    match command {
+        AuthCommand::Show => admin.show_auth().await,
+        AuthCommand::ResetPassword => admin.reset_password().await,
+        AuthCommand::PasswordLogin { state } => {
+            admin.set_password_login(*state == Switch::On).await
+        }
+        AuthCommand::RevokeSessions => admin.revoke_sessions().await,
     }
 }
 
@@ -431,6 +553,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Status => admin()?.status().await,
         Command::Health => admin()?.health().await,
         Command::Markets { command } => run_markets(&admin()?, command).await,
+        Command::Auth { command } => run_auth(&admin()?, command).await,
         Command::Config {
             command: ConfigCommand::Show,
         } => show_config(&cli, token.as_deref()),
@@ -440,6 +563,15 @@ async fn run(cli: Cli) -> Result<(), String> {
         Command::Webhook {
             command: WebhookCommand::Status,
         } => admin()?.webhooks().await,
+        Command::Webhook {
+            command: WebhookCommand::Config,
+        } => admin()?.webhook_config().await,
+        Command::Webhook {
+            command: WebhookCommand::SetUrl { url },
+        } => admin()?.set_webhook_url(url).await,
+        Command::Webhook {
+            command: WebhookCommand::RotateSecret,
+        } => admin()?.rotate_webhook_secret().await,
         Command::Webhook {
             command: WebhookCommand::Listen { port, secret, bind },
         } => webhook::listen(*bind, *port, secret, cli.json).await,

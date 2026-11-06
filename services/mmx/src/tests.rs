@@ -1,9 +1,13 @@
 //! Drives the real server over HTTP against fake services, built from the shapes in
 //! `services/api/rest`, `services/outbox` and `services/trade-reporter`.
 
+mod console;
+
+use crate::auth::Auth;
 use crate::events::{Activity, Poller};
 use crate::markets::MarketsFile;
 use crate::server::{self, AppState};
+use crate::store::{ConfigStore, LocalStore};
 use crate::upstream::{Targets, Upstreams};
 
 use std::collections::HashSet;
@@ -26,6 +30,7 @@ const TOKEN: &str = "test-token";
 const FILE: &str = "# Keep me\nmarkets:\n  - symbol: ITEM\n    tick_size: \"0.01\"\n";
 
 async fn spawn(router: Router) -> String {
+    crate::upstream::install_tls();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router).await });
@@ -309,10 +314,25 @@ struct World {
     quest: Arc<FakeQuest>,
     position: Arc<Mutex<String>>,
     up: Arc<Upstreams>,
+    state: Arc<AppState>,
+    dir: PathBuf,
 }
 
 /// Runs a real server, with a token, against the given gateways.
 async fn world_with(file: PathBuf, gateways: Vec<String>, quest: Arc<FakeQuest>) -> World {
+    let dir = file.with_file_name("state");
+    let store = ConfigStore::Local(LocalStore {
+        markets_file: file.clone(),
+        dir: dir.clone(),
+    });
+    let mut world = world_on(store, gateways, quest).await;
+    world.file = file;
+    world.dir = dir;
+    world
+}
+
+/// The same, on any store.
+async fn world_on(store: ConfigStore, gateways: Vec<String>, quest: Arc<FakeQuest>) -> World {
     let position = Arc::new(Mutex::new(POSITION.to_string()));
     let outbox = spawn(fake_outbox(position.clone())).await;
     let questdb = spawn(
@@ -332,24 +352,37 @@ async fn world_with(file: PathBuf, gateways: Vec<String>, quest: Arc<FakeQuest>)
 
     let targets = Targets {
         gateways,
+        gateway_dns: None,
         outbox,
         questdb,
         nats: nats_address,
         valkey: None,
     };
     let up = Arc::new(Upstreams::new(targets, Some(TOKEN.to_string())).unwrap());
-    let state = AppState {
+    let store = Arc::new(store);
+    let password = Some(console::FIRST_PASSWORD.to_string());
+    let auth = Auth::start(store.clone(), Some(TOKEN), false, password)
+        .await
+        .unwrap();
+    let state = Arc::new(AppState {
         up: up.clone(),
-        markets_file: file.clone(),
-        token: server::hash_token(Some(TOKEN)),
+        store,
+        auth,
         poll_every: Duration::from_millis(100),
         edits: tokio::sync::Mutex::new(()),
-    };
-    let url = spawn(server::router(Arc::new(state))).await;
+        behind_since: Mutex::new(None),
+        outbox_restart: "restart-the-outbox".to_string(),
+    });
+    let url = spawn(server::router(state.clone())).await;
     World {
         url,
-        http: reqwest::Client::new(),
-        file,
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        file: PathBuf::new(),
+        dir: PathBuf::new(),
+        state,
         quest,
         position,
         up,

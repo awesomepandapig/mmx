@@ -55,7 +55,7 @@ group "default" {
 }
 
 group "core" {
-  targets = ["node", "matching-engine", "api", "websocket", "market-data", "trade-reporter"]
+  targets = ["node", "matching-engine", "api", "mmx", "outbox", "websocket", "market-data", "trade-reporter"]
 }
 
 target "_common" {
@@ -92,6 +92,7 @@ target "service" {
   matrix = {
     item = [
       { image = "api", bin = "api" },
+      { image = "mmx", bin = "mmx" },
       { image = "websocket", bin = "websocket" },
       { image = "market-data", bin = "market-data" },
       { image = "trade-reporter", bin = "trade-reporter" },

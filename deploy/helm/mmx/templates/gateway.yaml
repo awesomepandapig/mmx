@@ -1,15 +1,47 @@
 {{- $name := printf "%s-gateway" (include "mmx.fullname" .) -}}
 {{- $labels := dict "root" . "component" "gateway" -}}
 {{- $gateway := .Values.gateway -}}
+# The console owns this after install, so `helm upgrade` writes back what's there. Without that, it
+# would put `marketsYaml` over every edit. `keep` stops an uninstall from deleting what operators
+# made. `lookup` is empty under `helm template` and a client-side dry run, which show the seed.
+{{- $configName := include "mmx.configName" . }}
+{{- $config := lookup "v1" "ConfigMap" .Release.Namespace $configName }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "mmx.fullname" . }}-markets
+  name: {{ $configName }}
   labels:
     {{- include "mmx.labels" $labels | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
 data:
+{{- if $config }}
+  {{- toYaml $config.data | nindent 2 }}
+{{- else }}
   markets.yaml: |
     {{- .Values.marketsYaml | nindent 4 }}
+  {{- with .Values.webhookUrl }}
+  WEBHOOK_URL: {{ . | quote }}
+  {{- end }}
+{{- end }}
+---
+# One address per pod, because a reload has to reach every gateway, and the Service below reaches
+# one of them per call. A pod that isn't ready still has to be seen, so that it shows up as such.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-pods
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $gateway.service.port }}
+      targetPort: http
 ---
 apiVersion: v1
 kind: Service
@@ -72,6 +104,7 @@ spec:
             {{- include "mmx.secretEnvFrom" . | nindent 12 }}
           env:
             {{- include "mmx.aeronClientEnv" . | nindent 12 }}
+            {{- include "mmx.adminTokenEnv" . | nindent 12 }}
             - name: CLUSTER_INGRESS_ENDPOINTS
               value: {{ include "mmx.ingressEndpoints" . | quote }}
             - name: CLUSTER_REPORT_CHANNELS
@@ -105,9 +138,13 @@ spec:
               readOnly: true
       volumes:
         {{- include "mmx.aeronVolumes" (dict "sizeLimit" $gateway.sharedMemory.sizeLimit) | nindent 8 }}
+        # Mounted as a directory so edits reach the pod. Only this key: the rest isn't a gateway's.
         - name: markets
           configMap:
-            name: {{ include "mmx.fullname" . }}-markets
+            name: {{ $configName }}
+            items:
+              - key: markets.yaml
+                path: markets.yaml
 {{- if gt (int $gateway.replicas) 1 }}
 ---
 apiVersion: policy/v1
