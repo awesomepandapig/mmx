@@ -10,3 +10,4 @@ target/
 *.tfstate
 *.tfstate.backup
 tools/bench/ec2/hosts.json
+__pycache__/
