@@ -126,8 +126,8 @@ def cluster_services():
         ("api", [BIN / "api"], {
             "AERON_DIR": CLUSTER_AERON_DIR, "MARKETS_FILE": str(ROOT / "tools/local/markets.yaml"),
             "QUESTDB_URL": f"http://{questdb}", "VALKEY_URL": "redis://localhost:6379",
-            # Callers don't retry, and the check holds new orders while the recorder changes node.
-            "RETRY_WINDOW_SECS": "0",
+            # The same value `cluster.py` gives the nodes.
+            "CLUSTER_SESSION_TIMEOUT": "30s",
             "CLUSTER_INGRESS_ENDPOINTS": ",".join(f"localhost:{20000 + i}" for i in nodes),
             "CLUSTER_RESPONSE_CHANNEL": "aeron:udp?endpoint=localhost:20301",
             "CLUSTER_REPORT_CHANNELS": ",".join(

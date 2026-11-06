@@ -3,12 +3,15 @@
 //! A request is held until its first report arrives. If the leader changes, orders in flight may
 //! or may not have reached the log, so sending pauses until the new term's marker. Every report
 //! before it is final, so any order still waiting never reached the log and is safe to resend.
+//!
+//! That resend is the gateway's own and happens below the ID claim, so it needs no claim of its
+//! own. Repeats from callers never get this far, because they stop at the claim.
 
 use super::aeron_handler::{EngineLink, EngineRequest, OrderKey, OrderOutcome, OrderSender, OutboundOrder};
 use super::order::UuidType;
-use super::repeat::ReportStream;
+use super::recorder::ReportStream;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
@@ -36,13 +39,8 @@ const REPORT_STREAM: i32 = 1002;
 const REPORT_TEMPLATE: u16 = 3;
 const CANCEL_REJECT_TEMPLATE: u16 = 4;
 const TERM_MARKER_TEMPLATE: u16 = 100;
-const REQUEST_DEADLINE: Duration = Duration::from_secs(3);
 const SWEEP_INTERVAL: Duration = Duration::from_millis(50);
 const POSITION_INTERVAL: Duration = Duration::from_millis(5);
-
-/// A few hundred MB when full. An order rate that fills it within the retry window doesn't lose
-/// any protection, because a gateway that can't cover the window falls back to QuestDB.
-const RECENT_ORDERS: usize = 2_000_000;
 
 /// Where to find the cluster. All three variables hold comma-separated values, one per member.
 pub struct ClusterConfig {
@@ -84,7 +82,7 @@ impl PendingOrder {
 }
 
 /// What a request is waiting for. A cancel's own ID differs on every attempt, so requests match on
-/// the order they're about, which lets a retry join the attempt already in flight.
+/// the order they're about, which lets a repeated cancel join the attempt already in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Waiting {
     New(OrderKey),
@@ -140,50 +138,10 @@ fn decode(buffer: &[u8]) -> Decoded {
     }
 }
 
-/// Every order the engine has taken during the retry window, whichever gateway sent it.
-struct RecentOrders {
-    window: Duration,
-    capacity: usize,
-    known: HashSet<OrderKey>,
-    arrivals: VecDeque<(Instant, OrderKey)>,
-}
-
-impl RecentOrders {
-    fn new(window: Duration, capacity: usize) -> Self {
-        Self { window, capacity, known: HashSet::new(), arrivals: VecDeque::new() }
-    }
-
-    /// Returns the time of any order dropped early for space, since nothing before it is covered.
-    fn insert(&mut self, order: OrderKey, now: Instant) -> Option<Instant> {
-        if self.window.is_zero() || !self.known.insert(order) {
-            return None;
-        }
-        self.arrivals.push_back((now, order));
-        while let Some((arrived, oldest)) = self.arrivals.front().copied() {
-            let expired = now.duration_since(arrived) > self.window;
-            if !expired && self.arrivals.len() <= self.capacity {
-                return None;
-            }
-            self.arrivals.pop_front();
-            self.known.remove(&oldest);
-            if !expired {
-                return Some(arrived);
-            }
-        }
-        None
-    }
-
-    fn contains(&self, order: &OrderKey) -> bool {
-        self.known.contains(order)
-    }
-}
-
 /// The gateway's decisions, kept apart from Aeron so they can be driven directly.
 struct Tracker {
-    stream: Arc<ReportStream>,
     pending: HashMap<Waiting, PendingOrder>,
     unsent: VecDeque<Waiting>,
-    recent: RecentOrders,
     /// Finds a cancel from its reject, which doesn't name the account.
     cancels: HashMap<UuidType, OrderKey>,
     next_sequence: u64,
@@ -193,12 +151,10 @@ struct Tracker {
 }
 
 impl Tracker {
-    fn new(stream: Arc<ReportStream>, retry_window: Duration, recent_orders: usize) -> Self {
+    fn new() -> Self {
         Self {
-            stream,
             pending: HashMap::new(),
             unsent: VecDeque::new(),
-            recent: RecentOrders::new(retry_window, recent_orders),
             cancels: HashMap::new(),
             next_sequence: 0,
             last_exec_id: 0,
@@ -223,18 +179,20 @@ impl Tracker {
         new
     }
 
-    fn on_report(&mut self, buffer: &[u8], now: Instant) {
+    fn on_report(&mut self, buffer: &[u8]) {
         match decode(buffer) {
             Decoded::TermMarker(term) => self.marker_term = self.marker_term.max(term),
             Decoded::Accepted { exec_id, order } if self.is_new(exec_id) => {
-                if let Some(covered_since) = self.recent.insert(order, now) {
-                    self.stream.covered_since(covered_since);
-                }
                 self.resolve(Waiting::New(order), || OrderOutcome::Accepted);
             }
-            Decoded::Rejected { exec_id, order, repeat } if self.is_new(exec_id) => {
-                let outcome = move || if repeat { OrderOutcome::Repeat } else { OrderOutcome::Rejected };
-                self.resolve(Waiting::New(order), outcome);
+            // The ID was claimed, so nobody else sent this order. The engine holding it can only
+            // mean a resend found the first attempt resting, and the order is working.
+            Decoded::Rejected { exec_id, order, repeat: true } if self.is_new(exec_id) => {
+                warn!("Cluster: A resend found its order already working");
+                self.resolve(Waiting::New(order), || OrderOutcome::Accepted);
+            }
+            Decoded::Rejected { exec_id, order, repeat: false } if self.is_new(exec_id) => {
+                self.resolve(Waiting::New(order), || OrderOutcome::Rejected);
             }
             Decoded::Canceled { exec_id, order } if self.is_new(exec_id) => {
                 self.resolve(Waiting::Cancel(order), || OrderOutcome::Canceled);
@@ -270,21 +228,14 @@ impl Tracker {
         Some(self.unsent.len())
     }
 
-    fn admit(&mut self, order: OutboundOrder, now: Instant) {
-        let OutboundOrder { request, message, published } = order;
+    fn admit(&mut self, order: OutboundOrder) {
+        let OutboundOrder { request, message, send_by, published } = order;
         let (waiting, cancel_id) = match request {
             EngineRequest::New(order) => (Waiting::New(order), None),
             EngineRequest::Cancel { order, cancel_id } => (Waiting::Cancel(order), Some(cancel_id)),
         };
 
-        if let Waiting::New(key) = waiting
-            && self.recent.contains(&key)
-        {
-            let _ = published.send(OrderOutcome::Repeat);
-            return;
-        }
-
-        // A retry can arrive while the original is still waiting.
+        // A repeated cancel can arrive while the first is still waiting.
         if let Some(existing) = self.pending.get_mut(&waiting) {
             existing.answers.push(published);
             return;
@@ -301,14 +252,15 @@ impl Tracker {
                 cancel_id,
                 message,
                 answers: vec![published],
-                deadline: now + REQUEST_DEADLINE,
+                deadline: send_by,
             },
         );
         self.unsent.push_back(waiting);
     }
 
-    /// Sends what it can, stopping when `offer` refuses. Returns whether anything was sent.
-    fn send_unsent(&mut self, mut offer: impl FnMut(&[u8]) -> bool) -> bool {
+    /// Sends what it can, stopping when `offer` refuses. Returns whether anything was sent. Nothing
+    /// goes out past its deadline, because an order's status relies on that. `expire` answers those.
+    fn send_unsent(&mut self, now: Instant, mut offer: impl FnMut(&[u8]) -> bool) -> bool {
         if self.awaiting_term {
             return false;
         }
@@ -318,6 +270,10 @@ impl Tracker {
                 self.unsent.pop_front();
                 continue;
             };
+            if order.deadline <= now {
+                self.unsent.pop_front();
+                continue;
+            }
             if !offer(&order.message) {
                 break;
             }
@@ -337,7 +293,7 @@ impl Tracker {
         for waiting in &expired {
             self.resolve(*waiting, || OrderOutcome::TimedOut);
         }
-        // A retry of an expired request queues again, and mustn't be sent twice.
+        // A repeat of an expired cancel queues again, and mustn't be sent twice.
         if !expired.is_empty() {
             self.unsent.retain(|waiting| !expired.contains(waiting));
         }
@@ -351,7 +307,6 @@ fn on_error(code: i32, message: &str) {
 pub fn spawn_cluster_gateway(
     config: ClusterConfig,
     stream: Arc<ReportStream>,
-    retry_window: Duration,
     link: Arc<EngineLink>,
 ) -> Result<OrderSender, String> {
     let (orders, incoming) = mpsc::channel::<OutboundOrder>(ORDER_QUEUE_LENGTH);
@@ -359,7 +314,7 @@ pub fn spawn_cluster_gateway(
 
     thread::Builder::new()
         .name("cluster-gateway".to_string())
-        .spawn(move || run(config, stream, retry_window, link, incoming, started))
+        .spawn(move || run(config, stream, link, incoming, started))
         .map_err(|err| err.to_string())?;
 
     startup.recv().map_err(|err| err.to_string())??;
@@ -369,7 +324,6 @@ pub fn spawn_cluster_gateway(
 fn run(
     config: ClusterConfig,
     stream: Arc<ReportStream>,
-    retry_window: Duration,
     link: Arc<EngineLink>,
     mut incoming: mpsc::Receiver<OutboundOrder>,
     started: std_mpsc::Sender<Result<(), String>>,
@@ -406,7 +360,7 @@ fn run(
     };
     info!("Cluster: Session open, leader is member {:?}", client.leader());
 
-    let mut tracker = Tracker::new(stream.clone(), retry_window, RECENT_ORDERS);
+    let mut tracker = Tracker::new();
     let mut leader_changes = client.leader_changes();
     let mut last_sweep = Instant::now();
     let mut last_position = Instant::now();
@@ -419,7 +373,7 @@ fn run(
                 // Ahead of the answer, so anything that follows it waits for this report too.
                 |buffer, header| {
                     stream.advance_to(header.position());
-                    tracker.on_report(buffer, Instant::now());
+                    tracker.on_report(buffer);
                 },
                 256,
             );
@@ -433,10 +387,6 @@ fn run(
                     images += 1;
                     stream.advance_to(image.position());
                 });
-            }
-            // With no image, reports are being missed, so memory can't be trusted from here back.
-            if images == 0 {
-                stream.covered_since(Instant::now());
             }
             // An order needs a way in and a way to hear the answer.
             link.set(client.is_leader_connected() && images > 0);
@@ -459,13 +409,14 @@ fn run(
         match incoming.try_recv() {
             Ok(order) => {
                 idle = false;
-                tracker.admit(order, Instant::now());
+                tracker.admit(order);
             }
             Err(TryRecvError::Disconnected) => return,
             Err(TryRecvError::Empty) => {}
         }
 
-        if tracker.send_unsent(|message| client.offer(message) == OfferResult::Sent) {
+        let now = Instant::now();
+        if tracker.send_unsent(now, |message| client.offer(message) == OfferResult::Sent) {
             idle = false;
         }
 
@@ -484,6 +435,8 @@ fn run(
 mod tests {
     use super::*;
 
+    use super::super::aeron_handler::REQUEST_DEADLINE;
+
     use sbe::WriteBuf;
     use sbe::execution_report_codec::ExecutionReportEncoder;
     use sbe::message_header_codec::ENCODED_LENGTH;
@@ -492,7 +445,6 @@ mod tests {
 
     use tokio::sync::oneshot::error::TryRecvError as AnswerEmpty;
 
-    const WINDOW: Duration = Duration::from_secs(60);
     const PLAYER: UuidType = [7, 7];
 
     fn report(exec_id: u64, order: OrderKey, exec_type: ExecTypeEnum, reason: OrdRejReasonEnum) -> Vec<u8> {
@@ -532,7 +484,7 @@ mod tests {
     }
 
     fn tracker() -> Tracker {
-        Tracker::new(Arc::new(ReportStream::default()), WINDOW, 16)
+        Tracker::new()
     }
 
     fn key(id: u64) -> OrderKey {
@@ -541,18 +493,19 @@ mod tests {
 
     fn outbound(request: EngineRequest, tag: u8) -> (OutboundOrder, oneshot::Receiver<OrderOutcome>) {
         let (published, answer) = oneshot::channel();
-        (OutboundOrder { request, message: vec![tag], published }, answer)
+        let send_by = Instant::now() + REQUEST_DEADLINE;
+        (OutboundOrder { request, message: vec![tag], send_by, published }, answer)
     }
 
     fn admit(tracker: &mut Tracker, request: EngineRequest, tag: u8) -> oneshot::Receiver<OrderOutcome> {
         let (order, answer) = outbound(request, tag);
-        tracker.admit(order, Instant::now());
+        tracker.admit(order);
         answer
     }
 
     fn drain(tracker: &mut Tracker) -> Vec<u8> {
         let mut sent = Vec::new();
-        tracker.send_unsent(|message| {
+        tracker.send_unsent(Instant::now(), |message| {
             sent.push(message[0]);
             true
         });
@@ -566,29 +519,42 @@ mod tests {
         assert_eq!(drain(&mut tracker), [1]);
         assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty), "held until the first report");
 
-        tracker.on_report(&accepted(1, key(1)), Instant::now());
+        tracker.on_report(&accepted(1, key(1)));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::Accepted));
     }
 
     #[test]
-    fn a_reject_says_whether_it_was_a_repeat() {
+    fn a_reject_is_final() {
         let mut tracker = tracker();
-        let mut first = admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        let mut second = admit(&mut tracker, EngineRequest::New(key(2)), 2);
-        let now = Instant::now();
-        tracker.on_report(&report(1, key(1), ExecTypeEnum::Rejected, OrdRejReasonEnum::DuplicateOrder), now);
-        tracker.on_report(&report(2, key(2), ExecTypeEnum::Rejected, OrdRejReasonEnum::Other), now);
-        assert_eq!(first.try_recv(), Ok(OrderOutcome::Repeat));
-        assert_eq!(second.try_recv(), Ok(OrderOutcome::Rejected));
+        let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
+        tracker.on_report(&report(1, key(1), ExecTypeEnum::Rejected, OrdRejReasonEnum::Other));
+        assert_eq!(answer.try_recv(), Ok(OrderOutcome::Rejected));
+    }
+
+    /// A resend never passes through the claim, so it can't be mistaken for a caller's repeat, and
+    /// the engine holding the order means the caller's one order is working.
+    #[test]
+    fn a_resend_that_finds_its_order_working_is_accepted() {
+        let mut tracker = tracker();
+        let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
+        assert_eq!(drain(&mut tracker), [1]);
+
+        tracker.on_leader_change();
+        tracker.on_report(&term_marker(1));
+        assert_eq!(tracker.resolve_term(1, true), Some(1));
+        assert_eq!(drain(&mut tracker), [1], "the gateway's own resend goes out with no claim");
+
+        tracker.on_report(&report(1, key(1), ExecTypeEnum::Rejected, OrdRejReasonEnum::DuplicateOrder));
+        assert_eq!(answer.try_recv(), Ok(OrderOutcome::Accepted));
     }
 
     #[test]
     fn the_same_report_from_another_node_changes_nothing() {
         let mut tracker = tracker();
-        tracker.on_report(&accepted(5, key(1)), Instant::now());
+        tracker.on_report(&accepted(5, key(1)));
         let mut answer = admit(&mut tracker, EngineRequest::New(key(2)), 2);
         // An old exec ID, as a slower node replays what a faster one already delivered.
-        tracker.on_report(&accepted(5, key(2)), Instant::now());
+        tracker.on_report(&accepted(5, key(2)));
         assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty));
     }
 
@@ -604,8 +570,8 @@ mod tests {
         assert!(drain(&mut tracker).is_empty(), "nothing is sent while the term is unresolved");
         assert_eq!(tracker.resolve_term(1, true), None, "no marker yet");
 
-        tracker.on_report(&accepted(1, key(1)), Instant::now());
-        tracker.on_report(&term_marker(1), Instant::now());
+        tracker.on_report(&accepted(1, key(1)));
+        tracker.on_report(&term_marker(1));
         assert_eq!(tracker.resolve_term(1, false), None, "no leader yet");
         assert_eq!(tracker.resolve_term(1, true), Some(2));
 
@@ -619,7 +585,7 @@ mod tests {
     fn a_stale_marker_does_not_resolve_a_newer_term() {
         let mut tracker = tracker();
         tracker.on_leader_change();
-        tracker.on_report(&term_marker(1), Instant::now());
+        tracker.on_report(&term_marker(1));
         assert_eq!(tracker.resolve_term(2, true), None);
     }
 
@@ -634,49 +600,73 @@ mod tests {
         drain(&mut tracker);
 
         tracker.on_leader_change();
-        tracker.on_report(&term_marker(0), Instant::now());
+        tracker.on_report(&term_marker(0));
         assert_eq!(tracker.resolve_term(0, true), Some(9));
         assert_eq!(drain(&mut tracker), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
-    fn the_deadline_answers_unknown_and_a_late_report_still_counts() {
+    fn the_deadline_answers_unknown_and_nothing_is_resent_after_it() {
         let mut tracker = tracker();
         let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
         drain(&mut tracker);
 
-        let later = Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1);
-        tracker.expire(later);
+        tracker.expire(Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::TimedOut));
 
-        // The order did land. Its retry must not run a second time.
-        tracker.on_report(&accepted(1, key(1)), later);
-        let mut retry = admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        assert_eq!(retry.try_recv(), Ok(OrderOutcome::Repeat));
+        // The order may have landed, so a later failover must leave it alone.
+        tracker.on_leader_change();
+        tracker.on_report(&term_marker(1));
+        assert_eq!(tracker.resolve_term(1, true), Some(0));
         assert!(drain(&mut tracker).is_empty());
     }
 
     #[test]
-    fn an_expired_order_that_was_never_sent_goes_once_on_retry() {
+    fn an_order_never_goes_out_past_its_deadline() {
         let mut tracker = tracker();
-        admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        assert!(!tracker.send_unsent(|_| false), "back pressure keeps it queued");
-        tracker.expire(Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1));
+        let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
+        assert!(!tracker.send_unsent(Instant::now(), |_| false), "back pressure keeps it queued");
 
-        admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        assert_eq!(drain(&mut tracker), [1]);
+        let late = Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1);
+        assert!(!tracker.send_unsent(late, |_| true), "the sweep hasn't run, and still nothing goes");
+        tracker.expire(late);
+        assert_eq!(answer.try_recv(), Ok(OrderOutcome::TimedOut));
     }
 
     #[test]
-    fn a_retry_while_waiting_shares_the_original() {
+    fn a_late_resend_does_not_outlive_the_deadline_either() {
         let mut tracker = tracker();
-        let mut first = admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        let mut retry = admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        assert_eq!(drain(&mut tracker), [1], "only one message reaches the engine");
+        admit(&mut tracker, EngineRequest::New(key(1)), 1);
+        drain(&mut tracker);
 
-        tracker.on_report(&accepted(1, key(1)), Instant::now());
-        assert_eq!(first.try_recv(), Ok(OrderOutcome::Accepted));
-        assert_eq!(retry.try_recv(), Ok(OrderOutcome::Accepted));
+        tracker.on_leader_change();
+        tracker.on_report(&term_marker(1));
+        assert_eq!(tracker.resolve_term(1, true), Some(1));
+        let late = Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1);
+        assert!(!tracker.send_unsent(late, |_| true));
+    }
+
+    #[test]
+    fn an_order_queued_too_long_is_not_sent() {
+        let mut tracker = tracker();
+        let (mut order, mut answer) = outbound(EngineRequest::New(key(1)), 1);
+        order.send_by = Instant::now();
+        tracker.admit(order);
+        assert!(drain(&mut tracker).is_empty());
+        tracker.expire(Instant::now());
+        assert_eq!(answer.try_recv(), Ok(OrderOutcome::TimedOut));
+    }
+
+    #[test]
+    fn a_repeated_cancel_after_expiry_goes_once() {
+        let mut tracker = tracker();
+        let cancel = EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] };
+        admit(&mut tracker, cancel, 1);
+        assert!(!tracker.send_unsent(Instant::now(), |_| false));
+        tracker.expire(Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1));
+
+        admit(&mut tracker, cancel, 1);
+        assert_eq!(drain(&mut tracker), [1]);
     }
 
     #[test]
@@ -687,27 +677,9 @@ mod tests {
         let mut second = admit(&mut tracker, EngineRequest::New(theirs), 2);
         assert_eq!(drain(&mut tracker), [1, 2]);
 
-        tracker.on_report(&accepted(1, mine), Instant::now());
+        tracker.on_report(&accepted(1, mine));
         assert_eq!(first.try_recv(), Ok(OrderOutcome::Accepted));
         assert_eq!(second.try_recv(), Err(AnswerEmpty::Empty));
-    }
-
-    #[test]
-    fn repeats_are_bounced_for_any_gateways_orders() {
-        let mut tracker = tracker();
-        // This gateway never sent the order, but it read the report.
-        tracker.on_report(&accepted(1, key(1)), Instant::now());
-        let mut repeat = admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        assert_eq!(repeat.try_recv(), Ok(OrderOutcome::Repeat));
-    }
-
-    #[test]
-    fn a_rejected_order_can_be_sent_again() {
-        let mut tracker = tracker();
-        tracker.on_report(&report(1, key(1), ExecTypeEnum::Rejected, OrdRejReasonEnum::Other), Instant::now());
-        let mut retry = admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        assert_eq!(retry.try_recv(), Err(AnswerEmpty::Empty));
-        assert_eq!(drain(&mut tracker), [1]);
     }
 
     #[test]
@@ -715,11 +687,11 @@ mod tests {
         let mut tracker = tracker();
         let cancel = EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] };
         let mut answer = admit(&mut tracker, cancel, 1);
-        tracker.on_report(&accepted(1, key(2)), Instant::now());
-        tracker.on_report(&canceled(2, key(2)), Instant::now());
+        tracker.on_report(&accepted(1, key(2)));
+        tracker.on_report(&canceled(2, key(2)));
         assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty), "another order's cancel");
 
-        tracker.on_report(&canceled(3, key(1)), Instant::now());
+        tracker.on_report(&canceled(3, key(1)));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::Canceled));
         assert!(tracker.cancels.is_empty());
     }
@@ -730,10 +702,10 @@ mod tests {
         let cancel = EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] };
         let mut answer = admit(&mut tracker, cancel, 1);
 
-        tracker.on_report(&cancel_reject([8, 8]), Instant::now());
+        tracker.on_report(&cancel_reject([8, 8]));
         assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty), "another cancel's reject");
 
-        tracker.on_report(&cancel_reject([9, 9]), Instant::now());
+        tracker.on_report(&cancel_reject([9, 9]));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::NotOpen));
     }
 
@@ -744,7 +716,7 @@ mod tests {
         let mut second = admit(&mut tracker, EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] }, 2);
         assert_eq!(drain(&mut tracker), [1]);
 
-        tracker.on_report(&canceled(1, key(1)), Instant::now());
+        tracker.on_report(&canceled(1, key(1)));
         assert_eq!(first.try_recv(), Ok(OrderOutcome::Canceled));
         assert_eq!(second.try_recv(), Ok(OrderOutcome::Canceled));
     }
@@ -756,36 +728,7 @@ mod tests {
         tracker.expire(Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::TimedOut));
         assert!(tracker.cancels.is_empty());
-        tracker.on_report(&cancel_reject([9, 9]), Instant::now());
-    }
-
-    #[test]
-    fn memory_drops_orders_past_the_window() {
-        let start = Instant::now();
-        let mut recent = RecentOrders::new(WINDOW, 16);
-        assert_eq!(recent.insert(key(1), start), None);
-        assert_eq!(recent.insert(key(2), start + WINDOW + Duration::from_secs(1)), None);
-        assert!(!recent.contains(&key(1)));
-        assert!(recent.contains(&key(2)));
-    }
-
-    #[test]
-    fn filling_memory_reports_what_it_stopped_covering() {
-        let start = Instant::now();
-        let mut recent = RecentOrders::new(WINDOW, 2);
-        recent.insert(key(1), start);
-        recent.insert(key(2), start + Duration::from_secs(1));
-        let dropped = recent.insert(key(3), start + Duration::from_secs(2));
-        assert_eq!(dropped, Some(start));
-        assert!(!recent.contains(&key(1)));
-        assert!(recent.contains(&key(3)));
-    }
-
-    #[test]
-    fn a_zero_window_remembers_nothing() {
-        let mut recent = RecentOrders::new(Duration::ZERO, 2);
-        recent.insert(key(1), Instant::now());
-        assert!(!recent.contains(&key(1)));
+        tracker.on_report(&cancel_reject([9, 9]));
     }
 
     #[test]

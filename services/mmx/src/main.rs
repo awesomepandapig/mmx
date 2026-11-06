@@ -227,7 +227,7 @@ enum OrderCommand {
         /// Limit price. Without it, this is a market order
         #[arg(long)]
         price: Option<String>,
-        /// Generated if left out
+        /// A UUIDv7 made in the last minute. Generated if left out
         #[arg(long)]
         client_order_id: Option<Uuid>,
     },
@@ -394,7 +394,7 @@ async fn run_order(cli: &Cli, player: Option<Uuid>, command: &OrderCommand) -> R
             client_order_id,
         } => {
             let order = NewOrder {
-                client_order_id: client_order_id.unwrap_or_else(Uuid::new_v4),
+                client_order_id: client_order_id.unwrap_or_else(Uuid::now_v7),
                 product_id: symbol.clone(),
                 side: side.clone(),
                 r#type: if price.is_some() { "limit" } else { "market" }.to_string(),

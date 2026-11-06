@@ -84,7 +84,7 @@ With Kustomize, create an overlay that sets the image tag, like `kustomize/overl
 | `demo.bots.enabled` | `false` | Load bots, which need a `demo-bots` image |
 | `networkPolicy.gameServers` | Pods labeled `mmx.io/role=game-server` | Who may reach gateways |
 | `cluster.leaderHeartbeatTimeout` | `500ms` | How fast a leader is replaced, along with `electionTimeout` |
-| `cluster.archiveSyncLevel` | `0` | Replication only. 1 or 2 syncs to disk on every write |
+| `cluster.archiveSyncLevel` | `1` | A commit is on a quorum's disks, which must survive power loss. 0 relies on replication, and 2 also syncs metadata |
 | `cluster.engine.maxOrders` | `1000000` | Sets the engine's memory, as shown in `STARTUP.md` |
 | `cluster.persistence.size` | `200Gi` | The tape is kept forever by default |
 | `secrets.existingSecret` | Empty | A plain Kubernetes secret, loaded as environment variables |

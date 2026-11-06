@@ -22,11 +22,14 @@ use metrics::Metrics;
 
 mod order;
 
-mod rate_limit;
-use rate_limit::{Limit, RateLimiter, Unlimited, Valkey};
+mod order_id;
+use order_id::{DEFAULT_WINDOW_SECS, OrderIdRules};
 
-mod repeat;
-use repeat::{RepeatGuard, ReportStream};
+mod rate_limit;
+use rate_limit::{Decision, Limit, RateLimiter, Unlimited, Valkey};
+
+mod recorder;
+use recorder::ReportStream;
 
 mod routes;
 
@@ -44,15 +47,17 @@ use std::env;
 use std::process;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use log::{error, info, warn};
 
 const DEFAULT_MARKETS_FILE: &str = "services/api/rest/markets.yaml";
 const DEFAULT_QUESTDB_URL: &str = "http://localhost:9000";
-const DEFAULT_RETRY_WINDOW_SECS: u64 = 300;
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8000";
 const DEFAULT_RATE_LIMIT_ORDERS: u64 = 50;
 const DEFAULT_RATE_LIMIT_WINDOW_MS: u64 = 1000;
+const CLAIMS_POLL: Duration = Duration::from_millis(200);
 
 pub struct AppState {
     orders: OrderSender,
@@ -60,10 +65,11 @@ pub struct AppState {
     markets: MarketRegistry,
     rate_limiter: Arc<dyn RateLimiter>,
     store: Arc<dyn OrderStore>,
-    /// Both of these need the cluster's report stream, so they're empty without one.
+    /// These need the cluster, so they're empty without one. With `id_rules` set, an order must
+    /// have a fresh UUIDv7 and a confirmed claim, or it isn't sent.
     report_stream: Option<Arc<ReportStream>>,
-    repeats: Option<RepeatGuard>,
-    require_client_order_id: bool,
+    id_rules: Option<OrderIdRules>,
+    claims_ready: Option<Arc<AtomicBool>>,
     engine: Arc<EngineLink>,
     halts: Arc<Halts>,
     metrics: Metrics,
@@ -77,8 +83,37 @@ fn env_number<T: FromStr>(name: &str, default: T) -> Result<T, String> {
     }
 }
 
-fn rate_limiter() -> Result<Arc<dyn RateLimiter>, String> {
+/// Takes the forms the nodes' settings use, because this must be the same value as theirs.
+fn parse_duration(text: &str) -> Option<Duration> {
+    let number = |digits: &str| digits.parse::<u64>().ok();
+    if let Some(digits) = text.strip_suffix("ms") {
+        return number(digits).map(Duration::from_millis);
+    }
+    if let Some(digits) = text.strip_suffix('s') {
+        return number(digits).map(Duration::from_secs);
+    }
+    text.strip_suffix('m').and_then(number).map(|minutes| Duration::from_secs(minutes * 60))
+}
+
+/// The session timeout has no default, because a guess that's too short could report a live order
+/// as never landed.
+fn order_id_rules() -> Result<OrderIdRules, String> {
+    let window = env_number("ORDER_ID_WINDOW_SECS", DEFAULT_WINDOW_SECS)?;
+    if window == 0 {
+        return Err("ORDER_ID_WINDOW_SECS must be above 0".to_string());
+    }
+    let session_timeout = env::var("CLUSTER_SESSION_TIMEOUT")
+        .map_err(|_| "CLUSTER_SESSION_TIMEOUT must match the cluster's session timeout".to_string())?;
+    let session_timeout = parse_duration(&session_timeout)
+        .ok_or_else(|| format!("CLUSTER_SESSION_TIMEOUT must look like 30s, got {session_timeout:?}"))?;
+    Ok(OrderIdRules { window: Duration::from_secs(window), session_timeout })
+}
+
+fn rate_limiter(id_rules: Option<OrderIdRules>) -> Result<Arc<dyn RateLimiter>, String> {
     let Ok(url) = env::var("VALKEY_URL") else {
+        if id_rules.is_some() {
+            return Err("VALKEY_URL is required in cluster mode, because orders are claimed there".to_string());
+        }
         warn!("Rate limit: VALKEY_URL isn't set, so orders aren't limited");
         return Ok(Arc::new(Unlimited));
     };
@@ -87,7 +122,30 @@ fn rate_limiter() -> Result<Arc<dyn RateLimiter>, String> {
         window_ms: env_number("RATE_LIMIT_WINDOW_MS", DEFAULT_RATE_LIMIT_WINDOW_MS)?,
     };
     info!("Rate limit: {} orders per {} ms by default", limit.orders, limit.window_ms);
-    Ok(Arc::new(Valkey::new(&url, limit)?))
+    Ok(Arc::new(Valkey::new(&url, limit, id_rules)?))
+}
+
+/// Keeps `/readyz` current, and makes a lost epoch start its hold at once rather than at the first
+/// order. Whether an order may go is still decided by the script, never by this flag.
+fn watch_claims(limiter: Arc<dyn RateLimiter>) -> Arc<AtomicBool> {
+    let ready = Arc::new(AtomicBool::new(false));
+    let flag = ready.clone();
+    tokio::spawn(async move {
+        loop {
+            let answer = limiter.claims_ready().await;
+            let now_ready = answer == Ok(Decision::Allowed);
+            let was_ready = flag.swap(now_ready, Ordering::Relaxed);
+            match answer {
+                Ok(Decision::Allowed) if !was_ready => info!("Claims: Ready for new orders"),
+                Ok(Decision::Recovering { retry_after_ms }) if was_ready => {
+                    error!("Claims: Valkey lost its data, so new orders wait {retry_after_ms} ms");
+                }
+                _ => {}
+            }
+            tokio::time::sleep(CLAIMS_POLL).await;
+        }
+    });
+    ready
 }
 
 fn halts() -> Result<Arc<Halts>, String> {
@@ -117,16 +175,17 @@ async fn start() -> Result<(), String> {
 
     let engine = Arc::new(EngineLink::default());
 
-    let clustered = ClusterConfig::from_env();
-    let require_client_order_id = clustered.is_some();
-    let (orders, report_stream, repeats) = match clustered {
+    let (orders, report_stream, id_rules) = match ClusterConfig::from_env() {
         Some(config) => {
-            let window = env_number("RETRY_WINDOW_SECS", DEFAULT_RETRY_WINDOW_SECS)?;
-            let window = Duration::from_secs(window);
+            let id_rules = order_id_rules()?;
+            info!(
+                "Order IDs: Accepted for {:?}, and an order settles {:?} after its ID",
+                id_rules.window,
+                id_rules.settled_after()
+            );
             let stream = Arc::new(ReportStream::default());
-            let orders = spawn_cluster_gateway(config, stream.clone(), window, engine.clone())?;
-            let repeats = RepeatGuard { stream: stream.clone(), store: store.clone(), window };
-            (orders, Some(stream), Some(repeats))
+            let orders = spawn_cluster_gateway(config, stream.clone(), engine.clone())?;
+            (orders, Some(stream), Some(id_rules))
         }
         None => {
             let channel = transport::env_or("PUB_CHANNEL", transport::ORDERS_CHANNEL);
@@ -135,15 +194,18 @@ async fn start() -> Result<(), String> {
         }
     };
 
+    let rate_limiter = rate_limiter(id_rules)?;
+    let claims_ready = id_rules.map(|_| watch_claims(rate_limiter.clone()));
+
     let shared_state = Arc::new(AppState {
         orders,
         auth: Arc::new(TrustedGameServer),
         markets,
-        rate_limiter: rate_limiter()?,
+        rate_limiter,
         store,
         report_stream,
-        repeats,
-        require_client_order_id,
+        id_rules,
+        claims_ready,
         engine,
         halts,
         metrics: Metrics::default(),
@@ -152,10 +214,11 @@ async fn start() -> Result<(), String> {
 
     let app = routes::router(shared_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8000")
+    let address = transport::env_or("BIND_ADDR", DEFAULT_BIND_ADDR);
+    let listener = tokio::net::TcpListener::bind(&address)
         .await
-        .map_err(|e| format!("Server: Failed to bind to port 8000: {e}"))?;
-    info!("Server: Bound to 0.0.0.0:8000");
+        .map_err(|e| format!("Server: Failed to bind to {address}: {e}"))?;
+    info!("Server: Bound to {address}");
 
     let startup_duration = start_time.elapsed();
     info!(

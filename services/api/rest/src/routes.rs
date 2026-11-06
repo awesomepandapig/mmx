@@ -1,18 +1,19 @@
 use super::AppState;
 use super::admin;
-use super::aeron_handler::{EngineRequest, OrderOutcome, OutboundOrder};
+use super::aeron_handler::{EngineRequest, OrderOutcome, OutboundOrder, REQUEST_DEADLINE};
 use super::errors::AppError;
 use super::halts::Refusal;
 use super::identity::Player;
 use super::markets::normalize_symbol;
 use super::order::{Order, create_cancel_buffer, create_order_buffer, u64s_to_uuid, uuid_to_u64s};
-use super::rate_limit::Decision;
-use super::repeat::await_recorder;
+use super::order_id;
+use super::rate_limit::{Claim, Decision};
+use super::recorder::await_recorder;
 use super::store::OrderQuery;
 use super::validation::{CreateOrder, ValidOrder, validate_order};
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::{
     Json, Router,
@@ -36,6 +37,7 @@ use uuid::Uuid;
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_LIST_LIMIT: usize = 1000;
 pub const MAX_CANCEL_ALL: usize = 10_000;
+const NANOS_PER_MILLI: u64 = 1_000_000;
 
 pub fn router(state: Arc<AppState>) -> Router {
     // Every route here shares the one layer, so a new one can't forget its auth.
@@ -69,11 +71,12 @@ async fn submit(
     state: &AppState,
     request: EngineRequest,
     message: Vec<u8>,
+    send_by: Instant,
 ) -> Result<oneshot::Receiver<OrderOutcome>, AppError> {
     let (published, result) = oneshot::channel();
     state
         .orders
-        .send(OutboundOrder { request, message, published })
+        .send(OutboundOrder { request, message, send_by, published })
         .await
         .map_err(|_| AppError::InternalServerError("Order publisher stopped".to_string()))?;
     Ok(result)
@@ -85,12 +88,28 @@ pub async fn outcome(result: oneshot::Receiver<OrderOutcome>) -> Result<OrderOut
         .map_err(|_| AppError::InternalServerError("Order publisher stopped".to_string()))
 }
 
-/// Only a checked limit can refuse an order. Valkey being down mustn't stop trading, so an error
-/// lets the order through.
-async fn check_rate_limit(state: &AppState, player: Player) -> Result<(), AppError> {
-    match state.rate_limiter.check(player.0).await {
+/// In cluster mode an order must claim its ID, and anything short of a confirmed claim refuses it.
+/// Otherwise only a checked limit can refuse an order, so Valkey being down doesn't stop trading.
+async fn claim_and_limit(state: &AppState, player: Player, id: Uuid) -> Result<(), AppError> {
+    let claim = match &state.id_rules {
+        Some(_) => {
+            let time_ms = order_id::time_ms(id).ok_or(AppError::InvalidOrderId(id))?;
+            Some(Claim { id, time_ms })
+        }
+        None => None,
+    };
+    match state.rate_limiter.check(player.0, claim).await {
         Ok(Decision::Allowed) => Ok(()),
         Ok(Decision::Limited { retry_after_ms }) => Err(AppError::RateLimited { retry_after_ms }),
+        Ok(Decision::Duplicate) => Err(AppError::DuplicateOrder(id)),
+        Ok(Decision::Recovering { retry_after_ms }) => {
+            Err(AppError::ClaimsRecovering { id, retry_after_ms })
+        }
+        Ok(Decision::OutOfDate) => Err(AppError::StaleOrderId(id)),
+        Err(err) if claim.is_some() => {
+            warn!("Claims: Refusing order {id}, nothing was sent: {err}");
+            Err(AppError::ClaimUnavailable(id))
+        }
         Err(err) => {
             warn!("Rate limit: Letting an order through unchecked: {err}");
             Ok(())
@@ -128,25 +147,24 @@ async fn place_order(
     let Json(payload) = payload?;
 
     let markets = state.markets.current();
-    let order = validate_order(&payload, player, &markets, state.require_client_order_id)?;
+    let now_ms = now_ns()? / NANOS_PER_MILLI;
+    let order = validate_order(&payload, player, &markets, state.id_rules.as_ref(), now_ms)?;
     let id = u64s_to_uuid(order.cl_ord_id);
+    let send_by = Instant::now() + REQUEST_DEADLINE;
 
-    // First so that a halted market doesn't spend the player's limit.
+    // First so that a halted market doesn't spend the player's limit or the ID.
     check_halt(state, &order)?;
-    check_rate_limit(state, player).await?;
-    if let Some(repeats) = &state.repeats {
-        repeats.check(player.0, id).await?;
-    }
-    // The checks above can wait on Valkey and QuestDB, and a halt may have landed meanwhile.
+    claim_and_limit(state, player, id).await?;
+    // That can wait on Valkey, and a halt may have landed meanwhile. The claim stays spent, and the
+    // answer says nothing was sent, so the caller moves on to a new ID.
     check_halt(state, &order)?;
 
     let _in_flight = state.metrics.in_flight();
     let message = create_order_buffer(&order, now_ns()?).to_vec();
     let request = EngineRequest::New((order.account, order.cl_ord_id));
-    match outcome(submit(state, request, message).await?).await? {
+    match outcome(submit(state, request, message, send_by).await?).await? {
         OrderOutcome::Accepted => {}
         OrderOutcome::Rejected => return Err(AppError::OrderRejected(id)),
-        OrderOutcome::Repeat => return Err(AppError::RepeatOrder(id)),
         OrderOutcome::TimedOut => return Err(AppError::OrderOutcomeUnknown(id)),
         OrderOutcome::Failed(err) => {
             return Err(AppError::InternalServerError(format!("Failed to publish order: {err}")));
@@ -176,7 +194,7 @@ pub async fn submit_cancel(
     let account = player.account();
     let message = create_cancel_buffer(&orig_cl_ord_id, &cancel_id, &account, now_ns()?).to_vec();
     let request = EngineRequest::Cancel { order: (account, orig_cl_ord_id), cancel_id };
-    submit(state, request, message).await
+    submit(state, request, message, Instant::now() + REQUEST_DEADLINE).await
 }
 
 pub async fn cancel_order(
@@ -307,18 +325,91 @@ pub async fn list_orders(
     Ok(Json(orders.into_iter().map(Order::recorded).collect()))
 }
 
+/// An order with no record. `settled` matches a recorded order's: true means any escrow can clear.
+#[derive(Serialize, Debug)]
+pub struct MissingOrder {
+    id: Uuid,
+    status: &'static str,
+    settled: bool,
+    message: &'static str,
+}
+
+impl MissingOrder {
+    fn unknown(id: Uuid) -> Self {
+        let message = "This order may still land. Keep any funds on hold and ask again.";
+        Self { id, status: "unknown", settled: false, message }
+    }
+
+    fn never_landed(id: Uuid) -> Self {
+        let message = "This order never reached the engine and can't now. Any funds can be released.";
+        Self { id, status: "never_landed", settled: true, message }
+    }
+}
+
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+pub enum OrderStatus {
+    Recorded(Box<Order>),
+    Missing(MissingOrder),
+}
+
+/// Any gateway can answer this, since it reads only the recorder and the time inside the ID.
 pub async fn get_order(
     State(state): State<Arc<AppState>>,
     player: Player,
     id: Result<Path<Uuid>, PathRejection>,
-) -> Result<Json<Order>, AppError> {
+) -> Result<Json<OrderStatus>, AppError> {
     let Path(id) = id?;
     // The account is part of the query, so another player's order is simply not found.
     let query = OrderQuery { account: player.0, cl_ord_id: Some(id), limit: 1, ..Default::default() };
-    let orders = state.store.orders(&query).await.map_err(|err| {
-        warn!("QuestDB: Failed to read an order: {err}");
-        AppError::RecorderBehind
-    })?;
-    let order = orders.into_iter().next().ok_or(AppError::OrderNotFound)?;
-    Ok(Json(Order::recorded(order)))
+    let found = state.store.orders(&query).await.map(|orders| orders.into_iter().next());
+    let found = found.inspect_err(|err| warn!("QuestDB: Failed to read an order: {err}"));
+
+    if state.id_rules.is_none() {
+        let order = found.map_err(|_| AppError::RecorderBehind)?.ok_or(AppError::OrderNotFound)?;
+        return Ok(Json(OrderStatus::Recorded(Box::new(Order::recorded(order)))));
+    }
+    let status = match found {
+        Ok(Some(order)) => OrderStatus::Recorded(Box::new(Order::recorded(order))),
+        Ok(None) => prove_absent(&state, player, id, &query).await,
+        Err(_) => OrderStatus::Missing(MissingOrder::unknown(id)),
+    };
+    Ok(Json(status))
+}
+
+/// Says "never landed" only when that can't turn out false, since a game releases funds on it.
+///
+/// Age alone isn't enough, because nodes can hold a logged order while no quorum is up to commit it,
+/// and a stale report stream or recorder would hide it. So this sends a marker through the log, and
+/// whatever landed before it is on the stream ahead of its answer. A cancel for an ID nobody has
+/// used does that with no change to the engine. It's reported like any other, so the game gets a
+/// `cancel_rejected` webhook naming that ID. An ID this old can't land after the marker, so once the
+/// recorder has passed the marker, a second read is the last word.
+async fn prove_absent(state: &AppState, player: Player, id: Uuid, query: &OrderQuery) -> OrderStatus {
+    let unknown = || OrderStatus::Missing(MissingOrder::unknown(id));
+    let (Some(rules), Some(stream)) = (&state.id_rules, &state.report_stream) else {
+        return unknown();
+    };
+    let Some(time_ms) = order_id::time_ms(id) else { return unknown() };
+    let Ok(now) = now_ns() else { return unknown() };
+    let age = Duration::from_millis((now / NANOS_PER_MILLI).saturating_sub(time_ms));
+    if age <= rules.settled_after() {
+        return unknown();
+    }
+
+    let Ok(marker) = submit_cancel(state, player, Uuid::new_v4()).await else { return unknown() };
+    if !matches!(outcome(marker).await, Ok(OrderOutcome::NotOpen)) {
+        return unknown();
+    }
+    if await_recorder(stream, state.store.as_ref()).await.is_err() {
+        return unknown();
+    }
+    match state.store.orders(query).await.map(|orders| orders.into_iter().next()) {
+        Ok(Some(order)) => OrderStatus::Recorded(Box::new(Order::recorded(order))),
+        Ok(None) => OrderStatus::Missing(MissingOrder::never_landed(id)),
+        Err(err) => {
+            warn!("QuestDB: Failed to read an order: {err}");
+            unknown()
+        }
+    }
 }

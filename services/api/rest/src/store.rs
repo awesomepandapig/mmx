@@ -1,5 +1,5 @@
 //! Reads order history from QuestDB, the query view of the tape. It can lag behind the stream, so
-//! anything that needs an up-to-date answer goes through `repeat::await_recorder` first.
+//! anything that needs an up-to-date answer goes through `recorder::await_recorder` first.
 //!
 //! The recorder must keep two promises:
 //!
@@ -27,12 +27,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 const ORDERS_COLUMNS: &str = "cl_ord_id, last(symbol) symbol, last(ord_status) ord_status, \
      last(side) side, last(leaves_qty) leaves_qty, last(cum_qty) cum_qty, last(price) price, \
      last_not_null(avg_px) avg_px, min(ts) created_at, max(ts) updated_at";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OrderKey {
-    pub account: Uuid,
-    pub cl_ord_id: Uuid,
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OrdersCommits {
@@ -87,10 +81,6 @@ pub trait OrderStore: Send + Sync {
     /// How far `orders` commits have been applied, and how far they've been made.
     async fn orders_commits(&self) -> Result<OrdersCommits, String>;
 
-    /// Whether this order got as far as the engine in the last `window`. A rejected order doesn't
-    /// count, because it never executed and may be sent again.
-    async fn order_reached_engine(&self, key: &OrderKey, window: Duration) -> Result<bool, String>;
-
     async fn orders(&self, query: &OrderQuery) -> Result<Vec<RecordedOrder>, String>;
 
     /// Every player's working orders in one market. `symbol` must already be normalized.
@@ -123,16 +113,6 @@ fn parse_reply(body: &str) -> Result<Option<ExecReply>, String> {
 
 const POSITION_SQL: &str = "select position from recorder_position";
 const COMMITS_SQL: &str = "select writerTxn, sequencerTxn from wal_tables() where name = 'orders'";
-
-fn repeat_sql(key: &OrderKey, window: Duration) -> String {
-    format!(
-        "select count() from orders where account = '{}' and cl_ord_id = '{}' \
-         and ord_status != 'rejected' and ts >= dateadd('s', -{}, now())",
-        key.account,
-        key.cl_ord_id,
-        window.as_secs()
-    )
-}
 
 /// A rejected repeat shares its original's client order ID, but it says nothing about that order.
 /// Left in, it would read as the latest state of an order that's still working, and a game could
@@ -308,11 +288,6 @@ impl OrderStore for QuestDb {
             Some(reply) => parse_commits(&reply),
             None => Ok(OrdersCommits::default()),
         }
-    }
-
-    async fn order_reached_engine(&self, key: &OrderKey, window: Duration) -> Result<bool, String> {
-        let reply = self.exec(&repeat_sql(key, window)).await?;
-        Ok(reply.as_ref().and_then(first_number).unwrap_or(0) > 0)
     }
 
     async fn orders(&self, query: &OrderQuery) -> Result<Vec<RecordedOrder>, String> {
@@ -500,15 +475,6 @@ mod tests {
     #[test]
     fn an_unknown_status_is_refused() {
         assert!(parse_status("mystery").is_err());
-    }
-
-    #[test]
-    fn repeat_checks_skip_rejected_orders_and_stay_in_the_window() {
-        let key = OrderKey { account: account(), cl_ord_id: Uuid::nil() };
-        let sql = repeat_sql(&key, Duration::from_secs(300));
-        assert!(sql.contains("ord_status != 'rejected'"));
-        assert!(sql.contains("ts >= dateadd('s', -300, now())"));
-        assert!(sql.contains(&format!("account = '{}'", account())));
     }
 
     #[test]

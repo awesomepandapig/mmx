@@ -64,6 +64,9 @@ spec:
               value: mmx-node-0.mmx-node:20000,mmx-node-1.mmx-node:20001,mmx-node-2.mmx-node:20002
             - name: CLUSTER_RESPONSE_CHANNEL
               value: aeron:udp?endpoint=$(POD_IP):20301
+            # Must match SESSION_TIMEOUT in node.env.
+            - name: CLUSTER_SESSION_TIMEOUT
+              value: 30s
             - name: CLUSTER_REPORT_CHANNELS
               value: aeron:udp?endpoint=$(POD_IP):0|control=mmx-node-0.mmx-node:40450|session-id=1002,aeron:udp?endpoint=$(POD_IP):0|control=mmx-node-1.mmx-node:40451|session-id=1002,aeron:udp?endpoint=$(POD_IP):0|control=mmx-node-2.mmx-node:40452|session-id=1002
             - name: CLIENT_HOST
