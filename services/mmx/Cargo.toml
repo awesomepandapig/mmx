@@ -9,6 +9,7 @@ edition = "2024"
 # services inside the exchange are still plain HTTP.
 [dependencies]
 argon2 = { version = "0.5.3", features = ["std"] }
+async-nats = "0.42.0"
 axum = "0.8.4"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }

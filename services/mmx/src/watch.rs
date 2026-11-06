@@ -87,6 +87,12 @@ pub fn render(kind: &str, data: &Value) -> String {
                 text(data, "target")
             )
         }
+        "sample" => format!(
+            "sample  {} sent {} of {}",
+            text(data, "table"),
+            data.get("sent").unwrap_or(&Value::Null),
+            data.get("seen").unwrap_or(&Value::Null),
+        ),
         "source_failed" => format!(
             "source  {} failing: {}",
             text(data, "source"),

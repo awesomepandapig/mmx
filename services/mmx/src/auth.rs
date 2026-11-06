@@ -1,9 +1,16 @@
-//! Who may use `/admin/v1`. The CLI sends `MMX_ADMIN_TOKEN` as a bearer, and the console holds a
-//! signed session cookie from a password or an OIDC provider.
+//! Who may use `/admin/v1`, and what they may do. The CLI sends `MMX_ADMIN_TOKEN` as a bearer, and
+//! the console holds a signed session cookie. An OIDC provider is the normal way in, and its groups
+//! decide a person's role. The password is for first install and break-glass, and carries the admin
+//! role, like the token.
 //!
 //! There's no default password. The first start reads `MMX_ADMIN_PASSWORD` or generates one and logs
 //! it once, and only a hash is stored. That password only unlocks first-run setup, where the admin
 //! chooses a real one.
+//!
+//! Destructive routes need a recent sign-in. A password session proves it by typing the password
+//! again, and an OIDC session goes back to the provider, which must say when the person signed in.
+//! The bearer token is exempt: it's a credential only a cluster admin can read, it can't be phished
+//! through a browser, and there's nobody at a prompt in a script.
 //!
 //! A session is a signed cookie, so nothing about it is stored, and every replica can check it. A
 //! generation number in the Secret revokes them all at once. Logging out only clears the cookie in
@@ -39,10 +46,15 @@ use tracing::{info, warn};
 
 pub const SESSION_COOKIE: &str = "mmx_session";
 const OIDC_COOKIE: &str = "mmx_oidc";
+const OIDC_CALLBACK: &str = "/admin/v1/oidc/callback";
 pub const CSRF_HEADER: &str = "x-csrf-token";
 
 const SESSION_SECS: u64 = 12 * 60 * 60;
 const OIDC_LOGIN_SECS: u64 = 10 * 60;
+/// How long a sign-in counts as recent, for destructive actions.
+pub const STEP_UP_SECS: u64 = 5 * 60;
+/// Clocks at the provider and here can disagree by this much.
+const CLOCK_SKEW_SECS: u64 = 60;
 const MIN_PASSWORD: usize = 12;
 const MAX_PASSWORD: usize = 1024;
 
@@ -113,42 +125,139 @@ fn check_new_password(password: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// What someone may do. Each role includes the ones before it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Viewer,
+    Operator,
+    Admin,
+}
+
+/// Provider groups for each role, by exact name. Someone in several gets the highest.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
+pub struct RoleGroups {
+    #[serde(default)]
+    pub admin: Vec<String>,
+    #[serde(default)]
+    pub operator: Vec<String>,
+    #[serde(default)]
+    pub viewer: Vec<String>,
+}
+
+impl RoleGroups {
+    /// Nobody gets in by default: a group that isn't listed is worth nothing.
+    pub fn role_for(&self, groups: &[String]) -> Option<Role> {
+        let holds = |listed: &[String]| groups.iter().any(|group| listed.contains(group));
+        if holds(&self.admin) {
+            Some(Role::Admin)
+        } else if holds(&self.operator) {
+            Some(Role::Operator)
+        } else if holds(&self.viewer) {
+            Some(Role::Viewer)
+        } else {
+            None
+        }
+    }
+}
+
+pub const DEFAULT_GROUPS_CLAIM: &str = "groups";
+
+fn default_groups_claim() -> String {
+    DEFAULT_GROUPS_CLAIM.to_string()
+}
+
+/// Older files can hold fields that are gone, such as the sign-in list, so unknown fields are
+/// ignored here. They're dropped on the next save.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct OidcSettings {
     pub enabled: bool,
     pub issuer: String,
     pub client_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
-    /// Emails, `@domains` or subjects. Nobody gets in if this is empty.
+    #[serde(default = "default_groups_claim")]
+    pub groups_claim: String,
     #[serde(default)]
-    pub allowed: Vec<String>,
-}
-
-fn yes() -> bool {
-    true
+    pub roles: RoleGroups,
 }
 
 /// `console.yaml` in the store. None of it is secret.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Settings {
+    /// Left out, it's whatever the deployment asks for, and on by default. A stored value wins, so
+    /// `mmx auth password-login on` works as a way back in on any install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_url: Option<String>,
-    #[serde(default = "yes")]
-    pub password_login: bool,
+    pub password_login: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc: Option<OidcSettings>,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            public_url: None,
-            password_login: true,
-            oidc: None,
+/// What the deployment sets in the environment, so an install can start with its provider already
+/// connected. A provider set here can't be changed from the console.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Managed {
+    pub oidc: Option<OidcSettings>,
+    pub client_secret: Option<String>,
+    pub password_login: Option<bool>,
+}
+
+fn group_list(text: Option<String>) -> Vec<String> {
+    text.unwrap_or_default()
+        .split(',')
+        .map(|group| group.trim().to_string())
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+impl Managed {
+    /// `read` is the environment. Half a provider stops the server here, rather than leaving
+    /// everyone locked out with no explanation.
+    pub fn read(read: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let text = |name: &str| read(name).filter(|value| !value.trim().is_empty());
+        let password_login = match text("MMX_PASSWORD_LOGIN").as_deref() {
+            None => None,
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(other) => {
+                return Err(format!(
+                    "MMX_PASSWORD_LOGIN must be true or false, not {other}"
+                ));
+            }
+        };
+        let Some(issuer) = text("MMX_OIDC_ISSUER") else {
+            return Ok(Self {
+                password_login,
+                ..Self::default()
+            });
+        };
+        oidc::check_url("MMX_OIDC_ISSUER", issuer.trim())?;
+        let client_id = text("MMX_OIDC_CLIENT_ID")
+            .ok_or("MMX_OIDC_ISSUER is set, but MMX_OIDC_CLIENT_ID isn't")?;
+        let client_secret = text("MMX_OIDC_CLIENT_SECRET")
+            .ok_or("MMX_OIDC_ISSUER is set, but MMX_OIDC_CLIENT_SECRET isn't")?;
+        let roles = RoleGroups {
+            admin: group_list(text("MMX_OIDC_ADMIN_GROUPS")),
+            operator: group_list(text("MMX_OIDC_OPERATOR_GROUPS")),
+            viewer: group_list(text("MMX_OIDC_VIEWER_GROUPS")),
+        };
+        if roles.admin.is_empty() {
+            return Err(
+                "MMX_OIDC_ADMIN_GROUPS is empty, so nobody could run this install".to_string(),
+            );
         }
+        Ok(Self {
+            oidc: Some(OidcSettings {
+                enabled: true,
+                issuer: issuer.trim().trim_end_matches('/').to_string(),
+                client_id: client_id.trim().to_string(),
+                display_name: text("MMX_OIDC_DISPLAY_NAME"),
+                groups_claim: text("MMX_OIDC_GROUPS_CLAIM").unwrap_or_else(default_groups_claim),
+                roles,
+            }),
+            client_secret: Some(client_secret),
+            password_login,
+        })
     }
 }
 
@@ -194,6 +303,7 @@ pub struct Keys {
     password_hash: Option<String>,
     must_set: bool,
     pub settings: Settings,
+    pub password_login: bool,
     oidc_secret: Option<String>,
 }
 
@@ -201,6 +311,9 @@ pub struct Keys {
 pub struct Session {
     pub user: String,
     pub method: String,
+    pub role: Role,
+    /// When this person last proved who they are. Zero if a provider never said.
+    auth_at: u64,
     expires: u64,
     generation: u64,
     csrf: String,
@@ -215,11 +328,30 @@ pub enum Caller {
     Session(Session),
 }
 
+impl Caller {
+    fn role(&self) -> Role {
+        match self {
+            Self::Token | Self::Local => Role::Admin,
+            Self::Session(session) => session.role,
+        }
+    }
+
+    /// Who to name in the audit log.
+    fn name(&self) -> &str {
+        match self {
+            Self::Token => "the admin token",
+            Self::Local => "a local caller",
+            Self::Session(session) => &session.user,
+        }
+    }
+}
+
 pub struct Auth {
     store: Arc<ConfigStore>,
     /// Hashed, so that comparing doesn't reveal the token's length.
     token: Option<[u8; 32]>,
     insecure_local: bool,
+    managed: Managed,
     keys: RwLock<Arc<Keys>>,
     hashing: Semaphore,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
@@ -265,19 +397,46 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         })
 }
 
-/// Secure cookies need TLS, which the operator terminates in front of this server, so the public URL
-/// says whether it's there. Without one, a proxy's header can still turn it on.
-fn secure(keys: &Keys, headers: &HeaderMap) -> bool {
-    let public = keys
-        .settings
-        .public_url
-        .as_deref()
-        .is_some_and(|url| url.starts_with("https://"));
-    let forwarded = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
-    public || forwarded
+/// One value from a header a proxy sets. The first is the one the client reached.
+fn forwarded<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let value = headers.get(name)?.to_str().ok()?;
+    let first = value.split(',').next()?.trim();
+    (!first.is_empty()).then_some(first)
+}
+
+fn valid_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-_:[]".contains(&byte))
+}
+
+/// The scheme and host this request was addressed to. These headers can be forged, which is safe
+/// for what they're used for. A forged host only changes the redirect URI, which the provider
+/// compares with the one registered, and a forged scheme only hides a cookie from its own sender.
+/// Nothing else trusts them, and they never decide who someone is.
+pub fn request_origin(headers: &HeaderMap) -> Option<String> {
+    let host = forwarded(headers, "x-forwarded-host")
+        .filter(|host| valid_host(host))
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|value| value.to_str().ok())
+                .filter(|host| valid_host(host))
+        })?;
+    let scheme = if secure(headers) { "https" } else { "http" };
+    Some(format!("{scheme}://{host}"))
+}
+
+/// Exactly what to register with a provider.
+pub fn redirect_uri(headers: &HeaderMap) -> Option<String> {
+    Some(format!("{}{OIDC_CALLBACK}", request_origin(headers)?))
+}
+
+/// Secure cookies need TLS, which is terminated in front of this server, so only the proxy knows.
+fn secure(headers: &HeaderMap) -> bool {
+    forwarded(headers, "x-forwarded-proto").is_some_and(|proto| proto.eq_ignore_ascii_case("https"))
 }
 
 fn cookie(
@@ -298,23 +457,21 @@ fn internal(message: String) -> ApiError {
 }
 
 /// A browser always names the page a write came from. This backs up the CSRF token, and covers
-/// login, which has no session to hold one yet.
-fn check_origin(keys: &Keys, headers: &HeaderMap) -> Result<(), ApiError> {
+/// login, which has no session to hold one yet. A page on another site can't set `X-Forwarded-Host`
+/// without a CORS preflight, which this server never answers, so accepting it is safe, and needed
+/// behind a proxy that rewrites `Host`.
+fn check_origin(headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return Ok(());
     };
     let origin = origin.to_str().unwrap_or_default();
     let host = origin.split_once("://").map_or(origin, |(_, host)| host);
-    let host_matches = headers
+    let same =
+        |expected: Option<&str>| expected.is_some_and(|name| name.eq_ignore_ascii_case(host));
+    let direct = headers
         .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|expected| expected.eq_ignore_ascii_case(host));
-    let public_matches = keys
-        .settings
-        .public_url
-        .as_deref()
-        .is_some_and(|url| url.trim_end_matches('/').eq_ignore_ascii_case(origin));
-    if host_matches || public_matches {
+        .and_then(|value| value.to_str().ok());
+    if same(direct) || same(forwarded(headers, "x-forwarded-host")) {
         Ok(())
     } else {
         Err(error(
@@ -333,11 +490,13 @@ impl Auth {
         token: Option<&str>,
         insecure_local: bool,
         initial_password: Option<String>,
+        managed: Managed,
     ) -> Result<Arc<Self>, String> {
         let auth = Arc::new(Self {
             store,
             token: token.map(digest),
             insecure_local,
+            managed,
             keys: RwLock::new(Arc::new(Keys::default())),
             hashing: Semaphore::new(CONCURRENT_HASHES),
             failures: Mutex::default(),
@@ -371,7 +530,11 @@ impl Auth {
             doc.data
                 .insert(MUST_SET_KEY.to_string(), "true".to_string());
         }
+        // With a provider and no password login, nobody will use this. `mmx auth reset-password`
+        // makes a usable one for break-glass.
+        let unused = self.managed.password_login == Some(false);
         match self.store.put_secrets(&doc).await {
+            Ok(_) if unused => Ok(()),
             Ok(_) if generated => {
                 info!("Console: first-run admin password: {password}");
                 info!("Console: this is shown once. Sign in with it to choose a real password.");
@@ -391,6 +554,10 @@ impl Auth {
         let secrets = self.store.secrets().await.map_err(|err| err.message())?;
         let config = self.store.config().await.map_err(|err| err.message())?;
         let field = |name: &str| secrets.data.get(name).cloned();
+        let mut settings = Settings::read(&config.data)?;
+        if let Some(oidc) = &self.managed.oidc {
+            settings.oidc = Some(oidc.clone());
+        }
         let keys = Keys {
             session_key: field(SESSION_KEY_KEY)
                 .map(String::into_bytes)
@@ -400,8 +567,16 @@ impl Auth {
                 .unwrap_or(0),
             password_hash: field(PASSWORD_HASH_KEY),
             must_set: field(MUST_SET_KEY).is_some_and(|text| text == "true"),
-            settings: Settings::read(&config.data)?,
-            oidc_secret: field(OIDC_SECRET_KEY),
+            password_login: settings
+                .password_login
+                .or(self.managed.password_login)
+                .unwrap_or(true),
+            settings,
+            oidc_secret: self
+                .managed
+                .client_secret
+                .clone()
+                .or_else(|| field(OIDC_SECRET_KEY)),
         };
         *self.keys.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(keys);
         Ok(())
@@ -430,6 +605,11 @@ impl Auth {
         self.token.is_some()
     }
 
+    /// Whether the provider comes from the deployment, not from this console.
+    pub fn oidc_managed(&self) -> bool {
+        self.managed.oidc.is_some()
+    }
+
     pub fn oidc_secret_hint(&self) -> Option<String> {
         self.keys().oidc_secret.as_deref().map(hint)
     }
@@ -443,15 +623,41 @@ impl Auth {
         (session.expires > now() && session.generation == keys.generation).then_some(session)
     }
 
-    fn issue(&self, keys: &Keys, user: &str, method: &str) -> Result<(String, Session), String> {
+    fn issue(
+        &self,
+        keys: &Keys,
+        user: &str,
+        method: &str,
+        role: Role,
+        auth_at: u64,
+    ) -> Result<(String, Session), String> {
         let session = Session {
             user: user.to_string(),
             method: method.to_string(),
+            role,
+            auth_at,
             expires: now() + SESSION_SECS,
             generation: keys.generation,
             csrf: random_text(24)?,
         };
         Ok((seal(&keys.session_key, &session)?, session))
+    }
+
+    /// The same session under the current generation, so the person keeps working.
+    pub fn reissue(&self, session: &Session, headers: &HeaderMap) -> Result<HeaderValue, ApiError> {
+        let keys = self.keys();
+        let renewed = Session {
+            generation: keys.generation,
+            ..session.clone()
+        };
+        let sealed = seal(&keys.session_key, &renewed).map_err(internal)?;
+        cookie(
+            SESSION_COOKIE,
+            &sealed,
+            SESSION_SECS,
+            "Strict",
+            secure(headers),
+        )
     }
 
     fn check_bearer(&self, presented: &str) -> bool {
@@ -482,7 +688,7 @@ impl Auth {
         let keys = self.keys();
         if let Some(session) = self.session(&keys, headers) {
             if !method.is_safe() {
-                check_origin(&keys, headers)?;
+                check_origin(headers)?;
                 let csrf = headers
                     .get(CSRF_HEADER)
                     .and_then(|value| value.to_str().ok())
@@ -639,22 +845,93 @@ fn refuse(err: ApiError) -> Response {
     response
 }
 
-/// Everything under `/admin/v1`, apart from signing in.
-pub async fn require_admin(
+/// The role a route needs. Reading is open to any role, apart from settings, and anything not
+/// named here takes admin, so a new route is safe until someone decides otherwise.
+pub fn required_role(method: &Method, path: &str) -> Role {
+    let path = path.strip_prefix("/admin/v1").unwrap_or(path);
+    if method.is_safe() {
+        return if path == "/settings" {
+            Role::Admin
+        } else {
+            Role::Viewer
+        };
+    }
+    if path.starts_with("/markets/")
+        || path == "/config/markets"
+        || path == "/config/markets/validate"
+    {
+        return Role::Operator;
+    }
+    Role::Admin
+}
+
+/// Routes that can't be undone, or that decide who gets in. Saving the markets file can delete a
+/// market too, so that route checks for itself.
+pub fn needs_step_up(method: &Method, path: &str) -> bool {
+    let path = path.strip_prefix("/admin/v1").unwrap_or(path);
+    let market = path.strip_prefix("/markets/");
+    match *method {
+        Method::DELETE => market.is_some(),
+        Method::POST => {
+            market.is_some_and(|rest| rest.ends_with("/cancel-all"))
+                || path == "/webhooks/secret"
+                || path == "/sessions/revoke"
+        }
+        Method::PUT => path == "/settings" || path == "/settings/oidc",
+        _ => false,
+    }
+}
+
+/// A session must have signed in recently. The token and local callers pass, as the module says.
+pub fn check_recent(caller: &Caller) -> Result<(), ApiError> {
+    let Caller::Session(session) = caller else {
+        return Ok(());
+    };
+    if now().saturating_sub(session.auth_at) <= STEP_UP_SECS {
+        return Ok(());
+    }
+    Err(error(
+        StatusCode::FORBIDDEN,
+        "reauth_required",
+        "Confirm who you are to do this.",
+    ))
+}
+
+/// Everything under `/admin/v1`, apart from signing in. Every write is logged with who made it.
+pub async fn require_role(
     State(state): State<Arc<AppState>>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    match state
-        .auth
-        .identify(request.method(), request.headers(), false)
-    {
-        Ok(caller) => {
-            request.extensions_mut().insert(caller);
-            next.run(request).await
-        }
-        Err(err) => refuse(err),
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let caller = match state.auth.identify(&method, request.headers(), false) {
+        Ok(caller) => caller,
+        Err(err) => return refuse(err),
+    };
+    if caller.role() < required_role(&method, &path) {
+        warn!("Audit: refused {} {method} {path}", caller.name());
+        return refuse(error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Your role doesn't allow this.",
+        ));
     }
+    if needs_step_up(&method, &path)
+        && let Err(err) = check_recent(&caller)
+    {
+        return refuse(err);
+    }
+    let name = (!method.is_safe()).then(|| caller.name().to_string());
+    request.extensions_mut().insert(caller);
+    let response = next.run(request).await;
+    if let Some(name) = name {
+        info!(
+            "Audit: {name} {method} {path}: {}",
+            response.status().as_u16()
+        );
+    }
+    response
 }
 
 /// The routes someone can use with only the temporary password.
@@ -684,8 +961,11 @@ fn session_view(state: &AppState, keys: &Keys, session: Option<&Session>) -> Val
         "user": session.map(|session| &session.user),
         "method": session.map(|session| &session.method),
         "csrf_token": session.map(|session| &session.csrf),
+        "role": session.map(|session| session.role),
+        "reauth_until": session.map(|session| session.auth_at + STEP_UP_SECS),
         "must_set_password": session.is_some_and(|session| session.method == "password") && keys.must_set,
-        "password_login": keys.settings.password_login,
+        "first_run": keys.must_set && keys.password_login,
+        "password_login": keys.password_login,
         "oidc": oidc,
         "version": env!("CARGO_PKG_VERSION"),
         "store": state.store.info().backend,
@@ -713,7 +993,7 @@ fn with_session(
         sealed,
         SESSION_SECS,
         "Strict",
-        secure(keys, headers),
+        secure(headers),
     )?;
     let mut response = Json(session_view(state, keys, Some(session))).into_response();
     response.headers_mut().insert(header::SET_COOKIE, value);
@@ -740,8 +1020,8 @@ pub async fn login(
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|rejection| invalid(rejection.body_text()))?;
     let keys = state.auth.keys();
-    check_origin(&keys, &headers)?;
-    if !keys.settings.password_login {
+    check_origin(&headers)?;
+    if !keys.password_login {
         return Err(error(
             StatusCode::FORBIDDEN,
             "password_login_disabled",
@@ -771,7 +1051,59 @@ pub async fn login(
     }
     let (sealed, session) = state
         .auth
-        .issue(&keys, "admin", "password")
+        .issue(&keys, "admin", "password", Role::Admin, now())
+        .map_err(internal)?;
+    with_session(&state, &keys, &headers, &sealed, &session)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReauthBody {
+    password: String,
+}
+
+/// Proves a password session is still the person who opened it. An OIDC session uses
+/// `/oidc/start?reauth=1` instead.
+pub async fn reauth(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(caller): axum::Extension<Caller>,
+    extensions: Extensions,
+    headers: HeaderMap,
+    body: Result<Json<ReauthBody>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|rejection| invalid(rejection.body_text()))?;
+    let Caller::Session(session) = caller else {
+        return Err(invalid("Only a console session confirms this way."));
+    };
+    if session.method != "password" {
+        return Err(invalid("Confirm with your provider."));
+    }
+    let peer = peer_of(&extensions);
+    if state.auth.peek_blocked(peer) {
+        return Err(error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_attempts",
+            "Too many failed attempts. Try again in a few minutes.",
+        ));
+    }
+    let keys = state.auth.keys();
+    let stored = keys.password_hash.clone().unwrap_or_default();
+    let accepted = state.auth.verify_password(body.password, stored).await?;
+    state.auth.note_login(peer, accepted);
+    if !accepted {
+        warn!(
+            "Console: failed confirmation for {} from {peer:?}",
+            session.user
+        );
+        return Err(error(
+            StatusCode::UNAUTHORIZED,
+            "wrong_password",
+            "That password isn't right.",
+        ));
+    }
+    let (sealed, session) = state
+        .auth
+        .issue(&keys, &session.user, &session.method, session.role, now())
         .map_err(internal)?;
     with_session(&state, &keys, &headers, &sealed, &session)
 }
@@ -781,7 +1113,7 @@ pub async fn logout(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let keys = state.auth.keys();
-    let value = cookie(SESSION_COOKIE, "", 0, "Strict", secure(&keys, &headers))?;
+    let value = cookie(SESSION_COOKIE, "", 0, "Strict", secure(&headers))?;
     let mut response = Json(session_view(&state, &keys, None)).into_response();
     response.headers_mut().insert(header::SET_COOKIE, value);
     Ok(response)
@@ -814,6 +1146,16 @@ pub async fn change_password(
             ));
         }
     };
+    if session.method != "password" {
+        if session.role != Role::Admin {
+            return Err(error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Your role doesn't allow this.",
+            ));
+        }
+        check_recent(&caller)?;
+    }
     if session.method == "password" && !keys.must_set {
         let current = body.current.clone().unwrap_or_default();
         let stored = keys.password_hash.clone().unwrap_or_default();
@@ -838,7 +1180,7 @@ pub async fn change_password(
     let keys = state.auth.keys();
     let (sealed, session) = state
         .auth
-        .issue(&keys, &session.user, &session.method)
+        .issue(&keys, &session.user, &session.method, session.role, now())
         .map_err(internal)?;
     with_session(&state, &keys, &headers, &sealed, &session)
 }
@@ -874,7 +1216,13 @@ pub async fn revoke_sessions(
         Caller::Session(session) => {
             let (sealed, session) = state
                 .auth
-                .issue(&keys, &session.user, &session.method)
+                .issue(
+                    &keys,
+                    &session.user,
+                    &session.method,
+                    session.role,
+                    session.auth_at,
+                )
                 .map_err(internal)?;
             with_session(&state, &keys, &headers, &sealed, &session)
         }
@@ -882,13 +1230,18 @@ pub async fn revoke_sessions(
     }
 }
 
-/// What the browser carries while it's away at the provider.
+/// What the browser carries while it's away at the provider. The redirect URI travels with it, so
+/// the callback sends the provider exactly what the start did.
 #[derive(Serialize, Deserialize, Debug)]
 struct OidcLogin {
     state: String,
     nonce: String,
     verifier: String,
     expires: u64,
+    redirect_uri: String,
+    /// Where to land afterwards, always a path on this server.
+    return_to: String,
+    step_up: bool,
 }
 
 fn login_failed(message: &str) -> Response {
@@ -899,44 +1252,72 @@ fn login_failed(message: &str) -> Response {
     Redirect::to(&format!("/login?{query}")).into_response()
 }
 
-fn oidc_redirect_uri(settings: &Settings) -> Option<String> {
-    let public = settings.public_url.as_deref()?;
-    Some(format!(
-        "{}/admin/v1/oidc/callback",
-        public.trim_end_matches('/')
-    ))
+/// A failed confirmation leaves the session as it was, so the person goes back to their page.
+fn step_up_failed(return_to: &str, message: &str) -> Response {
+    warn!("Console: OIDC confirmation failed: {message}");
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("reauth_error", message)
+        .finish();
+    let glue = if return_to.contains('?') { '&' } else { '?' };
+    Redirect::to(&format!("{return_to}{glue}{query}")).into_response()
 }
 
-pub fn redirect_uri(settings: &Settings) -> Option<String> {
-    oidc_redirect_uri(settings)
+/// A path on this server, or the home page. `//host` and `/\host` are other sites to a browser.
+fn local_path(path: Option<&str>) -> String {
+    match path {
+        Some(path)
+            if path.starts_with('/')
+                && !path.starts_with("//")
+                && !path.contains('\\')
+                && path.chars().all(|c| !c.is_control()) =>
+        {
+            path.to_string()
+        }
+        _ => "/".to_string(),
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct StartParams {
+    /// Sends the person back to the provider to sign in again, for a destructive action.
+    #[serde(default)]
+    reauth: Option<String>,
+    #[serde(rename = "return", default)]
+    return_to: Option<String>,
 }
 
 async fn start_oidc(
     state: &AppState,
     keys: &Keys,
     headers: &HeaderMap,
+    params: &StartParams,
 ) -> Result<Response, String> {
     let settings = keys
         .settings
         .oidc_enabled()
         .ok_or("Single sign-on isn't turned on.")?;
-    let redirect = oidc_redirect_uri(&keys.settings).ok_or("The public URL isn't set.")?;
+    let redirect = redirect_uri(headers).ok_or("This request has no usable Host header.")?;
     let provider = oidc::discover(state.auth.oidc_http(), &settings.issuer).await?;
 
+    let step_up = params.reauth.is_some();
     let login = OidcLogin {
         state: random_text(24)?,
         nonce: random_text(24)?,
         verifier: random_text(48)?,
         expires: now() + OIDC_LOGIN_SECS,
+        redirect_uri: redirect,
+        return_to: local_path(params.return_to.as_deref()),
+        step_up,
     };
     let address = oidc::authorize_url(
         &provider,
         &oidc::Request {
             client_id: &settings.client_id,
-            redirect_uri: &redirect,
+            redirect_uri: &login.redirect_uri,
             state: &login.state,
             nonce: &login.nonce,
             verifier: &login.verifier,
+            max_age: step_up.then_some(STEP_UP_SECS),
         },
     )?;
     let sealed = seal(&keys.session_key, &login)?;
@@ -946,7 +1327,7 @@ async fn start_oidc(
         &sealed,
         OIDC_LOGIN_SECS,
         "Lax",
-        secure(keys, headers),
+        secure(headers),
     )
     .map_err(|_| "can't build the login cookie".to_string())?;
     let mut response = Redirect::to(&address).into_response();
@@ -954,10 +1335,17 @@ async fn start_oidc(
     Ok(response)
 }
 
-pub async fn oidc_start(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn oidc_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<StartParams>,
+) -> Response {
     let keys = state.auth.keys();
-    match start_oidc(&state, &keys, &headers).await {
+    match start_oidc(&state, &keys, &headers, &params).await {
         Ok(response) => response,
+        Err(message) if params.reauth.is_some() => {
+            step_up_failed(&local_path(params.return_to.as_deref()), &message)
+        }
         Err(message) => login_failed(&message),
     }
 }
@@ -970,20 +1358,32 @@ pub struct CallbackParams {
     error_description: Option<String>,
 }
 
+/// Checks the provider's answer to a confirmation. A provider that ignores `prompt=login` still
+/// reports when the person really signed in, so an old session can't pass for a new one.
+fn check_step_up(auth_time: Option<u64>) -> Result<u64, String> {
+    let at = auth_time.ok_or(
+        "The provider didn't say when you signed in, so this can't be confirmed. \
+         Turn on the auth_time claim for this client.",
+    )?;
+    if now().saturating_sub(at) > STEP_UP_SECS + CLOCK_SKEW_SECS {
+        return Err(
+            "The provider reused an earlier sign-in, so this wasn't confirmed.".to_string(),
+        );
+    }
+    Ok(at)
+}
+
 async fn finish_oidc(
     state: &AppState,
     keys: &Keys,
     headers: &HeaderMap,
+    login: &OidcLogin,
     params: CallbackParams,
 ) -> Result<Response, String> {
     let settings = keys
         .settings
         .oidc_enabled()
         .ok_or("Single sign-on isn't turned on.")?;
-    let sealed =
-        cookie_value(headers, OIDC_COOKIE).ok_or("This sign-in has expired. Try again.")?;
-    let login: OidcLogin =
-        open(&keys.session_key, sealed).ok_or("This sign-in has expired. Try again.")?;
     if login.expires <= now() {
         return Err("This sign-in has expired. Try again.".to_string());
     }
@@ -1004,7 +1404,6 @@ async fn finish_oidc(
 
     let http = state.auth.oidc_http();
     let provider = oidc::discover(http, &settings.issuer).await?;
-    let redirect = oidc_redirect_uri(&keys.settings).ok_or("The public URL isn't set.")?;
     let client_secret = keys
         .oidc_secret
         .as_deref()
@@ -1016,7 +1415,7 @@ async fn finish_oidc(
             client_id: &settings.client_id,
             client_secret,
             code: &code,
-            redirect_uri: &redirect,
+            redirect_uri: &login.redirect_uri,
             verifier: &login.verifier,
         },
     )
@@ -1029,21 +1428,46 @@ async fn finish_oidc(
         &login.nonce,
     )
     .await?;
-    if !claims.allowed(&settings.allowed) {
-        return Err(format!(
-            "{} isn't allowed to use this console.",
-            claims.display()
-        ));
-    }
 
-    let (sealed, _) = state.auth.issue(keys, &claims.display(), "oidc")?;
-    info!("Console: {} signed in through OIDC", claims.display());
-    let secure = secure(keys, headers);
+    let groups = claims.groups(&settings.groups_claim)?;
+    let user = claims.display();
+    let Some(role) = settings.roles.role_for(&groups) else {
+        return Err(if groups.is_empty() {
+            format!(
+                "{user} has no groups in the {} claim, so has no role here.",
+                settings.groups_claim
+            )
+        } else {
+            format!(
+                "None of {user}'s groups has a role here. The provider sent: {}.",
+                groups.join(", ")
+            )
+        });
+    };
+    let auth_at = if login.step_up {
+        check_step_up(claims.auth_time())?
+    } else {
+        claims.auth_time().unwrap_or(0)
+    };
+
+    let (sealed, _) = state.auth.issue(keys, &user, "oidc", role, auth_at)?;
+    info!("Console: {user} signed in through OIDC as {role:?}");
+    let secure = secure(headers);
     let session = cookie(SESSION_COOKIE, &sealed, SESSION_SECS, "Strict", secure)
         .map_err(|_| "can't build the session cookie".to_string())?;
     let spent = cookie(OIDC_COOKIE, "", 0, "Lax", secure)
         .map_err(|_| "can't build the login cookie".to_string())?;
-    let mut response = Redirect::to("/").into_response();
+    let target = if login.step_up {
+        let glue = if login.return_to.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        format!("{}{glue}reauthed=1", login.return_to)
+    } else {
+        login.return_to.clone()
+    };
+    let mut response = Redirect::to(&target).into_response();
     response.headers_mut().append(header::SET_COOKIE, session);
     response.headers_mut().append(header::SET_COOKIE, spent);
     Ok(response)
@@ -1055,9 +1479,36 @@ pub async fn oidc_callback(
     Query(params): Query<CallbackParams>,
 ) -> Response {
     let keys = state.auth.keys();
-    match finish_oidc(&state, &keys, &headers, params).await {
+    let login = cookie_value(&headers, OIDC_COOKIE)
+        .and_then(|sealed| open::<OidcLogin>(&keys.session_key, sealed));
+    let Some(login) = login else {
+        return login_failed("This sign-in has expired. Try again.");
+    };
+    match finish_oidc(&state, &keys, &headers, &login, params).await {
         Ok(response) => response,
+        Err(message) if login.step_up => step_up_failed(&login.return_to, &message),
         Err(message) => login_failed(&message),
+    }
+}
+
+#[cfg(test)]
+impl Auth {
+    /// The same session, as if its sign-in were `ago` seconds older.
+    pub fn aged(&self, cookie: &str, ago: u64) -> String {
+        let keys = self.keys();
+        let sealed = cookie.split_once('=').map_or(cookie, |(_, value)| value);
+        let mut session: Session = open(&keys.session_key, sealed).expect("a session");
+        session.auth_at -= ago;
+        format!(
+            "{SESSION_COOKIE}={}",
+            seal(&keys.session_key, &session).unwrap()
+        )
+    }
+
+    pub fn session_for(&self, user: &str, role: Role) -> String {
+        let keys = self.keys();
+        let (sealed, _) = self.issue(&keys, user, "oidc", role, now()).unwrap();
+        format!("{SESSION_COOKIE}={sealed}")
     }
 }
 
@@ -1101,25 +1552,179 @@ mod tests {
         assert_eq!(cookie_value(&headers, "missing"), None);
     }
 
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
     #[test]
-    fn origins_must_match_the_host_or_public_url() {
-        let keys = Keys {
-            settings: Settings {
-                public_url: Some("https://console.example/".to_string()),
-                ..Settings::default()
-            },
-            ..Keys::default()
+    fn origins_must_match_the_host_the_client_used() {
+        let behind = |origin: &'static str| {
+            headers(&[
+                ("host", "mmx-console:8093"),
+                ("x-forwarded-host", "mmx.ops.internal"),
+                ("origin", origin),
+            ])
         };
-        let headers = |origin: &'static str| {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::HOST, HeaderValue::from_static("mmx:8093"));
-            headers.insert(header::ORIGIN, HeaderValue::from_static(origin));
-            headers
+        assert!(check_origin(&behind("http://mmx-console:8093")).is_ok());
+        assert!(check_origin(&behind("https://mmx.ops.internal")).is_ok());
+        assert!(check_origin(&behind("https://evil.example")).is_err());
+        assert!(check_origin(&HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn the_redirect_uri_comes_from_the_request() {
+        assert_eq!(
+            redirect_uri(&headers(&[("host", "127.0.0.1:8093")])).unwrap(),
+            "http://127.0.0.1:8093/admin/v1/oidc/callback"
+        );
+        assert_eq!(
+            redirect_uri(&headers(&[
+                ("host", "mmx-console:8093"),
+                ("x-forwarded-host", "mmx.ops.internal, edge.internal"),
+                ("x-forwarded-proto", "https, http"),
+            ]))
+            .unwrap(),
+            "https://mmx.ops.internal/admin/v1/oidc/callback"
+        );
+    }
+
+    #[test]
+    fn a_junk_forwarded_host_falls_back_to_the_real_one() {
+        let sent = headers(&[
+            ("host", "mmx-console:8093"),
+            ("x-forwarded-host", "evil.example/path?x=1"),
+        ]);
+        assert_eq!(request_origin(&sent).unwrap(), "http://mmx-console:8093");
+    }
+
+    #[test]
+    fn cookies_are_secure_only_behind_tls() {
+        assert!(secure(&headers(&[("x-forwarded-proto", "https")])));
+        assert!(!secure(&headers(&[("x-forwarded-proto", "http")])));
+        assert!(!secure(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn the_highest_listed_role_wins_and_nothing_else_gets_in() {
+        let roles = RoleGroups {
+            admin: vec!["ops-admin".to_string()],
+            operator: vec!["ops".to_string()],
+            viewer: vec!["support".to_string()],
         };
-        assert!(check_origin(&keys, &headers("http://mmx:8093")).is_ok());
-        assert!(check_origin(&keys, &headers("https://console.example")).is_ok());
-        assert!(check_origin(&keys, &headers("https://evil.example")).is_err());
-        assert!(check_origin(&keys, &HeaderMap::new()).is_ok());
+        let of = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(ToString::to_string).collect();
+            roles.role_for(&names)
+        };
+        assert_eq!(of(&["support", "ops-admin"]), Some(Role::Admin));
+        assert_eq!(of(&["ops"]), Some(Role::Operator));
+        assert_eq!(of(&["support"]), Some(Role::Viewer));
+        assert_eq!(of(&["everyone"]), None);
+        assert_eq!(of(&[]), None);
+        assert_eq!(of(&["OPS"]), None, "names match exactly");
+    }
+
+    #[test]
+    fn each_route_needs_the_role_the_table_says() {
+        let role = required_role;
+        assert_eq!(role(&Method::GET, "/admin/v1/markets"), Role::Viewer);
+        assert_eq!(role(&Method::GET, "/events"), Role::Viewer);
+        assert_eq!(role(&Method::GET, "/settings"), Role::Admin);
+        assert_eq!(role(&Method::POST, "/markets/IRON/halt"), Role::Operator);
+        assert_eq!(role(&Method::DELETE, "/markets/IRON"), Role::Operator);
+        assert_eq!(role(&Method::PUT, "/config/markets"), Role::Operator);
+        assert_eq!(role(&Method::POST, "/webhooks/secret"), Role::Admin);
+        assert_eq!(role(&Method::PUT, "/webhooks/config"), Role::Admin);
+        assert_eq!(role(&Method::PUT, "/settings/oidc"), Role::Admin);
+        assert_eq!(role(&Method::POST, "/something/new"), Role::Admin);
+    }
+
+    #[test]
+    fn step_up_covers_the_destructive_routes_and_no_others() {
+        let up = needs_step_up;
+        assert!(up(&Method::DELETE, "/admin/v1/markets/IRON"));
+        assert!(up(&Method::POST, "/markets/IRON/cancel-all"));
+        assert!(up(&Method::POST, "/webhooks/secret"));
+        assert!(up(&Method::PUT, "/settings"));
+        assert!(up(&Method::PUT, "/settings/oidc"));
+        assert!(up(&Method::POST, "/sessions/revoke"));
+        assert!(!up(&Method::POST, "/markets/IRON/halt"));
+        assert!(!up(&Method::PUT, "/markets/IRON"));
+        assert!(!up(&Method::GET, "/settings"));
+    }
+
+    #[test]
+    fn a_confirmation_needs_a_recent_sign_in_from_the_provider() {
+        assert!(check_step_up(None).is_err());
+        assert!(check_step_up(Some(now() - 3600)).is_err());
+        assert!(check_step_up(Some(now())).is_ok());
+    }
+
+    #[test]
+    fn landing_pages_stay_on_this_server() {
+        assert_eq!(local_path(Some("/markets/IRON")), "/markets/IRON");
+        assert_eq!(local_path(Some("//evil.example")), "/");
+        assert_eq!(local_path(Some("/\\evil.example")), "/");
+        assert_eq!(local_path(Some("https://evil.example")), "/");
+        assert_eq!(local_path(None), "/");
+    }
+
+    #[test]
+    fn a_provider_from_the_environment_must_be_complete() {
+        let read = |pairs: &'static [(&str, &str)]| {
+            Managed::read(|name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            })
+        };
+        assert_eq!(read(&[]).unwrap(), Managed::default());
+        assert_eq!(
+            read(&[("MMX_PASSWORD_LOGIN", "false")])
+                .unwrap()
+                .password_login,
+            Some(false)
+        );
+        assert!(read(&[("MMX_PASSWORD_LOGIN", "maybe")]).is_err());
+        assert!(read(&[("MMX_OIDC_ISSUER", "https://id.example")]).is_err());
+        assert!(
+            read(&[
+                ("MMX_OIDC_ISSUER", "https://id.example"),
+                ("MMX_OIDC_CLIENT_ID", "mmx"),
+                ("MMX_OIDC_CLIENT_SECRET", "s"),
+            ])
+            .unwrap_err()
+            .contains("ADMIN_GROUPS")
+        );
+        let full = read(&[
+            ("MMX_OIDC_ISSUER", "https://id.example/"),
+            ("MMX_OIDC_CLIENT_ID", "mmx"),
+            ("MMX_OIDC_CLIENT_SECRET", "s"),
+            ("MMX_OIDC_ADMIN_GROUPS", "a, b"),
+            ("MMX_OIDC_GROUPS_CLAIM", "roles"),
+        ])
+        .unwrap();
+        let oidc = full.oidc.unwrap();
+        assert_eq!(oidc.issuer, "https://id.example");
+        assert_eq!(oidc.groups_claim, "roles");
+        assert_eq!(oidc.roles.admin, ["a", "b"]);
+    }
+
+    #[test]
+    fn an_older_settings_file_still_loads() {
+        let text = "public_url: https://old.example\npassword_login: true\noidc:\n  enabled: true\n  issuer: https://id.example\n  client_id: mmx\n  allowed: ['a@b.example']\n";
+        let settings: Settings = serde_yaml::from_str(text).unwrap();
+        let oidc = settings.oidc.unwrap();
+        assert_eq!(oidc.groups_claim, "groups");
+        assert_eq!(
+            oidc.roles,
+            RoleGroups::default(),
+            "the old list grants nothing"
+        );
     }
 
     #[test]

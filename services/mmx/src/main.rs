@@ -6,6 +6,7 @@ mod client;
 mod console;
 mod decimal;
 mod events;
+mod feed;
 mod markets;
 mod oidc;
 mod output;
@@ -34,7 +35,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use uuid::Uuid;
 
@@ -181,7 +182,7 @@ struct ServeArgs {
     #[arg(long)]
     insecure_local: bool,
 
-    /// How often `/events` polls, in milliseconds
+    /// How often `/events` reads the tape, in milliseconds
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(100..))]
     poll_ms: u64,
 
@@ -432,18 +433,23 @@ async fn serve(cli: &Cli, args: &ServeArgs, token: Option<String>) -> Result<(),
         token.as_deref(),
         args.insecure_local,
         password,
+        auth::Managed::read(|name| env::var(name).ok())?,
     )
     .await?;
     auth.spawn_refresh();
 
+    let up = Arc::new(Upstreams::new(cli.services.targets()?, token.clone())?);
     let state = Arc::new(AppState {
-        up: Arc::new(Upstreams::new(cli.services.targets()?, token.clone())?),
+        feeds: feed::Feeds::new(up.clone()),
+        up,
         store,
         auth,
         poll_every: Duration::from_millis(args.poll_ms),
         edits: Mutex::new(()),
         behind_since: StdMutex::new(None),
         outbox_restart: args.outbox_restart.clone(),
+        streams: Arc::new(Semaphore::new(server::MAX_STREAMS)),
+        summary: Mutex::new(None),
     });
     server::spawn_reconciler(state.clone());
     server::serve(state, address).await

@@ -178,7 +178,7 @@ fn render_webhook_config(body: &Value) -> String {
 fn render_auth(body: &Value) -> String {
     let oidc = body.get("oidc").unwrap_or(&Value::Null);
     format!(
-        "password login: {}\nsingle sign-on: {}\npublic url: {}",
+        "password login: {}\nsingle sign-on: {}\nredirect uri: {}",
         if flag(body, "password_login") {
             "on"
         } else {
@@ -189,7 +189,7 @@ fn render_auth(body: &Value) -> String {
         } else {
             "off"
         },
-        text(body, "public_url"),
+        text(oidc, "redirect_uri"),
     )
 }
 
@@ -237,7 +237,12 @@ fn render_webhooks(body: &Value) -> String {
 fn render_order(order: &Value) -> String {
     // An order with no record has only a status and what to do about it.
     if order.get("product_id").is_none() {
-        return format!("{} {}: {}", text(order, "id"), text(order, "status"), text(order, "message"));
+        return format!(
+            "{} {}: {}",
+            text(order, "id"),
+            text(order, "status"),
+            text(order, "message")
+        );
     }
     format!(
         "{} {:<6} {:<4} {} @ {} {} filled={}",

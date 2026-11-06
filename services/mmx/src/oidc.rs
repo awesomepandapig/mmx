@@ -10,7 +10,7 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use reqwest::{Client, redirect};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 use url::Url;
@@ -18,6 +18,8 @@ use url::Url;
 const TIMEOUT: Duration = Duration::from_secs(10);
 const DISCOVERY_PATH: &str = "/.well-known/openid-configuration";
 const SCOPES: &str = "openid email profile";
+/// Asked for only if the provider lists it, because some refuse a scope they don't know.
+const GROUPS_SCOPE: &str = "groups";
 
 /// Only asymmetric algorithms: HS256 would turn the client secret into a signing key.
 const ALGORITHMS: &[Algorithm] = &[
@@ -53,6 +55,8 @@ pub struct Provider {
     token_endpoint_auth_methods_supported: Vec<String>,
     #[serde(default)]
     code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    scopes_supported: Vec<String>,
 }
 
 /// A provider must be HTTPS. Plain HTTP on loopback is allowed so it can be tested locally.
@@ -117,15 +121,31 @@ pub struct Request<'a> {
     pub state: &'a str,
     pub nonce: &'a str,
     pub verifier: &'a str,
+    /// Set for a confirmation: the person must sign in again, whatever session the provider holds.
+    pub max_age: Option<u64>,
 }
 
 pub fn authorize_url(provider: &Provider, request: &Request) -> Result<String, String> {
     let mut url = Url::parse(&provider.authorization_endpoint).map_err(|err| err.to_string())?;
+    let scopes = if provider
+        .scopes_supported
+        .iter()
+        .any(|scope| scope == GROUPS_SCOPE)
+    {
+        format!("{SCOPES} {GROUPS_SCOPE}")
+    } else {
+        SCOPES.to_string()
+    };
+    if let Some(max_age) = request.max_age {
+        url.query_pairs_mut()
+            .append_pair("prompt", "login")
+            .append_pair("max_age", &max_age.to_string());
+    }
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", request.client_id)
         .append_pair("redirect_uri", request.redirect_uri)
-        .append_pair("scope", SCOPES)
+        .append_pair("scope", &scopes)
         .append_pair("state", request.state)
         .append_pair("nonce", request.nonce)
         .append_pair("code_challenge", &pkce_challenge(request.verifier))
@@ -194,52 +214,52 @@ pub async fn exchange(
         .ok_or_else(|| format!("token endpoint: HTTP {status}: no ID token in the answer"))
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 pub struct Claims {
     pub sub: String,
     pub email: Option<String>,
-    /// Some providers send this as a string.
-    #[serde(default)]
-    pub email_verified: Option<Value>,
     pub nonce: Option<String>,
+    /// Some providers send this as a float.
+    #[serde(default)]
+    auth_time: Option<Value>,
+    /// Everything else, because the groups claim's name is configurable.
+    #[serde(flatten)]
+    rest: Map<String, Value>,
 }
 
 impl Claims {
-    fn verified_email(&self) -> Option<String> {
-        let verified = match &self.email_verified {
-            Some(Value::Bool(value)) => *value,
-            Some(Value::String(value)) => value == "true",
-            _ => false,
-        };
-        self.email
-            .as_ref()
-            .filter(|_| verified)
-            .map(|email| email.to_lowercase())
-    }
-
     /// What the console calls this person.
     pub fn display(&self) -> String {
         self.email.clone().unwrap_or_else(|| self.sub.clone())
     }
 
-    /// Every account at a provider can reach this callback, and some providers let anyone make one,
-    /// so an empty list refuses everybody. An entry is an email, `@domain`, or a subject. An email
-    /// only counts if the provider says it verified it, or a self-chosen address would get in.
-    pub fn allowed(&self, allowed: &[String]) -> bool {
-        let email = self.verified_email();
-        allowed.iter().any(|entry| {
-            let entry = entry.trim();
-            if entry == self.sub {
-                return true;
-            }
-            let entry = entry.to_lowercase();
-            match (&email, entry.strip_prefix('@')) {
-                (Some(email), Some(domain)) => email
-                    .rsplit_once('@')
-                    .is_some_and(|(_, host)| host == domain),
-                (Some(email), None) => *email == entry,
-                (None, _) => false,
-            }
+    pub fn auth_time(&self) -> Option<u64> {
+        let time = self.auth_time.as_ref()?;
+        time.as_u64()
+            .or_else(|| time.as_f64().map(|time| time as u64))
+    }
+
+    /// The person's groups. Past a limit Entra leaves them out of the token and points at Graph
+    /// instead, which would read as having no groups, so that's refused by name.
+    pub fn groups(&self, claim: &str) -> Result<Vec<String>, String> {
+        let overage = self
+            .rest
+            .get("_claim_names")
+            .is_some_and(|names| names.get(claim).is_some());
+        if overage {
+            return Err(format!(
+                "The provider left the {claim} claim out of the token, because this person is in \
+                 too many groups. Have it send only the groups assigned to this application."
+            ));
+        }
+        Ok(match self.rest.get(claim) {
+            Some(Value::Array(groups)) => groups
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            Some(Value::String(group)) => vec![group.clone()],
+            _ => Vec::new(),
         })
     }
 }
@@ -300,12 +320,35 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn claims(email: Option<&str>, verified: Option<Value>) -> Claims {
-        Claims {
-            sub: "subject-1".to_string(),
-            email: email.map(str::to_string),
-            email_verified: verified,
-            nonce: None,
+    fn claims(value: Value) -> Claims {
+        let mut fields = json!({ "sub": "subject-1" });
+        fields
+            .as_object_mut()
+            .unwrap()
+            .extend(value.as_object().unwrap().clone());
+        serde_json::from_value(fields).unwrap()
+    }
+
+    fn provider(scopes: &[&str]) -> Provider {
+        Provider {
+            issuer: "https://id.example".to_string(),
+            authorization_endpoint: "https://id.example/auth".to_string(),
+            token_endpoint: "https://id.example/token".to_string(),
+            jwks_uri: "https://id.example/jwks".to_string(),
+            token_endpoint_auth_methods_supported: Vec::new(),
+            code_challenge_methods_supported: Vec::new(),
+            scopes_supported: scopes.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn request(max_age: Option<u64>) -> Request<'static> {
+        Request {
+            client_id: "mmx",
+            redirect_uri: "http://mmx/admin/v1/oidc/callback",
+            state: "s",
+            nonce: "n",
+            verifier: "v",
+            max_age,
         }
     }
 
@@ -320,31 +363,50 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_list_lets_nobody_in() {
-        assert!(!claims(Some("a@b.example"), Some(json!(true))).allowed(&[]));
+    fn groups_come_from_the_configured_claim() {
+        let person = claims(json!({ "groups": ["a", "b"], "roles": "c" }));
+        assert_eq!(person.groups("groups").unwrap(), ["a", "b"]);
+        assert_eq!(person.groups("roles").unwrap(), ["c"]);
+        assert!(person.groups("other").unwrap().is_empty());
     }
 
     #[test]
-    fn only_a_verified_email_counts() {
-        let allowed = ["a@b.example".to_string()];
-        assert!(claims(Some("A@B.example"), Some(json!(true))).allowed(&allowed));
-        assert!(claims(Some("a@b.example"), Some(json!("true"))).allowed(&allowed));
-        assert!(!claims(Some("a@b.example"), Some(json!(false))).allowed(&allowed));
-        assert!(!claims(Some("a@b.example"), None).allowed(&allowed));
+    fn an_omitted_groups_claim_fails_by_name() {
+        let person = claims(json!({
+            "_claim_names": { "groups": "src1" },
+            "_claim_sources": { "src1": { "endpoint": "https://graph.example" } },
+        }));
+        let message = person.groups("groups").unwrap_err();
+        assert!(message.contains("too many groups"), "{message}");
     }
 
     #[test]
-    fn a_domain_matches_only_that_domain() {
-        let allowed = ["@b.example".to_string()];
-        assert!(claims(Some("a@b.example"), Some(json!(true))).allowed(&allowed));
-        assert!(!claims(Some("a@notb.example"), Some(json!(true))).allowed(&allowed));
-        assert!(!claims(Some("a@b.example.evil"), Some(json!(true))).allowed(&allowed));
+    fn auth_time_can_be_a_whole_number_or_a_float() {
+        assert_eq!(claims(json!({ "auth_time": 1700 })).auth_time(), Some(1700));
+        assert_eq!(
+            claims(json!({ "auth_time": 1700.5 })).auth_time(),
+            Some(1700)
+        );
+        assert_eq!(claims(json!({})).auth_time(), None);
     }
 
     #[test]
-    fn a_subject_matches_without_an_email() {
-        assert!(claims(None, None).allowed(&["subject-1".to_string()]));
-        assert!(!claims(None, None).allowed(&["subject-2".to_string()]));
+    fn the_groups_scope_is_only_asked_for_if_offered() {
+        let plain = authorize_url(&provider(&["openid"]), &request(None)).unwrap();
+        assert!(plain.contains("scope=openid+email+profile&"), "{plain}");
+        let offered = authorize_url(&provider(&["openid", "groups"]), &request(None)).unwrap();
+        assert!(offered.contains("profile+groups"), "{offered}");
+    }
+
+    #[test]
+    fn a_confirmation_forces_a_new_sign_in() {
+        let plain = authorize_url(&provider(&[]), &request(None)).unwrap();
+        assert!(!plain.contains("prompt="), "{plain}");
+        let fresh = authorize_url(&provider(&[]), &request(Some(300))).unwrap();
+        assert!(
+            fresh.contains("prompt=login") && fresh.contains("max_age=300"),
+            "{fresh}"
+        );
     }
 
     #[test]

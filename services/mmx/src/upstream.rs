@@ -21,8 +21,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// A gateway cancels up to 10,000 orders one by one, and holds requests across a failover.
 pub const CANCEL_ALL_TIMEOUT: Duration = Duration::from_secs(120);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// A busy market has a long history to read when someone starts watching it.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
 
-const FOLLOW_BATCH: usize = 500;
+/// Most book levels a market can have and still be read in one go.
+const SNAPSHOT_LEVELS: usize = 100_000;
 const NATS_PORT: u16 = 4222;
 const VALKEY_PORT: u16 = 6379;
 
@@ -326,11 +329,150 @@ pub const TRADES: Table = Table {
     ],
 };
 
-/// Filters reach SQL as a normalized symbol and a parsed UUID, so neither can contain a quote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Buy,
+    Sell,
+}
+
+impl Side {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text {
+            "buy" => Ok(Self::Buy),
+            "sell" => Ok(Self::Sell),
+            other => Err(format!("side must be buy or sell, not {other}.")),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Buy => "buy",
+            Self::Sell => "sell",
+        }
+    }
+}
+
+/// The execution types on the tape. Taken from this list, so a value can't reach SQL unchecked.
+pub fn event_name(text: &str) -> Result<&'static str, String> {
+    const EVENTS: [&str; 5] = ["new", "trade", "canceled", "rejected", "expired"];
+    EVENTS
+        .into_iter()
+        .find(|event| *event == text)
+        .ok_or_else(|| format!("Unknown event {text}."))
+}
+
+/// How an operator names an order: the game's ID, or the engine's number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderKey {
+    Client(Uuid),
+    Engine(i64),
+}
+
+impl OrderKey {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if let Ok(id) = Uuid::parse_str(text) {
+            return Ok(Self::Client(id));
+        }
+        text.parse()
+            .map(Self::Engine)
+            .map_err(|_| "order must be a UUID or an order number.".to_string())
+    }
+}
+
+/// Filters reach SQL as parsed values, so none can contain a quote.
 #[derive(Default, Debug, Clone)]
 pub struct Filter {
     pub symbol: Option<String>,
     pub player: Option<Uuid>,
+    pub side: Option<Side>,
+    pub event: Option<&'static str>,
+    pub order: Option<OrderKey>,
+    /// Rows older than this `ts`, for paging back.
+    pub before: Option<String>,
+}
+
+/// A window of the chart, and how finely it's cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Range {
+    Minutes15,
+    Hour,
+    Hours6,
+    Day,
+}
+
+impl Range {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "15m" => Some(Self::Minutes15),
+            "1h" => Some(Self::Hour),
+            "6h" => Some(Self::Hours6),
+            "24h" => Some(Self::Day),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Minutes15 => "15m",
+            Self::Hour => "1h",
+            Self::Hours6 => "6h",
+            Self::Day => "24h",
+        }
+    }
+
+    fn minutes(self) -> u32 {
+        match self {
+            Self::Minutes15 => 15,
+            Self::Hour => 60,
+            Self::Hours6 => 360,
+            Self::Day => 1440,
+        }
+    }
+
+    pub fn bucket_secs(self) -> u32 {
+        match self {
+            Self::Minutes15 => 10,
+            Self::Hour => 30,
+            Self::Hours6 => 180,
+            Self::Day => 600,
+        }
+    }
+}
+
+/// Which rows of a table a filter can match. Trades have no event column, and every trade row is
+/// an execution of type `trade`.
+fn where_clause(table: &Table, filter: &Filter, since: Option<&str>) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(symbol) = &filter.symbol {
+        parts.push(format!("symbol = '{symbol}'"));
+    }
+    if let Some(player) = filter.player {
+        parts.push(format!("account = '{player}'"));
+    }
+    if let Some(side) = filter.side {
+        parts.push(format!("side = '{}'", side.name()));
+    }
+    match (filter.event, table.name) {
+        (Some("trade"), "trades") | (None, _) => {}
+        (Some(event), "orders") => parts.push(format!("exec_type = '{event}'")),
+        (Some(_), _) => return None,
+    }
+    match filter.order {
+        Some(OrderKey::Client(id)) => parts.push(format!("cl_ord_id = '{id}'")),
+        Some(OrderKey::Engine(id)) => parts.push(format!("order_id = {id}")),
+        None => {}
+    }
+    if let Some(time) = &filter.before {
+        parts.push(format!("ts < '{time}'"));
+    }
+    if let Some(time) = since {
+        parts.push(format!("ts >= '{time}'"));
+    }
+    Some(if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" where {}", parts.join(" and "))
+    })
 }
 
 impl Table {
@@ -339,39 +481,21 @@ impl Table {
         names.join(", ")
     }
 
-    /// The newest reports, one row each. Reading by time stays cheap however long the table gets,
-    /// unlike rolling every order up to its latest state, which has to scan it.
-    fn recent_sql(&self, filter: &Filter, limit: usize) -> String {
-        let mut filters = Vec::new();
-        if let Some(symbol) = &filter.symbol {
-            filters.push(format!("symbol = '{symbol}'"));
-        }
-        if let Some(player) = filter.player {
-            filters.push(format!("account = '{player}'"));
-        }
-        let filters = if filters.is_empty() {
-            String::new()
-        } else {
-            format!(" where {}", filters.join(" and "))
-        };
-        format!(
+    /// The newest rows, one each. Reading by time stays cheap however long the table gets, unlike
+    /// rolling every order up to its latest state, which has to scan it. With `since`, only rows
+    /// from then on, and that's how the live view reads: the newest few, however many there were.
+    fn newest_sql(&self, filter: &Filter, since: Option<&str>, limit: usize) -> Option<String> {
+        let filters = where_clause(self, filter, since)?;
+        Some(format!(
             "select {} from {}{filters} order by ts desc limit {limit}",
             self.column_names(),
             self.name
-        )
+        ))
     }
 
-    /// Rows from `after` on, oldest first. It includes `after`, because rows can share a timestamp,
-    /// so the caller drops the ones it has seen.
-    fn follow_sql(&self, after: Option<&str>) -> String {
-        let filter = after
-            .map(|time| format!(" where ts >= '{time}'"))
-            .unwrap_or_default();
-        format!(
-            "select {} from {}{filter} order by ts limit {FOLLOW_BATCH}",
-            self.column_names(),
-            self.name
-        )
+    fn count_sql(&self, filter: &Filter, since: &str) -> Option<String> {
+        let filters = where_clause(self, filter, Some(since))?;
+        Some(format!("select count() from {}{filters}", self.name))
     }
 
     fn row(&self, values: &[Value]) -> Map<String, Value> {
@@ -543,6 +667,10 @@ impl Upstreams {
     /// Runs SQL, and returns no rows if the table doesn't exist. Tables are made on first write, so
     /// that only means nothing has happened yet.
     async fn sql(&self, query: &str) -> Result<Vec<Vec<Value>>, String> {
+        self.sql_with(query, REQUEST_TIMEOUT).await
+    }
+
+    async fn sql_with(&self, query: &str, limit: Duration) -> Result<Vec<Vec<Value>>, String> {
         #[derive(Deserialize)]
         struct Exec {
             #[serde(default)]
@@ -550,7 +678,8 @@ impl Upstreams {
             error: Option<String>,
         }
         let url = format!("{}/exec", self.targets.questdb);
-        let reply = send(self.http.get(url).query(&[("query", query)])).await?;
+        let request = self.http.get(url).query(&[("query", query)]).timeout(limit);
+        let reply = send(request).await?;
         let exec: Exec = serde_json::from_value(reply.body.clone()).map_err(|_| reply.error())?;
         match exec.error {
             Some(error) if error.contains("does not exist") => Ok(Vec::new()),
@@ -566,17 +695,141 @@ impl Upstreams {
         filter: &Filter,
         limit: usize,
     ) -> Result<Vec<Map<String, Value>>, String> {
-        let rows = self.sql(&table.recent_sql(filter, limit)).await?;
+        self.newest(table, filter, None, limit).await
+    }
+
+    /// The newest `limit` rows, newest first, from `since` on if it's given.
+    pub async fn newest(
+        &self,
+        table: &Table,
+        filter: &Filter,
+        since: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Map<String, Value>>, String> {
+        let Some(query) = table.newest_sql(filter, since, limit) else {
+            return Ok(Vec::new());
+        };
+        let rows = self.sql(&query).await?;
         Ok(rows.iter().map(|row| table.row(row)).collect())
     }
 
-    pub async fn follow(
+    /// How many rows match from `since` on. QuestDB answers this from the time index, so it stays
+    /// cheap when the rows it counts are too many to read.
+    pub async fn count_since(
         &self,
         table: &Table,
-        after: Option<&str>,
-    ) -> Result<Vec<Map<String, Value>>, String> {
-        let rows = self.sql(&table.follow_sql(after)).await?;
-        Ok(rows.iter().map(|row| table.row(row)).collect())
+        filter: &Filter,
+        since: &str,
+    ) -> Result<u64, String> {
+        let Some(query) = table.count_sql(filter, since) else {
+            return Ok(0);
+        };
+        let rows = self.sql(&query).await?;
+        Ok(rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(Value::as_u64)
+            .unwrap_or(0))
+    }
+
+    /// The resting book, from the tape: each order's last report, for the orders still working.
+    /// This is the query the gateway uses for cancel-all, summed by price. It scans the market's
+    /// history, so it runs when someone starts watching a market, and never in a loop.
+    pub async fn book_snapshot(&self, symbol: &str) -> Result<Vec<(String, i64, i64)>, String> {
+        let query = format!(
+            "select side, price, sum(leaves) from (select account, cl_ord_id, order_id, \
+             last(side) side, last(price) price, last(leaves_qty) leaves, \
+             last(ord_status) ord_status from orders where symbol = '{symbol}' \
+             and (ord_rej_reason is null or ord_rej_reason != 'duplicate_order')) \
+             where ord_status in ('new', 'partially_filled') and price != null \
+             group by side, price limit {SNAPSHOT_LEVELS}"
+        );
+        let rows = self.sql_with(&query, SNAPSHOT_TIMEOUT).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| match row.as_slice() {
+                [side, price, size, ..] => {
+                    Some((side.as_str()?.to_string(), price.as_i64()?, size.as_i64()?))
+                }
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Prices over a window. Each match has one row per side, so buys count each once.
+    pub async fn candles(&self, symbol: &str, range: Range) -> Result<Vec<Value>, String> {
+        let query = format!(
+            "select ts, first(price), max(price), min(price), last(price), sum(quantity) \
+             from trades where symbol = '{symbol}' and side = 'buy' \
+             and ts > dateadd('m', -{}, now()) sample by {}s",
+            range.minutes(),
+            range.bucket_secs(),
+        );
+        let rows = self.sql(&query).await?;
+        let price = |value: &Value| value.as_i64().map(decimal::format);
+        Ok(rows
+            .iter()
+            .filter_map(|row| match row.as_slice() {
+                [time, open, high, low, close, volume] => Some(json!({
+                    "time": time,
+                    "open": price(open)?,
+                    "high": price(high)?,
+                    "low": price(low)?,
+                    "close": price(close)?,
+                    "volume": price(volume)?,
+                })),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The past 24 hours, and the last price whenever it was.
+    pub async fn day_summary(&self, symbol: &str) -> Result<Value, String> {
+        let day = format!(
+            "select first(price), max(price), min(price), sum(quantity), count() from trades \
+             where symbol = '{symbol}' and side = 'buy' and ts > dateadd('h', -24, now())"
+        );
+        let last = format!(
+            "select price, ts from trades where symbol = '{symbol}' and side = 'buy' \
+             order by ts desc limit 1"
+        );
+        let (day, last) = tokio::join!(self.sql(&day), self.sql(&last));
+        let (day, last) = (day?, last?);
+        let price = |value: Option<&Value>| value.and_then(Value::as_i64).map(decimal::format);
+        let row = day.first().map_or(&[][..], Vec::as_slice);
+        let newest = last.first().map_or(&[][..], Vec::as_slice);
+        Ok(json!({
+            "open": price(row.first()),
+            "high": price(row.get(1)),
+            "low": price(row.get(2)),
+            "volume": price(row.get(3)),
+            "trades": row.get(4).and_then(Value::as_u64).unwrap_or(0),
+            "last": price(newest.first()),
+            "last_time": newest.get(1),
+        }))
+    }
+
+    /// Reports per minute over the past hour, and the busiest markets in it.
+    pub async fn summary(&self) -> Result<Value, String> {
+        let rate = "select ts, count() from orders where ts > dateadd('h', -1, now()) sample by 1m";
+        let busiest = "select symbol, count() reports from orders \
+                       where ts > dateadd('h', -1, now()) order by reports desc limit 8";
+        let (rate, busiest) = tokio::join!(self.sql(rate), self.sql(busiest));
+        let rate: Vec<Value> = rate?
+            .iter()
+            .filter_map(|row| match row.as_slice() {
+                [time, count] => Some(json!({ "time": time, "reports": count })),
+                _ => None,
+            })
+            .collect();
+        let busiest: Vec<Value> = busiest?
+            .iter()
+            .filter_map(|row| match row.as_slice() {
+                [symbol, count] => Some(json!({ "symbol": symbol, "reports": count })),
+                _ => None,
+            })
+            .collect();
+        Ok(json!({ "reports_per_minute": rate, "busiest": busiest }))
     }
 
     async fn gateway_status(&self, gateway: &str) -> ServiceStatus {
@@ -765,18 +1018,27 @@ mod tests {
         let filter = Filter {
             symbol: Some("ITEM".to_string()),
             player: Some(player),
+            ..Filter::default()
         };
-        let sql = ORDERS.recent_sql(&filter, 5);
+        let sql = ORDERS.newest_sql(&filter, None, 5).unwrap();
         assert!(sql.ends_with(&format!(" from orders where symbol = 'ITEM' and account = '{player}' order by ts desc limit 5")), "{sql}");
         assert!(
             TRADES
-                .recent_sql(&Filter::default(), 1)
+                .newest_sql(&Filter::default(), None, 1)
+                .unwrap()
                 .ends_with(" from trades order by ts desc limit 1")
         );
-        let sql = ORDERS.follow_sql(Some("2026-01-01T00:00:00.000000Z"));
+        let since = "2026-01-01T00:00:00.000000Z";
+        let sql = ORDERS
+            .newest_sql(&Filter::default(), Some(since), 9)
+            .unwrap();
         assert!(
-            sql.contains(" where ts >= '2026-01-01T00:00:00.000000Z' order by ts limit "),
+            sql.ends_with(&format!(" where ts >= '{since}' order by ts desc limit 9")),
             "{sql}"
+        );
+        assert_eq!(
+            ORDERS.count_sql(&Filter::default(), since).unwrap(),
+            format!("select count() from orders where ts >= '{since}'")
         );
     }
 
