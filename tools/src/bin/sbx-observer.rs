@@ -32,6 +32,9 @@ fn now_ns() -> u64 {
 }
 
 fn main() {
+    // mmx turns on reqwest's bring-your-own-provider TLS, and a workspace build shares that feature
+    // with every crate, so without this the first client built here panics.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let endpoint = transport::env_or("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
     let exporter = MetricExporter::builder()
         .with_http()
