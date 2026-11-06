@@ -1,17 +1,19 @@
 //! `mmx serve`: the admin API under `/admin/v1`. The CLI and the console are both clients of this.
 
-use crate::auth::{self, Auth};
+use crate::auth::{self, Auth, Caller};
 use crate::console;
 use crate::events;
 use crate::feed::{self, Feeds};
 use crate::markets::{self, MarketEntry, MarketsFile, Problem, normalize_symbol};
+use crate::monitor::{MarketStats, Monitor};
 use crate::settings;
 use crate::store::{ConfigStore, Delivery, MARKETS_KEY, StoreError, text_revision};
 use crate::upstream::{
     Filter, GatewayResult, LiveMarket, ORDERS, Range, Side, TRADES, Table, Upstreams,
-    reloaded_symbols, verdict,
+    parse_time_ms, reloaded_symbols,
 };
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -45,8 +47,10 @@ const DELIVERY_EXPECTED_SECS: u64 = 90;
 pub const MAX_STREAMS: usize = 64;
 /// One page of the market list.
 const MAX_PAGE: usize = 500;
-/// `/activity/summary` scans an hour of the tape, so every viewer shares one reading.
-const SUMMARY_FRESH: Duration = Duration::from_secs(15);
+/// `/activity/summary` scans a window of the tape, so every viewer shares one reading.
+const SUMMARY_FRESH: Duration = Duration::from_secs(4);
+/// The most lines `/activity/log` gives at once.
+const MAX_LOG: usize = 500;
 
 pub struct AppState {
     pub up: Arc<Upstreams>,
@@ -63,7 +67,9 @@ pub struct AppState {
     /// Live market data, one subscription per market being watched.
     pub feeds: Arc<Feeds>,
     pub streams: Arc<Semaphore>,
-    pub summary: Mutex<Option<(Instant, Value)>>,
+    /// One reading per window, shared by every viewer.
+    pub summary: Mutex<HashMap<&'static str, (Instant, Value)>>,
+    pub monitor: Arc<Monitor>,
 }
 
 /// One seat for one open stream. It's held for as long as the stream is.
@@ -170,6 +176,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/status", get(status))
         .route("/markets", get(list_markets))
         .route("/activity/summary", get(activity_summary))
+        .route("/activity/log", get(activity_log))
         .route("/markets/reload", post(reload_markets))
         .route(
             "/markets/{symbol}",
@@ -245,10 +252,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let services = state.up.status().await;
-    Json(
-        json!({ "verdict": verdict(&services), "version": env!("CARGO_PKG_VERSION"), "services": services }),
-    )
+    Json(state.monitor.status().await.as_ref().clone())
 }
 
 #[derive(Serialize, Debug)]
@@ -278,6 +282,8 @@ struct MarketView {
     /// Whether every gateway matches the file, which is false until a reload lands everywhere.
     in_sync: bool,
     gateways: Vec<GatewayView>,
+    #[serde(flatten)]
+    stats: MarketStats,
 }
 
 /// Compares mantissas, because `0.10` and `0.1` are the same market, and a gateway reports the
@@ -363,7 +369,7 @@ fn gateway_in_sync(file: &MarketsFile, gateway: &str, markets: &[LiveMarket]) ->
     LiveIndex::new(file, &live).behind().is_empty()
 }
 
-fn market_view(symbol: &str, index: &LiveIndex) -> MarketView {
+fn market_view(symbol: &str, index: &LiveIndex, stats: &HashMap<String, MarketStats>) -> MarketView {
     let entry = index.file.get(symbol).copied();
     let gateways: Vec<GatewayView> = index
         .gateways
@@ -413,6 +419,7 @@ fn market_view(symbol: &str, index: &LiveIndex) -> MarketView {
         in_file: entry.is_some(),
         in_sync: gateways.iter().all(|view| view.in_sync),
         gateways,
+        stats: stats.get(symbol).cloned().unwrap_or_default(),
     }
 }
 
@@ -488,7 +495,8 @@ struct MarketQuery {
     q: Option<String>,
     /// `open`, `halted`, `disabled` or `out_of_sync`.
     state: Option<String>,
-    /// `symbol` or `state`. Symbol is the default.
+    /// `symbol`, `state`, `last`, `volume`, `trades`, `last_trade`, `spread` or `open_orders`.
+    /// Symbol is the default.
     sort: Option<String>,
     /// `asc` or `desc`.
     dir: Option<String>,
@@ -496,6 +504,28 @@ struct MarketQuery {
     limit: Option<usize>,
     offset: Option<usize>,
 }
+
+/// What a market's numbers sort by. A market with no number comes last in either direction, so
+/// markets that never traded don't bury the ones that did.
+fn stat_key(view: &MarketView, sort: &str) -> Option<f64> {
+    let stats = &view.stats;
+    let number = |text: &Option<String>| text.as_deref()?.parse::<f64>().ok();
+    match sort {
+        "last" => number(&stats.last),
+        "volume" => number(&stats.volume_24h),
+        "spread" => number(&stats.spread),
+        "trades" => stats.trades_24h.map(|count| count as f64),
+        "open_orders" => stats.open_orders.map(|count| count as f64),
+        "last_trade" => stats
+            .last_time
+            .as_deref()
+            .and_then(parse_time_ms)
+            .map(|time| time as f64),
+        _ => None,
+    }
+}
+
+const STAT_SORTS: [&str; 6] = ["last", "volume", "spread", "trades", "open_orders", "last_trade"];
 
 fn state_of(view: &MarketView) -> &'static str {
     if view.halted {
@@ -525,6 +555,7 @@ async fn list_markets(
     let (file, _) = read_file(&state).await?;
     let live = state.up.live_markets().await;
     let index = LiveIndex::new(&file, &live);
+    let stats = state.monitor.stats();
 
     // A market can be on a gateway and not in the file, which is what's worth seeing here.
     let mut symbols: Vec<&str> = file
@@ -544,7 +575,7 @@ async fn list_markets(
     let mut views: Vec<MarketView> = symbols
         .iter()
         .filter(|symbol| symbol.contains(&needle))
-        .map(|symbol| market_view(symbol, &index))
+        .map(|symbol| market_view(symbol, &index, &stats))
         .collect();
 
     // Counted before the state filter, so the filter's own buttons can show them.
@@ -564,14 +595,26 @@ async fn list_markets(
             other => state_of(view) == other,
         });
     }
-    if query.sort.as_deref() == Some("state") {
-        views.sort_by(|left, right| state_of(left).cmp(state_of(right)));
-    } else if !needle.is_empty() {
-        // What someone typed the start of comes first, then what merely contains it.
-        views.sort_by_key(|view| !view.symbol.starts_with(&needle));
-    }
-    if query.dir.as_deref() == Some("desc") {
-        views.reverse();
+    let descending = query.dir.as_deref() == Some("desc");
+    let sort = query.sort.as_deref().unwrap_or("symbol");
+    if STAT_SORTS.contains(&sort) {
+        views.sort_by(|left, right| match (stat_key(left, sort), stat_key(right, sort)) {
+            (Some(left), Some(right)) if descending => right.total_cmp(&left),
+            (Some(left), Some(right)) => left.total_cmp(&right),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        });
+    } else {
+        if sort == "state" {
+            views.sort_by(|left, right| state_of(left).cmp(state_of(right)));
+        } else if !needle.is_empty() {
+            // What someone typed the start of comes first, then what merely contains it.
+            views.sort_by_key(|view| !view.symbol.starts_with(&needle));
+        }
+        if descending {
+            views.reverse();
+        }
     }
     let total = views.len();
     let offset = query.offset.unwrap_or(0);
@@ -595,7 +638,11 @@ async fn get_market(
     let symbol = symbol(&raw)?;
     let (file, _) = read_file(&state).await?;
     let live = state.up.live_markets().await;
-    let view = market_view(&symbol, &LiveIndex::new(&file, &live));
+    let view = market_view(
+        &symbol,
+        &LiveIndex::new(&file, &live),
+        &state.monitor.stats(),
+    );
     if !view.in_file && view.gateways.iter().all(|gateway| gateway.market.is_none()) {
         return Err(error(
             StatusCode::NOT_FOUND,
@@ -645,16 +692,44 @@ async fn market_stream(
 }
 
 /// How busy the exchange is, for the overview.
-async fn activity_summary(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct SummaryParams {
+    range: Option<String>,
+}
+
+async fn activity_summary(
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<SummaryParams>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(params) = params.map_err(|rejection| invalid(rejection.body_text()))?;
+    let wanted = params.range.as_deref().unwrap_or("1h");
+    let range = Range::parse(wanted).ok_or_else(|| invalid(format!("Unknown range {wanted}.")))?;
     let mut cached = state.summary.lock().await;
-    if let Some((at, value)) = cached.as_ref()
+    if let Some((at, value)) = cached.get(range.name())
         && at.elapsed() < SUMMARY_FRESH
     {
         return Ok(Json(value.clone()));
     }
-    let value = state.up.summary().await.map_err(upstream_failed)?;
-    *cached = Some((Instant::now(), value.clone()));
+    let value = state.up.summary(range).await.map_err(upstream_failed)?;
+    cached.insert(range.name(), (Instant::now(), value.clone()));
     Ok(Json(value))
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct LogParams {
+    limit: Option<usize>,
+}
+
+/// What `mmx serve` has seen happen, newest first.
+async fn activity_log(
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<LogParams>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(params) = params.map_err(|rejection| invalid(rejection.body_text()))?;
+    let limit = params.limit.unwrap_or(MAX_LOG).min(MAX_LOG);
+    Ok(Json(state.monitor.log(limit)))
 }
 
 /// Checks that a reload really changed what the gateway serves. A gateway reads its own copy of the
@@ -952,27 +1027,43 @@ fn rollup(gateways: &[GatewayResult]) -> StatusCode {
     }
 }
 
-async fn forward(state: &AppState, raw: &str, action: &str) -> Result<Response, ApiError> {
+async fn forward(
+    state: &AppState,
+    raw: &str,
+    action: &str,
+    caller: &Caller,
+) -> Result<Response, ApiError> {
     let symbol = symbol(raw)?;
     let path = format!("/api/v1/admin/markets/{symbol}/{action}");
     let gateways = state.up.each_gateway(Method::POST, &path).await;
     let code = rollup(&gateways);
+    let level = if action == "halt" { "warn" } else { "info" };
+    let done = if code.is_success() { "" } else { " (not on every gateway)" };
+    let verb = if action == "halt" { "Halted" } else { "Resumed" };
+    state.monitor.note(
+        level,
+        format!("market {symbol}"),
+        format!("{verb}{done}"),
+        Some(caller.name().to_string()),
+    );
     let body = json!({ "symbol": symbol, "action": action, "ok": code.is_success(), "gateways": gateways });
     Ok((code, Json(body)).into_response())
 }
 
 async fn halt(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(raw): Path<String>,
 ) -> Result<Response, ApiError> {
-    forward(&state, &raw, "halt").await
+    forward(&state, &raw, "halt", &caller).await
 }
 
 async fn resume(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(raw): Path<String>,
 ) -> Result<Response, ApiError> {
-    forward(&state, &raw, "resume").await
+    forward(&state, &raw, "resume", &caller).await
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -986,10 +1077,17 @@ struct CancelCounts {
 /// `complete` is false if an order may be left open, in which case the request can be repeated.
 async fn cancel_all(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(raw): Path<String>,
 ) -> Result<Response, ApiError> {
     let symbol = symbol(&raw)?;
     let gateways = state.up.cancel_all(&symbol).await;
+    state.monitor.note(
+        "warn",
+        format!("market {symbol}"),
+        "Canceled all open orders".to_string(),
+        Some(caller.name().to_string()),
+    );
     let answer = gateways.last().filter(|result| result.ok);
     let counts = answer.map(|result| serde_json::from_value::<CancelCounts>(result.body.clone()));
     let code = match (&counts, gateways.last().and_then(|result| result.status)) {

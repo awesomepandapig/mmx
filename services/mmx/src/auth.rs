@@ -337,7 +337,7 @@ impl Caller {
     }
 
     /// Who to name in the audit log.
-    fn name(&self) -> &str {
+    pub fn name(&self) -> &str {
         match self {
             Self::Token => "the admin token",
             Self::Local => "a local caller",

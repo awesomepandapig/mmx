@@ -42,6 +42,7 @@ const NANOS_PER_MILLI: u64 = 1_000_000;
 pub fn router(state: Arc<AppState>) -> Router {
     // Every route here shares the one layer, so a new one can't forget its auth.
     let admin_routes = Router::new()
+        .route("/api/v1/admin/cluster", get(admin::cluster))
         .route("/api/v1/admin/markets", get(admin::list_markets))
         .route("/api/v1/admin/markets/reload", post(admin::reload_markets))
         .route("/api/v1/admin/markets/{symbol}/halt", post(admin::halt_market))
@@ -134,8 +135,13 @@ pub async fn post_order(
     player: Player,
     payload: Result<Json<CreateOrder>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Order>), AppError> {
+    let started = Instant::now();
     let result = place_order(&state, player, payload).await;
     state.metrics.record_order(&result);
+    // A refused order never reached the engine, so it would only flatter the numbers.
+    if result.is_ok() {
+        state.metrics.record_latency(started.elapsed());
+    }
     result
 }
 

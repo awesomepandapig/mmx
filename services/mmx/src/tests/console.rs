@@ -418,12 +418,14 @@ async fn insecure_local_refuses_browsers_without_a_session() {
         questdb: dead_url().await,
         nats: "127.0.0.1:1".to_string(),
         valkey: None,
+        websocket: None,
     };
     let up = Arc::new(Upstreams::new(targets, None).unwrap());
     let state = Arc::new(AppState {
         feeds: crate::feed::Feeds::new(up.clone()),
         streams: Arc::new(tokio::sync::Semaphore::new(server::MAX_STREAMS)),
-        summary: tokio::sync::Mutex::new(None),
+        summary: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        monitor: crate::monitor::Monitor::new(up.clone()),
         up,
         store,
         auth,
@@ -705,6 +707,7 @@ async fn gateways_can_be_found_through_a_name() {
         questdb: String::new(),
         nats: String::new(),
         valkey: None,
+        websocket: None,
     };
     let up = Upstreams::new(targets, None).unwrap();
     let urls = up.gateway_urls().await;

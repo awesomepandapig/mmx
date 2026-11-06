@@ -11,7 +11,7 @@ use crate::server::{self, AppState};
 use crate::store::{ConfigStore, LocalStore};
 use crate::upstream::{Filter, Targets, Upstreams};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -370,6 +370,7 @@ async fn world_on(store: ConfigStore, gateways: Vec<String>, quest: Arc<FakeQues
         questdb,
         nats: nats_address,
         valkey: None,
+        websocket: None,
     };
     let up = Arc::new(Upstreams::new(targets, Some(TOKEN.to_string())).unwrap());
     let store = Arc::new(store);
@@ -386,7 +387,8 @@ async fn world_on(store: ConfigStore, gateways: Vec<String>, quest: Arc<FakeQues
     let state = Arc::new(AppState {
         feeds: Feeds::new(up.clone()),
         streams: Arc::new(tokio::sync::Semaphore::new(server::MAX_STREAMS)),
-        summary: tokio::sync::Mutex::new(None),
+        summary: tokio::sync::Mutex::new(HashMap::new()),
+        monitor: crate::monitor::Monitor::new(up.clone()),
         up: up.clone(),
         store,
         auth,
@@ -531,10 +533,25 @@ async fn status_reports_each_service_and_a_verdict() {
         .iter()
         .map(|service| service["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["gateway", "outbox", "questdb", "nats"]);
-    assert_eq!(services[0]["checks"]["engine"], true);
-    assert_eq!(services[2]["version"], "8.2.3");
-    assert_eq!(services[3]["version"], "2.10.0");
+    assert_eq!(
+        names,
+        [
+            "matching-engine",
+            "gateway",
+            "outbox",
+            "trade-reporter",
+            "market-data",
+            "questdb",
+            "nats"
+        ]
+    );
+    assert_eq!(services[0]["ready"], true);
+    assert_eq!(services[1]["checks"]["engine"], true);
+    assert_eq!(services[5]["version"], "8.2.3");
+    assert_eq!(services[6]["version"], "2.10.0");
+    assert_eq!(body["can_trade"], true);
+    assert_eq!(body["cluster"]["mode"], "unknown");
+    assert_eq!(body["conditions"], json!([]));
     assert_eq!(
         gateway.calls_to("/readyz")[0].auth.as_deref(),
         Some("Bearer test-token")
@@ -545,11 +562,17 @@ async fn status_reports_each_service_and_a_verdict() {
     let partial = world_with(gateway.file.clone(), vec![live, dead_url().await], quest()).await;
     let (_, body) = partial.get("/status").await;
     assert_eq!(body["verdict"], "degraded");
-    assert_eq!(body["services"][1]["reachable"], false);
-    assert!(body["services"][1]["error"].is_string());
+    assert_eq!(body["services"][2]["reachable"], false);
+    assert!(body["services"][2]["error"].is_string());
+    assert_eq!(body["conditions"][0]["check"], "reachable");
+    assert!(body["conditions"][0]["since"].is_string());
 
     let none = world_with(gateway.file.clone(), vec![dead_url().await], quest()).await;
-    assert_eq!(none.get("/status").await.1["verdict"], "down");
+    let body = none.get("/status").await.1;
+    assert_eq!(body["verdict"], "down");
+    assert_eq!(body["can_trade"], false);
+    assert_eq!(body["services"][0]["name"], "matching-engine");
+    assert_eq!(body["services"][0]["ready"], false);
 }
 
 #[tokio::test]

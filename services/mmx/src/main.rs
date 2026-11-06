@@ -8,6 +8,7 @@ mod decimal;
 mod events;
 mod feed;
 mod markets;
+mod monitor;
 mod oidc;
 mod output;
 mod server;
@@ -26,6 +27,7 @@ use server::AppState;
 use store::{ConfigStore, KubeStore, LocalStore};
 use upstream::{Targets, Upstreams};
 
+use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -117,6 +119,10 @@ struct Services {
     #[arg(long, global = true, env = "VALKEY_URL", hide_env_values = true)]
     valkey: Option<String>,
 
+    /// The websocket service's address. Left out, it isn't listed
+    #[arg(long, global = true, env = "MMX_WEBSOCKET_URL")]
+    websocket: Option<String>,
+
     /// The markets file, which must be the one gateways read
     #[arg(
         long,
@@ -159,7 +165,7 @@ enum Command {
         #[command(subcommand)]
         command: OrderCommand,
     },
-    /// Recent order reports across all players, from QuestDB
+    /// Recent order events across all players, from QuestDB
     Orders(ActivityArgs),
     /// Recent trades across all players, from QuestDB, with one row per side
     Trades(ActivityArgs),
@@ -376,6 +382,7 @@ impl Services {
             questdb: base_url("questdb", &self.questdb)?,
             nats: self.nats.clone(),
             valkey: self.valkey.clone(),
+            websocket: self.websocket.clone(),
         })
     }
 }
@@ -439,8 +446,11 @@ async fn serve(cli: &Cli, args: &ServeArgs, token: Option<String>) -> Result<(),
     auth.spawn_refresh();
 
     let up = Arc::new(Upstreams::new(cli.services.targets()?, token.clone())?);
+    let monitor = monitor::Monitor::new(up.clone());
+    monitor.spawn();
     let state = Arc::new(AppState {
         feeds: feed::Feeds::new(up.clone()),
+        monitor: monitor.clone(),
         up,
         store,
         auth,
@@ -449,7 +459,7 @@ async fn serve(cli: &Cli, args: &ServeArgs, token: Option<String>) -> Result<(),
         behind_since: StdMutex::new(None),
         outbox_restart: args.outbox_restart.clone(),
         streams: Arc::new(Semaphore::new(server::MAX_STREAMS)),
-        summary: Mutex::new(None),
+        summary: Mutex::new(HashMap::new()),
     });
     server::spawn_reconciler(state.clone());
     server::serve(state, address).await

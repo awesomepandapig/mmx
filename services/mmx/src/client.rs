@@ -68,7 +68,7 @@ fn render_status(body: &Value) -> String {
             .and_then(Value::as_str)
             .unwrap_or("-");
         let mut row = format!(
-            "{:<8} {:<11} {:<8} {}",
+            "{:<16} {:<11} {:<8} {}",
             text(service, "name"),
             state,
             version,
@@ -78,6 +78,26 @@ fn render_status(body: &Value) -> String {
             row = format!("{row}  ({error})");
         }
         lines.push(row);
+    }
+    if let Some(cluster) = body.get("cluster").filter(|cluster| text(cluster, "mode") == "cluster") {
+        let number = |name: &str| cluster.get(name).unwrap_or(&Value::Null);
+        let quorum = if flag(cluster, "quorum") { "quorum" } else { "no quorum" };
+        lines.push(format!(
+            "cluster: {} of {} members, {quorum}, leader {}, term {}",
+            number("members_up"),
+            number("members_total"),
+            number("leader"),
+            number("term"),
+        ));
+    }
+    for condition in list(body, "conditions") {
+        lines.push(format!(
+            "failing: {} {} since {}: {}",
+            text(condition, "subject"),
+            text(condition, "check"),
+            text(condition, "since"),
+            text(condition, "detail"),
+        ));
     }
     lines.join("\n")
 }
@@ -653,7 +673,7 @@ mod tests {
         });
         let text = render_status(&body);
         assert!(text.starts_with("verdict: degraded"), "{text}");
-        assert!(text.contains("gateway  ready       1.2"), "{text}");
+        assert!(text.contains("gateway          ready       1.2"), "{text}");
         assert!(
             text.contains("not ready") && text.contains("(halted)"),
             "{text}"

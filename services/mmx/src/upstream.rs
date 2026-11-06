@@ -2,7 +2,9 @@
 //! Valkey.
 
 use crate::decimal;
+use crate::monitor::MarketStats;
 
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::time::Duration;
 
@@ -28,6 +30,11 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
 const SNAPSHOT_LEVELS: usize = 100_000;
 const NATS_PORT: u16 = 4222;
 const VALKEY_PORT: u16 = 6379;
+const WEBSOCKET_PORT: u16 = 8090;
+const OPEN_ORDERS_TIMEOUT: Duration = Duration::from_secs(3);
+/// Enough rows for every market at every order state, at the most markets anyone has tried.
+const SUMMARY_ROWS: usize = 30_000;
+const BUSIEST: usize = 12;
 
 /// reqwest panics on the first client without this. A workspace build can link two TLS backends, so
 /// the choice has to be explicit, and installing twice changes nothing.
@@ -191,10 +198,13 @@ pub struct ServiceStatus {
     pub checks: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// When its work was last seen, for services nothing can ask directly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<String>,
 }
 
 impl ServiceStatus {
-    fn new(name: &str, target: &str, required: bool) -> Self {
+    pub fn new(name: &str, target: &str, required: bool) -> Self {
         Self {
             name: name.to_string(),
             target: target.to_string(),
@@ -204,6 +214,7 @@ impl ServiceStatus {
             version: None,
             checks: None,
             error: None,
+            last_seen: None,
         }
     }
 
@@ -211,10 +222,31 @@ impl ServiceStatus {
         self.error = Some(error);
         self
     }
+
+    /// The boolean checks this service said no to. The outbox's `checks` hold other things.
+    pub fn failed_checks(&self) -> Vec<String> {
+        if self.name != "gateway" {
+            return Vec::new();
+        }
+        self.checks
+            .as_ref()
+            .and_then(Value::as_object)
+            .map_or_else(Vec::new, |checks| {
+                checks
+                    .iter()
+                    .filter(|(_, passed)| passed.as_bool() == Some(false))
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+    }
+
+    pub fn checks_failed(&self) -> bool {
+        !self.failed_checks().is_empty()
+    }
 }
 
 /// `ok` needs everything, and `down` means no gateway can take an order.
-pub fn verdict(services: &[ServiceStatus]) -> &'static str {
+pub fn install_verdict(services: &[ServiceStatus]) -> &'static str {
     let can_trade = services
         .iter()
         .any(|service| service.name == "gateway" && service.ready);
@@ -225,6 +257,60 @@ pub fn verdict(services: &[ServiceStatus]) -> &'static str {
     } else {
         "degraded"
     }
+}
+
+/// `/api/v1/admin/cluster` on a gateway.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GatewayMember {
+    pub member: usize,
+    pub connected: bool,
+    pub position: Option<i64>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct GatewayCluster {
+    pub term: i64,
+    pub leader: Option<usize>,
+    pub leader_connected: bool,
+    pub leader_changes: u64,
+    pub last_leader_change_ms: Option<u64>,
+    pub last_exec_id: u64,
+    pub members: Vec<GatewayMember>,
+}
+
+/// What one gateway said of the cluster. An older gateway, or one that's down, says nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterAnswer {
+    pub standalone: bool,
+    pub view: Option<GatewayCluster>,
+}
+
+/// The newest row QuestDB holds, which is how far `trade-reporter` has got.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TapeHead {
+    pub exec_id: Option<u64>,
+    pub time: Option<String>,
+    pub newest_trade_ms: Option<u64>,
+}
+
+/// Days since 1970 for a civil date, as in Howard Hinnant's `days_from_civil`.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let shifted = (month + 9) % 12;
+    let doy = (153 * shifted + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Milliseconds for a QuestDB timestamp like `2026-11-06T16:38:53.463813Z`.
+pub fn parse_time_ms(text: &str) -> Option<u64> {
+    let number = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let days = days_from_civil(number(0..4)?, number(5..7)?, number(8..10)?);
+    let seconds = number(11..13)? * 3600 + number(14..16)? * 60 + number(17..19)?;
+    let fraction = text.get(20..23).and_then(|part| part.parse::<i64>().ok());
+    u64::try_from((days * 86_400 + seconds) * 1000 + fraction.unwrap_or(0)).ok()
 }
 
 /// `GET /position` on the outbox.
@@ -429,6 +515,15 @@ impl Range {
         }
     }
 
+    fn summary_bucket_secs(self) -> u32 {
+        match self {
+            Self::Minutes15 => 10,
+            Self::Hour => 60,
+            Self::Hours6 => 300,
+            Self::Day => 900,
+        }
+    }
+
     pub fn bucket_secs(self) -> u32 {
         match self {
             Self::Minutes15 => 10,
@@ -517,6 +612,44 @@ impl Table {
     }
 }
 
+/// How a stretch of the tape breaks down. `orders` counts orders arriving, not their later steps.
+#[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
+struct Tally {
+    orders: u64,
+    trades: u64,
+    cancels: u64,
+    rejects: u64,
+    expired: u64,
+    /// Each match shows up once per side in `orders`.
+    #[serde(skip)]
+    sides: u64,
+}
+
+impl Tally {
+    fn add(&mut self, kind: &Value, count: &Value) {
+        let count = count.as_u64().unwrap_or(0);
+        match kind.as_str() {
+            Some("new") => self.orders += count,
+            Some("canceled") => self.cancels += count,
+            Some("rejected") => self.rejects += count,
+            Some("expired") => self.expired += count,
+            Some("trade") => {
+                self.sides += count;
+                self.trades = self.sides / 2;
+            }
+            _ => {}
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.orders += other.orders;
+        self.trades += other.trades;
+        self.cancels += other.cancels;
+        self.rejects += other.rejects;
+        self.expired += other.expired;
+    }
+}
+
 /// Strips a scheme, credentials and path, for dialing and so that passwords are never displayed.
 pub fn host_port(url: &str, default_port: u16) -> String {
     let url = url.split(',').next().unwrap_or(url).trim();
@@ -554,6 +687,8 @@ pub struct Targets {
     pub questdb: String,
     pub nats: String,
     pub valkey: Option<String>,
+    /// Nothing else reveals the websocket service, so it's only shown if it's named.
+    pub websocket: Option<String>,
 }
 
 pub struct Upstreams {
@@ -809,27 +944,183 @@ impl Upstreams {
         }))
     }
 
-    /// Reports per minute over the past hour, and the busiest markets in it.
-    pub async fn summary(&self) -> Result<Value, String> {
-        let rate = "select ts, count() from orders where ts > dateadd('h', -1, now()) sample by 1m";
-        let busiest = "select symbol, count() reports from orders \
-                       where ts > dateadd('h', -1, now()) order by reports desc limit 8";
-        let (rate, busiest) = tokio::join!(self.sql(rate), self.sql(busiest));
-        let rate: Vec<Value> = rate?
+    /// What the exchange did over a window. A row in `orders` is one step in an order's life, not
+    /// one order: a `new` row is an order arriving, so that's what's counted as an order. Each match
+    /// has a row per side, so trades count the buy side.
+    pub async fn summary(&self, range: Range) -> Result<Value, String> {
+        let (minutes, bucket) = (range.minutes(), range.summary_bucket_secs());
+        let window = format!("ts > dateadd('m', -{minutes}, now())");
+        let events = format!(
+            "select ts, exec_type, count() from orders where {window} sample by {bucket}s"
+        );
+        let trades = format!(
+            "select ts, count() from trades where side = 'buy' and {window} sample by {bucket}s"
+        );
+        let markets = format!(
+            "select symbol, exec_type, count() from orders where {window} limit {SUMMARY_ROWS}"
+        );
+        let minute = "ts > dateadd('s', -60, now())";
+        let recent = format!("select exec_type, count() from orders where {minute}");
+        let recent_trades =
+            format!("select count() from trades where side = 'buy' and {minute}");
+        let newest = "select ts from orders order by ts desc limit 1";
+        let (events, trades, markets, recent, recent_trades, newest) = tokio::join!(
+            self.sql(&events),
+            self.sql(&trades),
+            self.sql(&markets),
+            self.sql(&recent),
+            self.sql(&recent_trades),
+            self.sql(newest),
+        );
+
+        let mut series: BTreeMap<String, Tally> = BTreeMap::new();
+        for row in events? {
+            if let [time, kind, count] = row.as_slice() {
+                let time = time.as_str().unwrap_or_default().to_string();
+                series.entry(time).or_default().add(kind, count);
+            }
+        }
+        for row in trades? {
+            if let [time, count] = row.as_slice() {
+                let time = time.as_str().unwrap_or_default().to_string();
+                series.entry(time).or_default().trades = count.as_u64().unwrap_or(0);
+            }
+        }
+        let mut totals = Tally::default();
+        for tally in series.values() {
+            totals.merge(tally);
+        }
+
+        let mut by_market: BTreeMap<String, Tally> = BTreeMap::new();
+        for row in markets? {
+            if let [symbol, kind, count] = row.as_slice() {
+                let symbol = symbol.as_str().unwrap_or_default().to_string();
+                by_market.entry(symbol).or_default().add(kind, count);
+            }
+        }
+        let mut busiest: Vec<(String, Tally)> = by_market.into_iter().collect();
+        busiest.sort_by_key(|(_, tally)| std::cmp::Reverse(tally.orders));
+        busiest.truncate(BUSIEST);
+
+        let mut last_minute = Tally::default();
+        for row in recent? {
+            if let [kind, count] = row.as_slice() {
+                last_minute.add(kind, count);
+            }
+        }
+        last_minute.trades = recent_trades?
+            .first()
+            .and_then(|row| row.first())
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        Ok(json!({
+            "range": range.name(),
+            "bucket_secs": bucket,
+            "newest": newest?.first().and_then(|row| row.first()).cloned(),
+            "last_minute": last_minute,
+            "totals": totals,
+            "series": series
+                .iter()
+                .map(|(time, tally)| json!({ "time": time, "counts": tally }))
+                .collect::<Vec<_>>(),
+            "busiest": busiest
+                .iter()
+                .map(|(symbol, tally)| json!({ "symbol": symbol, "counts": tally }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Each gateway's own view of the cluster.
+    pub async fn cluster_answers(&self) -> Vec<ClusterAnswer> {
+        let results = self
+            .each_gateway(Method::GET, "/api/v1/admin/cluster")
+            .await;
+        results
+            .into_iter()
+            .map(|result| {
+                let standalone = result.ok
+                    && result.body.get("mode").and_then(Value::as_str) == Some("standalone");
+                let view = result
+                    .body
+                    .get("view")
+                    .filter(|_| result.ok)
+                    .and_then(|view| serde_json::from_value(view.clone()).ok());
+                ClusterAnswer { standalone, view }
+            })
+            .collect()
+    }
+
+    /// `/metrics` from every gateway that answers.
+    pub async fn gateway_metrics(&self) -> Vec<String> {
+        self.each_gateway(Method::GET, "/metrics")
+            .await
+            .into_iter()
+            .filter(|result| result.ok)
+            .filter_map(|result| result.body.as_str().map(str::to_string))
+            .collect()
+    }
+
+    pub async fn tape_head(&self) -> Result<TapeHead, String> {
+        let order = "select exec_id, ts from orders order by ts desc limit 1";
+        let trade = "select ts from trades order by ts desc limit 1";
+        let (order, trade) = tokio::join!(self.sql(order), self.sql(trade));
+        let order = order?;
+        let row = order.first().map_or(&[][..], Vec::as_slice);
+        Ok(TapeHead {
+            exec_id: row.first().and_then(Value::as_u64),
+            time: row.get(1).and_then(Value::as_str).map(str::to_string),
+            newest_trade_ms: trade?
+                .first()
+                .and_then(|row| row.first())
+                .and_then(Value::as_str)
+                .and_then(parse_time_ms),
+        })
+    }
+
+    /// Last price and 24 hour totals for every market, read by time, so it's cheap at any tape size.
+    pub async fn market_rows(&self) -> Result<HashMap<String, MarketStats>, String> {
+        let day = "select symbol, sum(quantity), count() from trades \
+                   where side = 'buy' and ts > dateadd('h', -24, now())";
+        let last = "select symbol, price, ts from trades where side = 'buy' \
+                    latest on ts partition by symbol";
+        let (day, last) = tokio::join!(self.sql(day), self.sql(last));
+        let mut rows: HashMap<String, MarketStats> = HashMap::new();
+        for row in last? {
+            if let [symbol, price, time] = row.as_slice()
+                && let Some(symbol) = symbol.as_str()
+            {
+                let stats = rows.entry(symbol.to_string()).or_default();
+                stats.last = price.as_i64().map(decimal::format);
+                stats.last_time = time.as_str().map(str::to_string);
+            }
+        }
+        for row in day? {
+            if let [symbol, volume, count] = row.as_slice()
+                && let Some(symbol) = symbol.as_str()
+            {
+                let stats = rows.entry(symbol.to_string()).or_default();
+                stats.volume_24h = volume.as_i64().map(decimal::format);
+                stats.trades_24h = count.as_u64();
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Orders still working, per market. This reads each order's last row, so it has a short leash.
+    pub async fn open_orders(&self) -> Result<HashMap<String, u64>, String> {
+        let query = "select symbol, count() from (select symbol, account, cl_ord_id, order_id, \
+                     last(ord_status) ord_status from orders where \
+                     (ord_rej_reason is null or ord_rej_reason != 'duplicate_order')) \
+                     where ord_status in ('new', 'partially_filled')";
+        let rows = self.sql_with(query, OPEN_ORDERS_TIMEOUT).await?;
+        Ok(rows
             .iter()
             .filter_map(|row| match row.as_slice() {
-                [time, count] => Some(json!({ "time": time, "reports": count })),
+                [symbol, count] => Some((symbol.as_str()?.to_string(), count.as_u64()?)),
                 _ => None,
             })
-            .collect();
-        let busiest: Vec<Value> = busiest?
-            .iter()
-            .filter_map(|row| match row.as_slice() {
-                [symbol, count] => Some(json!({ "symbol": symbol, "reports": count })),
-                _ => None,
-            })
-            .collect();
-        Ok(json!({ "reports_per_minute": rate, "busiest": busiest }))
+            .collect())
     }
 
     async fn gateway_status(&self, gateway: &str) -> ServiceStatus {
@@ -966,6 +1257,21 @@ impl Upstreams {
         }
     }
 
+    /// Any connection proves it's listening. It has no health route.
+    async fn websocket_status(&self, url: &str) -> ServiceStatus {
+        let address = host_port(url, WEBSOCKET_PORT);
+        let status = ServiceStatus::new("websocket", &address, false);
+        match timeout(PROBE_TIMEOUT, TcpStream::connect(&address)).await {
+            Ok(Ok(_)) => ServiceStatus {
+                reachable: true,
+                ready: true,
+                ..status
+            },
+            Ok(Err(error)) => status.unreachable(error.to_string()),
+            Err(_) => status.unreachable("timed out".to_string()),
+        }
+    }
+
     pub async fn status(&self) -> Vec<ServiceStatus> {
         let urls = self.gateway_urls().await;
         let gateways = urls.iter().map(|gateway| self.gateway_status(gateway));
@@ -975,14 +1281,23 @@ impl Upstreams {
                 None => None,
             }
         };
-        let (mut services, outbox, questdb, nats, valkey) = tokio::join!(
+        let websocket = async {
+            match &self.targets.websocket {
+                Some(url) => Some(self.websocket_status(url).await),
+                None => None,
+            }
+        };
+        let (mut services, outbox, questdb, nats, valkey, websocket) = tokio::join!(
             join_all(gateways),
             self.outbox_status(),
             self.questdb_status(),
             self.nats_status(),
-            valkey
+            valkey,
+            websocket,
         );
-        services.extend([outbox, questdb, nats]);
+        services.push(outbox);
+        services.extend(websocket);
+        services.extend([questdb, nats]);
         services.extend(valkey);
         services
     }
@@ -1060,6 +1375,29 @@ mod tests {
         assert_eq!(row["price"], "10.5");
         assert_eq!(row["player"], "p");
         assert!(!row.contains_key("size"));
+    }
+
+    #[test]
+    fn times_read_back_from_questdb() {
+        assert_eq!(parse_time_ms("1970-01-01T00:00:01.500000Z"), Some(1500));
+        assert_eq!(
+            parse_time_ms("2026-11-06T16:47:36.120000Z"),
+            Some(1_793_983_656_120)
+        );
+        assert_eq!(parse_time_ms("not a time"), None);
+    }
+
+    #[test]
+    fn an_order_counts_once_however_many_steps_it_takes() {
+        let mut tally = Tally::default();
+        tally.add(&json!("new"), &json!(10));
+        tally.add(&json!("trade"), &json!(8));
+        tally.add(&json!("canceled"), &json!(2));
+        tally.add(&json!("rejected"), &json!(1));
+        assert_eq!(tally.orders, 10);
+        assert_eq!(tally.trades, 4);
+        assert_eq!(tally.cancels, 2);
+        assert_eq!(tally.rejects, 1);
     }
 
     #[test]

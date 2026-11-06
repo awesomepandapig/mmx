@@ -218,6 +218,7 @@ fn gateway(setup: Setup) -> Gateway {
         claims_ready: setup.clustered.then(|| claims_ready.clone()),
         engine: link.clone(),
         halts: halts.clone(),
+        cluster: None,
         metrics: Metrics::default(),
         admin_token: setup.admin_token,
     };
@@ -1459,4 +1460,14 @@ fn a_position_never_moves_backwards() {
     stream.advance_to(100);
     stream.advance_to(50);
     assert_eq!(stream.position(), 100);
+}
+
+#[tokio::test]
+async fn the_cluster_view_needs_the_admin_token_and_says_when_there_is_no_cluster() {
+    let gateway = gateway(Setup::default());
+    let refused = gateway.send(Method::GET, "/api/v1/admin/cluster", None, None).await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED);
+    let reply = gateway.admin(Method::GET, "/api/v1/admin/cluster").await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["mode"], "standalone");
 }

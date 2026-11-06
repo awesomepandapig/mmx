@@ -4,7 +4,7 @@ mod aeron_handler;
 use aeron_handler::{EngineLink, OrderSender, spawn_order_publisher};
 
 mod cluster_gateway;
-use cluster_gateway::{ClusterConfig, spawn_cluster_gateway};
+use cluster_gateway::{ClusterConfig, ClusterWatch, spawn_cluster_gateway};
 
 mod decimal;
 
@@ -71,6 +71,8 @@ pub struct AppState {
     id_rules: Option<OrderIdRules>,
     claims_ready: Option<Arc<AtomicBool>>,
     engine: Arc<EngineLink>,
+    /// `None` without a cluster.
+    cluster: Option<Arc<ClusterWatch>>,
     halts: Arc<Halts>,
     metrics: Metrics,
     admin_token: Option<String>,
@@ -175,7 +177,7 @@ async fn start() -> Result<(), String> {
 
     let engine = Arc::new(EngineLink::default());
 
-    let (orders, report_stream, id_rules) = match ClusterConfig::from_env() {
+    let (orders, report_stream, id_rules, cluster) = match ClusterConfig::from_env() {
         Some(config) => {
             let id_rules = order_id_rules()?;
             info!(
@@ -184,13 +186,15 @@ async fn start() -> Result<(), String> {
                 id_rules.settled_after()
             );
             let stream = Arc::new(ReportStream::default());
-            let orders = spawn_cluster_gateway(config, stream.clone(), engine.clone())?;
-            (orders, Some(stream), Some(id_rules))
+            let watch = Arc::new(ClusterWatch::default());
+            let orders =
+                spawn_cluster_gateway(config, stream.clone(), engine.clone(), watch.clone())?;
+            (orders, Some(stream), Some(id_rules), Some(watch))
         }
         None => {
             let channel = transport::env_or("PUB_CHANNEL", transport::ORDERS_CHANNEL);
             let stream_id = transport::stream_id_or("PUB_STREAM_ID", transport::ORDERS_STREAM);
-            (spawn_order_publisher(&channel, stream_id, engine.clone())?, None, None)
+            (spawn_order_publisher(&channel, stream_id, engine.clone())?, None, None, None)
         }
     };
 
@@ -207,6 +211,7 @@ async fn start() -> Result<(), String> {
         id_rules,
         claims_ready,
         engine,
+        cluster,
         halts,
         metrics: Metrics::default(),
         admin_token: admin::admin_token(),

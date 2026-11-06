@@ -13,10 +13,10 @@ use super::recorder::ReportStream;
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cluster::{ClusterClient, OfferResult};
 
@@ -29,8 +29,12 @@ use sbe::message_header_codec::MessageHeaderDecoder;
 use sbe::order_cancel_reject_codec::OrderCancelRejectDecoder;
 use sbe::ord_rej_reason_enum::OrdRejReasonEnum;
 
+use serde::Serialize;
+
 use tokio::sync::{mpsc, oneshot};
 use tokio::sync::mpsc::error::TryRecvError;
+
+use transport::AeronSubscription;
 
 const ORDER_QUEUE_LENGTH: usize = 4096;
 const INGRESS_STREAM: i32 = 101;
@@ -300,6 +304,68 @@ impl Tracker {
     }
 }
 
+/// One cluster member as this gateway hears it. Each member publishes its own copy of the report
+/// stream, and the copies are byte-identical, so positions compare directly.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MemberView {
+    pub member: usize,
+    /// Whether this member's stream is reaching the gateway.
+    pub connected: bool,
+    /// Bytes of the report stream read from this member. `None` until it's first connected.
+    pub position: Option<i64>,
+}
+
+/// What this gateway knows of the cluster, for operators.
+#[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterView {
+    pub term: i64,
+    pub leader: Option<usize>,
+    pub leader_connected: bool,
+    pub leader_changes: u64,
+    /// Unix milliseconds of the last change this gateway saw. It's `None` if there's been none
+    /// since it started.
+    pub last_leader_change_ms: Option<u64>,
+    /// The newest exec ID on the report stream, which is how far consumers have to go.
+    pub last_exec_id: u64,
+    pub members: Vec<MemberView>,
+}
+
+/// Aeron handles can't leave their thread, so it copies what it knows here for the admin route.
+#[derive(Default)]
+pub struct ClusterWatch(RwLock<ClusterView>);
+
+impl ClusterWatch {
+    fn publish(&self, view: ClusterView) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = view;
+    }
+
+    pub fn view(&self) -> ClusterView {
+        self.0.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+}
+
+/// Reads the member behind each report channel, which are listed in member order. A member back from
+/// a restart can briefly have two images, so the furthest one speaks for it.
+fn member_views(reports: &[AeronSubscription], stream: &ReportStream) -> Vec<MemberView> {
+    reports
+        .iter()
+        .enumerate()
+        .map(|(member, subscription)| {
+            let mut position = None;
+            subscription.for_each_image(|image| {
+                let read = image.position();
+                position = Some(position.map_or(read, |best: i64| best.max(read)));
+                stream.advance_to(read);
+            });
+            MemberView { member, connected: position.is_some(), position }
+        })
+        .collect()
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_millis() as u64)
+}
+
 fn on_error(code: i32, message: &str) {
     error!("Aeron: Error {}: {}", code, message);
 }
@@ -308,13 +374,14 @@ pub fn spawn_cluster_gateway(
     config: ClusterConfig,
     stream: Arc<ReportStream>,
     link: Arc<EngineLink>,
+    watch: Arc<ClusterWatch>,
 ) -> Result<OrderSender, String> {
     let (orders, incoming) = mpsc::channel::<OutboundOrder>(ORDER_QUEUE_LENGTH);
     let (started, startup) = std_mpsc::channel();
 
     thread::Builder::new()
         .name("cluster-gateway".to_string())
-        .spawn(move || run(config, stream, link, incoming, started))
+        .spawn(move || run(config, stream, link, watch, incoming, started))
         .map_err(|err| err.to_string())?;
 
     startup.recv().map_err(|err| err.to_string())??;
@@ -325,6 +392,7 @@ fn run(
     config: ClusterConfig,
     stream: Arc<ReportStream>,
     link: Arc<EngineLink>,
+    watch: Arc<ClusterWatch>,
     mut incoming: mpsc::Receiver<OutboundOrder>,
     started: std_mpsc::Sender<Result<(), String>>,
 ) {
@@ -364,6 +432,7 @@ fn run(
     let mut leader_changes = client.leader_changes();
     let mut last_sweep = Instant::now();
     let mut last_position = Instant::now();
+    let mut last_leader_change_ms = None;
 
     loop {
         let mut idle = true;
@@ -381,15 +450,19 @@ fn run(
 
         if last_position.elapsed() >= POSITION_INTERVAL {
             last_position = Instant::now();
-            let mut images = 0;
-            for subscription in &reports {
-                subscription.for_each_image(|image| {
-                    images += 1;
-                    stream.advance_to(image.position());
-                });
-            }
+            let members = member_views(&reports, &stream);
             // An order needs a way in and a way to hear the answer.
-            link.set(client.is_leader_connected() && images > 0);
+            let heard = members.iter().any(|member| member.connected);
+            link.set(client.is_leader_connected() && heard);
+            watch.publish(ClusterView {
+                term: client.leadership_term(),
+                leader: client.leader(),
+                leader_connected: client.is_leader_connected(),
+                leader_changes: client.leader_changes(),
+                last_leader_change_ms,
+                last_exec_id: tracker.last_exec_id,
+                members,
+            });
         }
 
         client.poll_egress();
@@ -397,6 +470,7 @@ fn run(
 
         if client.leader_changes() != leader_changes {
             leader_changes = client.leader_changes();
+            last_leader_change_ms = Some(unix_ms());
             tracker.on_leader_change();
             warn!("Cluster: Leader changed to {:?}, holding orders", client.leader());
         }
