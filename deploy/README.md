@@ -10,8 +10,13 @@ Linux x86 is the first-party target, and images are also built for arm64.
 | `scripts/validate.sh` | Static checks, with no cluster or containers |
 | `scripts/local-images.sh` | Image builds with Apple `container` |
 
-**None of this has been run yet.** The manifests, chart and scripts pass static checks only. No image
-has been built, and nothing has been installed on a cluster. See [First real run](#first-real-run).
+**Most of this hasn't been run yet.** One part has: on a one-node `container cluster`, the `mmx` image
+was built with `local-images.sh` and the chart installed. The console ran there with its real
+ServiceAccount, and a saved market reached two stand-in gateway pods in about 70 seconds. Those pods
+read the real mounted ConfigMap, but they weren't real gateways. RBAC, seeding, and keeping edits across
+`helm upgrade`, uninstall and reinstall were checked on that API server. Every other image, the rest of
+the chart, OIDC against a real provider and NetworkPolicy enforcement have only had static checks.
+See [First real run](#first-real-run).
 
 ## Images
 

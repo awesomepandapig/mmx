@@ -610,7 +610,8 @@ export function Markets() {
 
   function finish(notice: Outcome) {
     setDialog(null);
-    setOutcome(notice);
+    // A save on its way has its own banner, which keeps counting until it lands.
+    setOutcome(notice.title.endsWith("reaching gateways") ? null : notice);
     void markets.refresh();
   }
 

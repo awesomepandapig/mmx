@@ -238,6 +238,10 @@ target/release/mmx webhook listen --port 8095 --secret local-development-secret 
    tools/demo/mmx_client.py --symbol IRON trade
    ```
 
+This flow was checked in a real browser against a three-node cluster, but with `mmx serve`, a gateway
+and an outbox attached beside a stack that was already running. `sbx.py` starts the same `mmx serve`, and
+that entry was booted alone, but a whole `up --cluster` with it hasn't been run yet.
+
 `MMX_ADMIN_TOKEN` is `dev` here unless you set another. Console edits go to `.run/mmx`, so they don't
 touch `tools/local`, which only provides the first copy. `rm -rf .run/mmx` starts the console from
 scratch, including its password. `tools/scripts/sbx.py restart outbox` applies a saved webhook.

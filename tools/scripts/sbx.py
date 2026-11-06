@@ -101,7 +101,8 @@ MMX_STATE = RUN / "mmx"
 SAMPLE_MARKETS = ROOT / "tools" / "local" / "markets.yaml"
 MARKETS_FILE = MMX_STATE / "markets.yaml"
 MMX_ENV_FILE = MMX_STATE / "outbox.env"
-MMX_PORT = 8093
+MMX_BIND = os.environ.get("MMX_BIND", "127.0.0.1:8093")
+MMX_PORT = int(MMX_BIND.rsplit(":")[-1])
 # Local only. The gateway and `mmx serve` must agree on it.
 ADMIN_TOKEN = os.environ.get("MMX_ADMIN_TOKEN", "dev")
 
@@ -160,7 +161,7 @@ def cluster_services():
             "MMX_ADMIN_TOKEN": ADMIN_TOKEN, "MARKETS_FILE": str(MARKETS_FILE),
             "MMX_STATE_DIR": str(MMX_STATE), "QUESTDB_URL": f"http://{questdb}",
             "VALKEY_URL": "redis://localhost:6379", "MMX_GATEWAY_URLS": "http://localhost:8000",
-            "MMX_BIND": os.environ.get("MMX_BIND", f"127.0.0.1:{MMX_PORT}"),
+            "MMX_BIND": MMX_BIND,
             "MMX_OUTBOX_URL": f"http://{read_env_file(OUTBOX_ENV_FILE)['OUTBOX_HTTP']}",
             "MMX_OUTBOX_RESTART": "tools/scripts/sbx.py restart outbox"}, "Admin API listening"),
     ]

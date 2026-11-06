@@ -3,6 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import { Button, Card, Notice, PageHeader, Status, TableFrame, cn } from "../components/ui";
 import type { State } from "../components/ui";
 import { BASE, api, messageOf } from "../lib/api";
+import { useSession } from "../lib/session";
 import type { OrderRow, TradeRow, WebhookPosition } from "../lib/api";
 
 const KEEP = 500;
@@ -185,6 +186,7 @@ function Webhooks({ position }: { position: WebhookPosition | null }) {
 }
 
 export function Activity() {
+  const { load } = useSession();
   const [params, setParams] = useSearchParams();
   const symbol = params.get("symbol") ?? "";
   const [tab, setTab] = useState<Tab>("orders");
@@ -209,7 +211,11 @@ export function Activity() {
 
     const stream = new EventSource(`${BASE}/events`);
     stream.onopen = () => setLink("live");
-    stream.onerror = () => setLink("lost");
+    // A stream can't show a 401, so this finds out whether the session is what ended.
+    stream.onerror = () => {
+      setLink("lost");
+      void load();
+    };
     const on = <T,>(kind: string, handle: (data: T) => void) =>
       stream.addEventListener(kind, (event) => handle(JSON.parse(event.data) as T));
 
@@ -227,7 +233,7 @@ export function Activity() {
       setSources(({ [source]: _gone, ...rest }) => rest),
     );
     return () => stream.close();
-  }, []);
+  }, [load]);
 
   const symbols = useMemo(
     () => [...new Set([...orders, ...trades].map((row) => row.symbol))].sort(),
