@@ -1,7 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as RadixSwitch from "@radix-ui/react-switch";
 import clsx from "clsx";
-import { useId, useState } from "react";
+import { forwardRef, useId, useState } from "react";
 import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
@@ -37,13 +37,12 @@ export const buttonClass = (tone: Tone = "plain") =>
     tones[tone],
   );
 
-export function Button({
-  tone = "plain",
-  className,
-  ...props
-}: ButtonHTMLAttributes<HTMLButtonElement> & { tone?: Tone }) {
-  return <button type="button" {...props} className={cn(buttonClass(tone), className)} />;
-}
+export const Button = forwardRef<
+  HTMLButtonElement,
+  ButtonHTMLAttributes<HTMLButtonElement> & { tone?: Tone }
+>(function Button({ tone = "plain", className, ...props }, ref) {
+  return <button ref={ref} type="button" {...props} className={cn(buttonClass(tone), className)} />;
+});
 
 /** A panel with a border, for forms. Dashboards use `Panel` inside a `Tiles`. */
 export function Card({ className, children }: { className?: string; children: ReactNode }) {
@@ -157,9 +156,9 @@ export function Metric({
   return (
     <div className={cn("min-w-0 bg-surface px-3 py-2", className)}>
       <p className="label truncate">{label}</p>
-      <p className={cn("tabular truncate text-[20px] font-medium leading-7", wordTone[tone])}>
+      <div className={cn("tabular truncate text-[20px] font-medium leading-7", wordTone[tone])}>
         {value ?? <Skeleton className="my-1 h-5 w-16" />}
-      </p>
+      </div>
       <p className="tabular truncate text-[12px] leading-4 text-muted">{note ?? " "}</p>
     </div>
   );

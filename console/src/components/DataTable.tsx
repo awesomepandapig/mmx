@@ -1,3 +1,5 @@
+/* eslint-disable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/no-noninteractive-tabindex --
+   A header cell is a drop target, and a focusable separator is how ARIA spells a resize handle. */
 import * as Popover from "@radix-ui/react-popover";
 import {
   flexRender,
@@ -317,7 +319,6 @@ export function DataTable<T>({
                       {flexRender(header.column.columnDef.header, header.getContext())}
                       {sort && <span aria-hidden>{sort === "asc" ? "↑" : "↓"}</span>}
                     </button>
-                    {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
                     <div
                       role="separator"
                       aria-orientation="vertical"
