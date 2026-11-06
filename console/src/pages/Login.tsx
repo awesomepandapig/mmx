@@ -12,7 +12,7 @@ export function AuthPage({ children }: { children: ReactNode }) {
     <main className="flex min-h-dvh items-center justify-center p-4">
       <div className="w-full max-w-sm">
         <Wordmark className="mb-5 block text-center" />
-        <Card className="p-6">{children}</Card>
+        <Card className="p-4">{children}</Card>
       </div>
     </main>
   );
@@ -83,7 +83,7 @@ export function Login() {
 
   return (
     <AuthPage>
-      <h1 className="font-display text-[22px] font-medium tracking-heading">Sign in</h1>
+      <h1 className="text-[15px] font-semibold">Sign in</h1>
       <div className="mt-4 space-y-3">
         {failure && <Notice state="bad">{failure}</Notice>}
         {session.oidc && (

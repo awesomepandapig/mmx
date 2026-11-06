@@ -1,29 +1,22 @@
-import { useEffect, useRef, useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Navigate, useNavigate, useSearchParams } from "react-router-dom";
+import type { ColumnDef, SortingState } from "@tanstack/react-table";
+import { Confirm } from "../components/Confirm";
+import { DataTable } from "../components/DataTable";
+import { lastMarket } from "../components/MarketPicker";
+import { MarketsNav } from "../components/MarketsNav";
 import { MarketDialogs, OutcomeNotice, editOutcome } from "../components/marketActions";
 import type { MarketDialog, Outcome } from "../components/marketActions";
-import { Confirm } from "../components/Confirm";
 import {
   Button,
-  Card,
-  EmptyState,
   ErrorState,
   Notice,
-  Page,
-  PageHeader,
   Pager,
   SearchField,
   Segmented,
   SkeletonRows,
-  SortHeader,
-  Status,
-  TableFrame,
-  Tag,
-  cn,
-  tdClass,
-  thClass,
+  Word,
 } from "../components/ui";
-import type { State } from "../components/ui";
 import { ApiError, api, messageOf, queryString } from "../lib/api";
 import type {
   Delivery,
@@ -35,105 +28,65 @@ import type {
   Problem,
   Validation,
 } from "../lib/api";
+import { tradingState, useExchange } from "../lib/exchange";
+import { ago, count, utc } from "../lib/format";
 import { useDebounced, usePolled, useTitle } from "../lib/hooks";
 import { useCan } from "../lib/session";
 
-export function marketState(market: Market): { state: State; text: string } {
-  if (market.halted) return { state: "bad", text: "Halted" };
-  if (!market.enabled) return { state: "idle", text: "Disabled" };
-  return { state: "good", text: "Open" };
+/** `/markets` is a market, the last one looked at, or the busiest if there isn't one. */
+export function MarketsHome() {
+  const [params] = useSearchParams();
+  const pick = params.get("pick") ? "?pick=1" : "";
+  const last = lastMarket();
+  const busiest = usePolled(
+    () => api.get<MarketList>("/markets?limit=1&sort=volume&dir=desc"),
+    60000,
+    last ?? "",
+  );
+  useTitle("Markets");
+  if (last) return <Navigate to={`/markets/${last}${pick}`} replace />;
+  const first = busiest.data?.markets[0];
+  if (first) return <Navigate to={`/markets/${first.symbol}${pick}`} replace />;
+  if (busiest.error) {
+    return (
+      <ErrorState
+        title="Can't read markets"
+        detail={busiest.error}
+        onRetry={() => void busiest.refresh()}
+      />
+    );
+  }
+  if (busiest.data) return <Navigate to="/all-markets" replace />;
+  return <SkeletonRows rows={8} />;
 }
 
 function DeliveryNotice({ delivery, onReload }: { delivery: Delivery; onReload?: () => void }) {
   if (delivery.state === "in_sync") return null;
   const reload = onReload && <Button onClick={onReload}>Reload gateways</Button>;
+  const edge = "border-x-0 border-t-0";
   if (delivery.state === "reaching_gateways") {
     return (
-      <Notice title="Saved, reaching gateways" action={reload}>
+      <Notice title="Saved, reaching gateways" action={reload} className={edge}>
         {delivery.waited_secs ?? 0}s of about {delivery.expected_secs ?? 90}s.
       </Notice>
     );
   }
   if (delivery.state === "stalled") {
     return (
-      <Notice state="bad" title="Gateways haven't taken this file" action={reload}>
+      <Notice state="bad" title="Gateways haven't taken this file" action={reload} className={edge}>
         {delivery.waited_secs ?? 0}s. Behind: {delivery.behind.join(", ")}
       </Notice>
     );
   }
   return (
-    <Notice state="warn" title="Gateways differ from the saved file" action={reload}>
+    <Notice
+      state="warn"
+      title="Gateways differ from the saved file"
+      action={reload}
+      className={edge}
+    >
       Behind: {delivery.behind.join(", ")}
     </Notice>
-  );
-}
-
-function MarketRow({
-  market,
-  canAct,
-  onDialog,
-}: {
-  market: Market;
-  canAct: boolean;
-  onDialog: (dialog: MarketDialog) => void;
-}) {
-  const navigate = useNavigate();
-  const { state, text } = marketState(market);
-  const held = market.gateways.filter((gateway) => gateway.in_sync).length;
-  const unreachable = market.gateways.filter((gateway) => !gateway.reachable).length;
-  const halting = market.gateways.filter((gateway) => gateway.market?.halted).length;
-  const partlyHalted = market.halted && halting < market.gateways.length;
-  return (
-    <tr
-      className="cursor-pointer border-t border-hairline hover:bg-raised"
-      onClick={() => navigate(`/markets/${market.symbol}`)}
-    >
-      <td className={tdClass}>
-        <Link
-          to={`/markets/${market.symbol}`}
-          onClick={(event) => event.stopPropagation()}
-          className="font-code font-medium hover:text-accent"
-        >
-          {market.symbol}
-        </Link>
-        {!market.in_file && <Tag className="ml-2">Not in file</Tag>}
-      </td>
-      <td className={tdClass}>
-        <Status state={state}>{text}</Status>
-        {partlyHalted && (
-          <span className="ml-2 text-xs text-warn">
-            {halting} of {market.gateways.length}
-          </span>
-        )}
-      </td>
-      <td className={`${tdClass} tabular font-code text-[12.5px]`}>{market.tick_size}</td>
-      <td className={`${tdClass} tabular font-code text-[12.5px] text-muted`}>
-        {market.min_size ?? "-"}
-      </td>
-      <td className={`${tdClass} tabular font-code text-[12.5px] text-muted`}>
-        {market.max_size ?? "-"}
-      </td>
-      <td className={`${tdClass} tabular text-[13px]`}>
-        <span className={held < market.gateways.length ? "text-warn" : "text-muted"}>
-          {held} of {market.gateways.length} in sync
-        </span>
-        {unreachable > 0 && <span className="ml-2 text-bad">{unreachable} unreachable</span>}
-      </td>
-      <td className={`${tdClass} text-right`}>
-        {canAct && (
-          <Button
-            className="h-8 px-2.5 text-[13px]"
-            disabled={!market.enabled && !market.halted}
-            onClick={(event) => {
-              event.stopPropagation();
-              onDialog({ kind: market.halted ? "resume" : "halt", market });
-            }}
-          >
-            {market.halted ? "Resume" : "Halt"}
-          </Button>
-        )}
-      </td>
-    </tr>
   );
 }
 
@@ -151,27 +104,31 @@ function filters(counts?: MarketCounts): { value: Filter; label: string }[] {
   ];
 }
 
-function List({
-  canAct,
-  onDialog,
-  outcome,
-  onOutcome,
-  onEditor,
-  stamp,
-}: {
-  canAct: boolean;
-  onDialog: (dialog: MarketDialog) => void;
-  outcome: Outcome | null;
-  onOutcome: (outcome: Outcome | null) => void;
-  onEditor: () => void;
-  stamp: number;
-}) {
+const SERVER_SORTS = new Set([
+  "symbol",
+  "state",
+  "last",
+  "volume",
+  "trades",
+  "spread",
+  "open_orders",
+  "last_trade",
+]);
+
+export function AllMarkets() {
+  useTitle("All markets");
+  const canAct = useCan("operator");
+  const navigate = useNavigate();
+  const { canTrade, status } = useExchange();
   const [params, setParams] = useSearchParams();
+  const [dialog, setDialog] = useState<MarketDialog>(null);
+  const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [stamp, setStamp] = useState(0);
   const [text, setText] = useState(params.get("q") ?? "");
   const q = useDebounced(text.trim(), 200);
   const state = (params.get("state") ?? "all") as Filter;
-  const sort = params.get("sort") === "state" ? "state" : "symbol";
-  const dir = params.get("dir") === "desc" ? "desc" : "asc";
+  const sort = params.get("sort") ?? "volume";
+  const dir = params.get("dir") === "asc" ? "asc" : "desc";
   const limit = Number(params.get("limit")) || 50;
   const offset = Number(params.get("offset")) || 0;
 
@@ -198,136 +155,240 @@ function List({
     offset,
   });
   const markets = usePolled(() => api.get<MarketList>(`/markets${query}`), 3000, query + stamp);
-  const toggle = (name: "symbol" | "state") =>
-    change({ sort: name, dir: sort === name && dir === "asc" ? "desc" : "asc" });
+  const data = markets.data;
+  const known = !!status;
 
   async function reload() {
     try {
-      onOutcome(editOutcome(await api.post<EditResult>("/markets/reload")));
+      setOutcome(editOutcome(await api.post<EditResult>("/markets/reload")));
     } catch (error) {
-      onOutcome({ state: "bad", title: "Reload failed", body: messageOf(error) });
+      setOutcome({ state: "bad", title: "Reload failed", body: messageOf(error) });
     }
     void markets.refresh();
   }
 
+  const sorting: SortingState = [{ id: sort, desc: dir === "desc" }];
+
+  const columns = useMemo(() => {
+    const number = (
+      id: string,
+      header: string,
+      size: number,
+      value: (market: Market) => string | number | undefined,
+      sortable = true,
+    ): ColumnDef<Market, never> => ({
+      id,
+      header,
+      size,
+      enableSorting: sortable,
+      accessorFn: (market) => (value(market) ?? "") as never,
+      cell: ({ getValue }) => {
+        const shown = getValue() as string | number;
+        return shown === "" ? <span className="text-faint">-</span> : shown;
+      },
+      meta: { mono: true, align: "right" },
+    });
+    const list: ColumnDef<Market, never>[] = [
+      {
+        id: "symbol",
+        header: "Market",
+        size: 96,
+        accessorFn: (market) => market.symbol as never,
+        cell: ({ row }) => <span className="font-medium text-accent">{row.original.symbol}</span>,
+        meta: { mono: true, required: true },
+      },
+      {
+        id: "state",
+        header: "State",
+        size: 130,
+        accessorFn: (market) => tradingState(market, canTrade, known).word as never,
+        cell: ({ row }) => {
+          const { word, tone } = tradingState(row.original, canTrade, known);
+          return <Word tone={tone === "plain" ? "muted" : tone}>{word}</Word>;
+        },
+      },
+      number("last", "Last", 110, (market) => market.last),
+      number("spread", "Spread", 90, (market) => market.spread),
+      number("volume", "24h volume", 120, (market) => market.volume_24h),
+      number("trades", "24h trades", 96, (market) =>
+        market.trades_24h === undefined ? undefined : count(market.trades_24h),
+      ),
+      number("open_orders", "Open orders", 96, (market) =>
+        market.open_orders === undefined ? undefined : count(market.open_orders),
+      ),
+      {
+        id: "last_trade",
+        header: "Last trade (UTC)",
+        size: 186,
+        accessorFn: (market) => (market.last_time ? utc(market.last_time) : "") as never,
+        meta: { mono: true },
+      },
+      {
+        id: "age",
+        header: "Traded",
+        size: 90,
+        enableSorting: false,
+        accessorFn: (market) => (market.last_time ? ago(market.last_time) : "") as never,
+        meta: { align: "right", hidden: true },
+      },
+      number("tick", "Tick", 84, (market) => market.tick_size, false),
+      number("min", "Min size", 90, (market) => market.min_size, false),
+      number("max", "Max size", 100, (market) => market.max_size, false),
+      {
+        id: "gateways",
+        header: "Gateways",
+        size: 120,
+        enableSorting: false,
+        accessorFn: (market) =>
+          `${market.gateways.filter((gateway) => gateway.in_sync).length} of ${market.gateways.length}` as never,
+        cell: ({ row }) => {
+          const { gateways } = row.original;
+          const held = gateways.filter((gateway) => gateway.in_sync).length;
+          return held === gateways.length ? (
+            <span className="text-muted">
+              {held} of {gateways.length} agree
+            </span>
+          ) : (
+            <Word tone="warn">
+              {held} of {gateways.length} agree
+            </Word>
+          );
+        },
+      },
+      {
+        id: "file",
+        header: "In file",
+        size: 70,
+        enableSorting: false,
+        accessorFn: (market) => (market.in_file ? "" : "Not in file") as never,
+        cell: ({ getValue }) => <Word tone="warn">{getValue() as string}</Word>,
+        meta: { hidden: true },
+      },
+      {
+        id: "actions",
+        header: "",
+        size: 76,
+        enableSorting: false,
+        enableResizing: false,
+        meta: { label: "Halt or resume" },
+        cell: ({ row }) =>
+          !canAct || (!row.original.enabled && !row.original.halted) ? null : (
+            <Button
+              tone={row.original.halted ? "plain" : "caution"}
+              className="h-[22px] px-1.5 text-[12px]"
+              onClick={(event) => {
+                event.stopPropagation();
+                setDialog({ kind: row.original.halted ? "resume" : "halt", market: row.original });
+              }}
+            >
+              {row.original.halted ? "Resume" : "Halt"}
+            </Button>
+          ),
+      },
+    ];
+    return list;
+  }, [canAct, canTrade, known]);
+
   const broken = markets.failure instanceof ApiError && markets.failure.code === "markets_file";
-  const data = markets.data;
-  const searching = !!q || state !== "all";
 
   return (
-    <>
-      <div className="mb-2 space-y-2 empty:hidden">
-        {outcome && <OutcomeNotice outcome={outcome} onClose={() => onOutcome(null)} />}
-        {data && (
-          <DeliveryNotice
-            delivery={data.delivery}
-            onReload={canAct ? () => void reload() : undefined}
-          />
-        )}
-      </div>
-      <Card className="overflow-hidden">
-        <div className="flex flex-wrap items-center gap-2 p-3">
-          <SearchField
-            label="Search markets"
-            className="w-full sm:w-72"
-            placeholder="Search by symbol"
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-          />
-          <Segmented
-            label="State"
-            className="max-w-full overflow-x-auto"
-            value={state}
-            options={filters(data?.counts)}
-            onChange={(value) => change({ state: value })}
-          />
+    <div className="flex min-h-[480px] flex-1 flex-col lg:min-h-0">
+      <MarketsNav />
+      {data && (
+        <DeliveryNotice
+          delivery={data.delivery}
+          onReload={canAct ? () => void reload() : undefined}
+        />
+      )}
+      {outcome && (
+        <div className="flex-none">
+          <OutcomeNotice outcome={outcome} onClose={() => setOutcome(null)} />
         </div>
-        {markets.error && !data ? (
-          <ErrorState
-            title={broken ? "The markets file doesn't parse" : "Can't read markets"}
-            detail={markets.error}
-            onRetry={broken ? undefined : () => void markets.refresh()}
-          />
-        ) : !data ? (
-          <SkeletonRows rows={8} />
-        ) : data.markets.length === 0 ? (
-          searching ? (
-            <EmptyState title="No markets match">
-              {q ? `Nothing with "${q}" in this view.` : undefined}
-            </EmptyState>
-          ) : (
-            <EmptyState
-              title="No markets"
-              action={
-                canAct ? (
-                  <Button tone="primary" onClick={() => onDialog({ kind: "new" })}>
-                    New market
-                  </Button>
-                ) : undefined
-              }
-            />
-          )
-        ) : (
+      )}
+      {broken && (
+        <Notice
+          state="bad"
+          title="The markets file doesn't parse"
+          className="border-x-0 border-t-0"
+        >
+          {markets.error}
+        </Notice>
+      )}
+      <DataTable
+        id="all-markets"
+        className="min-h-[360px] flex-1"
+        columns={columns}
+        data={data?.markets ?? []}
+        rowId={(market) => market.symbol}
+        onRowClick={(market) => navigate(`/markets/${market.symbol}`)}
+        loading={!data && !markets.error}
+        error={markets.error}
+        onRetry={() => void markets.refresh()}
+        sorting={sorting}
+        onSorting={(updater) => {
+          const next = typeof updater === "function" ? updater(sorting) : updater;
+          const first = next[0];
+          if (first && SERVER_SORTS.has(first.id)) {
+            change({ sort: first.id, dir: first.desc ? "desc" : "asc" });
+          }
+        }}
+        empty={q || state !== "all" ? "No markets match" : "No markets"}
+        title={
           <>
-            {markets.error && (
-              <p className="border-t border-line px-4 py-1.5 text-[13px] text-bad">
-                {broken ? (
-                  <button type="button" className="underline" onClick={onEditor}>
-                    {markets.error}
-                  </button>
-                ) : (
-                  markets.error
-                )}
-              </p>
-            )}
-            <TableFrame>
-              <table className="w-full min-w-[820px] text-left text-sm">
-                <thead>
-                  <tr className="border-t border-line">
-                    <SortHeader
-                      label="Market"
-                      active={sort === "symbol"}
-                      dir={dir}
-                      onClick={() => toggle("symbol")}
-                    />
-                    <SortHeader
-                      label="State"
-                      active={sort === "state"}
-                      dir={dir}
-                      onClick={() => toggle("state")}
-                    />
-                    <th className={thClass}>Tick</th>
-                    <th className={thClass}>Min</th>
-                    <th className={thClass}>Max</th>
-                    <th className={thClass}>Gateways</th>
-                    <th className={thClass}>
-                      <span className="sr-only">Actions</span>
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.markets.map((market) => (
-                    <MarketRow
-                      key={market.symbol}
-                      market={market}
-                      canAct={canAct}
-                      onDialog={onDialog}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            </TableFrame>
-            <Pager
-              offset={offset}
-              limit={limit}
-              total={data.total}
-              onOffset={(next) => change({ offset: next }, false)}
-              onLimit={(next) => change({ limit: next === 50 ? 0 : next })}
+            Markets{" "}
+            <span className="tabular font-normal text-faint">
+              ({(data?.total ?? 0).toLocaleString()})
+            </span>
+          </>
+        }
+        toolbar={
+          <>
+            <SearchField
+              label="Search markets"
+              className="w-44"
+              placeholder="Find market"
+              value={text}
+              onChange={(event) => setText(event.target.value)}
+            />
+            <Segmented
+              label="State"
+              className="max-w-full overflow-x-auto"
+              value={state}
+              options={filters(data?.counts)}
+              onChange={(value) => change({ state: value })}
             />
           </>
-        )}
-      </Card>
-    </>
+        }
+        footer={
+          <>
+            {data && (
+              <Pager
+                offset={offset}
+                limit={limit}
+                total={data.total}
+                onOffset={(next) => change({ offset: next }, false)}
+                onLimit={(next) => change({ limit: next === 50 ? 0 : next })}
+              />
+            )}
+            {canAct && (
+              <Button tone="primary" onClick={() => setDialog({ kind: "new" })}>
+                New market
+              </Button>
+            )}
+          </>
+        }
+      />
+      <MarketDialogs
+        dialog={dialog}
+        onClose={() => setDialog(null)}
+        onDone={(notice) => {
+          setDialog(null);
+          // A save on its way has its own banner, which keeps counting until it lands.
+          setOutcome(notice.title.endsWith("reaching gateways") ? null : notice);
+          setStamp(stamp + 1);
+        }}
+      />
+    </div>
   );
 }
 
@@ -480,12 +541,12 @@ function YamlEditor({
   const numbers = Array.from({ length: lines }, (_, index) => index + 1).join("\n");
 
   return (
-    <div className="space-y-2 p-3">
-      <div className="flex h-[min(60dvh,560px)] overflow-hidden rounded-xl border border-line bg-deep font-code text-[13px] leading-6 focus-within:border-accent">
+    <div className="flex min-h-0 flex-1 flex-col gap-2 p-2">
+      <div className="flex min-h-[320px] flex-1 overflow-hidden border border-line bg-deep font-code text-[12px] leading-5 focus-within:border-accent">
         <pre
           ref={gutter}
           aria-hidden
-          className="w-14 shrink-0 select-none overflow-hidden border-r border-hairline py-3 pr-2 text-right text-faint"
+          className="w-12 shrink-0 select-none overflow-hidden border-r border-hairline py-2 pr-2 text-right text-faint"
         >
           {numbers}
         </pre>
@@ -499,7 +560,7 @@ function YamlEditor({
           onScroll={(event) => {
             if (gutter.current) gutter.current.scrollTop = event.currentTarget.scrollTop;
           }}
-          className="h-full min-w-0 flex-1 resize-none overflow-auto bg-transparent px-3 py-3 focus:outline-none"
+          className="h-full min-w-0 flex-1 resize-none overflow-auto bg-transparent px-2 py-2 focus:outline-none"
         />
       </div>
 
@@ -520,7 +581,7 @@ function YamlEditor({
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="min-w-0 break-all text-[13px] text-faint">{file.location}</p>
+        <p className="min-w-0 break-all font-code text-[12px] text-faint">{file.location}</p>
         {!readOnly && (
           <div className="flex gap-2">
             <Button disabled={!dirty} onClick={() => setText(file.yaml)}>
@@ -544,71 +605,17 @@ function YamlEditor({
   );
 }
 
-export function Markets() {
-  useTitle("Markets");
+export function MarketsFilePage() {
+  useTitle("Markets file");
   const canAct = useCan("operator");
-  const [params, setParams] = useSearchParams();
-  const view = params.get("view") === "file" ? "file" : "list";
-  const [dialog, setDialog] = useState<MarketDialog>(null);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
-  const [stamp, setStamp] = useState(0);
-
-  function finish(notice: Outcome) {
-    setDialog(null);
-    // A save on its way has its own banner, which keeps counting until it lands.
-    setOutcome(notice.title.endsWith("reaching gateways") ? null : notice);
-    setStamp(stamp + 1);
-  }
-
-  function show(next: "list" | "file") {
-    setParams(next === "file" ? { view: "file" } : {}, { replace: true });
-  }
-
   return (
-    <Page>
-      <PageHeader
-        title="Markets"
-        actions={
-          <>
-            <Segmented
-              label="View"
-              value={view}
-              options={[
-                { value: "list", label: "List" },
-                { value: "file", label: "File" },
-              ]}
-              onChange={show}
-            />
-            {canAct && (
-              <Button tone="primary" onClick={() => setDialog({ kind: "new" })}>
-                New market
-              </Button>
-            )}
-          </>
-        }
-      />
-      {view === "list" ? (
-        <List
-          canAct={canAct}
-          onDialog={setDialog}
-          outcome={outcome}
-          onOutcome={setOutcome}
-          onEditor={() => show("file")}
-          stamp={stamp}
-        />
-      ) : (
-        <>
-          {outcome && (
-            <div className={cn("mb-2")}>
-              <OutcomeNotice outcome={outcome} onClose={() => setOutcome(null)} />
-            </div>
-          )}
-          <Card>
-            <YamlEditor readOnly={!canAct} onSaved={finish} />
-          </Card>
-        </>
-      )}
-      <MarketDialogs dialog={dialog} onClose={() => setDialog(null)} onDone={finish} />
-    </Page>
+    <div className="flex min-h-[480px] flex-1 flex-col lg:min-h-0">
+      <MarketsNav />
+      {outcome && <OutcomeNotice outcome={outcome} onClose={() => setOutcome(null)} />}
+      <div className="flex min-h-0 flex-1 flex-col bg-surface">
+        <YamlEditor readOnly={!canAct} onSaved={setOutcome} />
+      </div>
+    </div>
   );
 }

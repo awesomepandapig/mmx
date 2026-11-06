@@ -10,9 +10,10 @@ import { Layout } from "./components/Layout";
 import { ErrorState } from "./components/ui";
 import { SessionProvider, useSession } from "./lib/session";
 import { Activity } from "./pages/Activity";
+import { Cluster } from "./pages/Cluster";
 import { Login } from "./pages/Login";
 import { MarketPage } from "./pages/Market";
-import { Markets } from "./pages/Markets";
+import { AllMarkets, MarketsFilePage, MarketsHome } from "./pages/Markets";
 import { NotFound } from "./pages/NotFound";
 import { Overview } from "./pages/Overview";
 import { Settings } from "./pages/Settings";
@@ -56,7 +57,10 @@ createRoot(root).render(
           <Route element={<Guard />}>
             <Route element={<Layout />}>
               <Route index element={<Overview />} />
-              <Route path="markets" element={<Markets />} />
+              <Route path="cluster" element={<Cluster />} />
+              <Route path="markets" element={<MarketsHome />} />
+              <Route path="all-markets" element={<AllMarkets />} />
+              <Route path="markets-file" element={<MarketsFilePage />} />
               <Route path="markets/:symbol" element={<MarketPage />} />
               <Route path="activity" element={<Activity />} />
               <Route path="webhooks" element={<Webhooks />} />

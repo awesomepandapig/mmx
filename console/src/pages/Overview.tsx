@@ -1,233 +1,372 @@
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { LineChart } from "../components/Sparkline";
-import {
-  Card,
-  EmptyState,
-  ErrorState,
-  Notice,
-  Page,
-  PageHeader,
-  SectionTitle,
-  Skeleton,
-  SkeletonRows,
-  Status,
-  TableFrame,
-  tdClass,
-  thClass,
-} from "../components/ui";
-import type { State } from "../components/ui";
+import { ConditionsTable, MembersTable, ServicesTable, verdictWords } from "../components/Health";
+import { TimeChart } from "../components/TimeChart";
+import type { Series, TimePoint } from "../components/TimeChart";
+import { Metric, Panel, Segmented, Skeleton, Tiles, Word, cn } from "../components/ui";
 import { api } from "../lib/api";
 import type {
+  ActivityLog,
   ActivitySummary,
+  LogEntry,
   MarketList,
-  ServiceStatus,
-  Status as ExchangeStatus,
+  Tally,
   WebhookPosition,
 } from "../lib/api";
-import { count } from "../lib/format";
+import { useExchange } from "../lib/exchange";
+import type { Tone } from "../lib/exchange";
+import { bytes, count, millis, rate, utc, utcClock } from "../lib/format";
 import { usePolled, useTitle } from "../lib/hooks";
 
-const verdicts: Record<ExchangeStatus["verdict"], { state: State; title: string }> = {
-  ok: { state: "good", title: "All services ready" },
-  degraded: { state: "warn", title: "Degraded: a service isn't ready" },
-  down: { state: "bad", title: "Down: no gateway can take orders" },
+type Range = "15m" | "1h" | "6h" | "24h";
+const RANGE_MS: Record<Range, number> = {
+  "15m": 900000,
+  "1h": 3600000,
+  "6h": 21600000,
+  "24h": 86400000,
 };
 
-function serviceState(service: ServiceStatus): { state: State; text: string } {
-  if (service.ready) return { state: "good", text: "Ready" };
-  if (service.reachable) return { state: "warn", text: "Not ready" };
-  return { state: service.required ? "bad" : "warn", text: "Unreachable" };
+const SERIES: Series[] = [
+  { key: "orders", label: "Orders", stroke: "stroke-s-orders", fill: "bg-s-orders fill-s-orders" },
+  { key: "trades", label: "Trades", stroke: "stroke-s-trades", fill: "bg-s-trades fill-s-trades" },
+  {
+    key: "cancels",
+    label: "Cancels",
+    stroke: "stroke-s-cancels",
+    fill: "bg-s-cancels fill-s-cancels",
+  },
+  {
+    key: "rejects",
+    label: "Rejects",
+    stroke: "stroke-s-rejects",
+    fill: "bg-s-rejects fill-s-rejects",
+  },
+];
+
+/** Quiet stretches have no rows, so they're filled in, or a line would skip over them. */
+function perSecond(summary: ActivitySummary, from: number, to: number): TimePoint[] {
+  const size = summary.bucket_secs * 1000;
+  const found = new Map(
+    summary.series.map((row) => [
+      Math.floor(new Date(row.time).getTime() / size) * size,
+      row.counts,
+    ]),
+  );
+  const points: TimePoint[] = [];
+  const empty: Partial<Tally> = {};
+  // The newest bucket is still filling, so it would always read as a fall.
+  for (let time = Math.ceil(from / size) * size; time < to - size; time += size) {
+    const counts = found.get(time) ?? empty;
+    const each = (value = 0) => value / summary.bucket_secs;
+    points.push({
+      time,
+      values: {
+        orders: each(counts.orders),
+        trades: each(counts.trades),
+        cancels: each(counts.cancels),
+        rejects: each(counts.rejects),
+      },
+    });
+  }
+  return points;
 }
 
-const webhookWords: Record<WebhookPosition["state"], { state: State; text: string }> = {
-  not_configured: { state: "idle", text: "Not configured" },
-  halted: { state: "bad", text: "Halted" },
-  verifying: { state: "warn", text: "Verifying" },
-  failing: { state: "bad", text: "Failing" },
-  delivering: { state: "warn", text: "Delivering" },
-  idle: { state: "good", text: "Caught up" },
+const webhookWords: Record<WebhookPosition["state"], { word: string; tone: Tone }> = {
+  not_configured: { word: "Not configured", tone: "warn" },
+  halted: { word: "Halted", tone: "bad" },
+  verifying: { word: "Verifying", tone: "muted" },
+  failing: { word: "Failing", tone: "bad" },
+  delivering: { word: "Delivering", tone: "muted" },
+  idle: { word: "Caught up", tone: "muted" },
 };
 
-function Tile({
-  label,
-  to,
-  value,
-  note,
-}: {
-  label: string;
-  to: string;
-  value: React.ReactNode;
-  note?: React.ReactNode;
-}) {
+const logTone: Record<LogEntry["level"], Tone> = { info: "plain", warn: "warn", bad: "bad" };
+
+function EventLog({ log }: { log: ActivityLog | null }) {
+  if (!log) return <Skeleton className="m-3 h-20" />;
+  if (log.entries.length === 0) {
+    return <p className="px-3 py-2 text-muted">Nothing since {utc(log.since)} UTC.</p>;
+  }
   return (
-    <Link
-      to={to}
-      className="block rounded-2xl border border-line bg-surface p-4 transition-colors hover:border-accent"
-    >
-      <p className="text-[13px] text-muted">{label}</p>
-      <div className="tabular mt-1 font-display text-[28px] font-medium leading-9 tracking-heading">
-        {value ?? <Skeleton className="my-1 h-7 w-16" />}
-      </div>
-      <div className="mt-0.5 h-5 text-[13px]">{note}</div>
-    </Link>
+    <ol>
+      {log.entries.map((entry, index) => (
+        <li
+          key={`${entry.time}-${index}`}
+          className="grid grid-cols-[64px_minmax(0,1fr)] gap-2 border-b border-hairline px-3 py-1"
+          title={utc(entry.time)}
+        >
+          <time className="tabular font-code text-[12px] text-faint">{utcClock(entry.time)}</time>
+          <p className="min-w-0 break-words">
+            <span className="text-muted">{entry.subject}</span>{" "}
+            <Word tone={logTone[entry.level]}>{entry.message}</Word>
+            {entry.actor && <span className="text-faint"> by {entry.actor}</span>}
+          </p>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function Busiest({ summary }: { summary: ActivitySummary | null }) {
+  if (!summary) return <Skeleton className="m-3 h-20" />;
+  const top = summary.busiest;
+  if (top.length === 0) return <p className="px-3 py-2 text-muted">No orders in this window.</p>;
+  const most = Math.max(...top.map((market) => market.counts.orders), 1);
+  return (
+    <table className="tabular w-full table-fixed text-right text-[12px]">
+      <thead className="text-[11px] text-faint">
+        <tr>
+          <th className="w-[76px] px-3 py-1 text-left font-medium">Market</th>
+          <th className="px-1 font-medium">Orders</th>
+          <th className="w-[20%] px-1 font-medium" aria-label="Share" />
+          <th className="px-1 font-medium">Trades</th>
+          <th className="px-1 font-medium">Cancels</th>
+          <th className="px-3 font-medium">Rejects</th>
+        </tr>
+      </thead>
+      <tbody>
+        {top.map(({ symbol, counts }) => (
+          <tr key={symbol} className="border-t border-hairline hover:bg-raised">
+            <td className="px-3 py-1 text-left">
+              <Link to={`/markets/${symbol}`} className="font-code font-medium text-accent">
+                {symbol}
+              </Link>
+            </td>
+            <td className="px-1">{count(counts.orders)}</td>
+            <td className="px-1">
+              <span
+                className="block h-1 bg-faint/60"
+                style={{ width: `${(counts.orders / most) * 100}%` }}
+              />
+            </td>
+            <td className="px-1">{count(counts.trades)}</td>
+            <td className="px-1">{count(counts.cancels)}</td>
+            <td className="px-3">
+              <Word tone={counts.rejects > 0 ? "bad" : "plain"}>{count(counts.rejects)}</Word>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 
 export function Overview() {
   useTitle("Overview");
-  const status = usePolled(() => api.get<ExchangeStatus>("/status"), 5000);
+  const { status, canTrade } = useExchange();
+  const [range, setRange] = useState<Range>("1h");
+  const summary = usePolled(
+    () => api.get<ActivitySummary>(`/activity/summary?range=${range}`),
+    5000,
+    range,
+  );
   const markets = usePolled(() => api.get<MarketList>("/markets?limit=1"), 5000);
   const webhooks = usePolled(() => api.get<WebhookPosition>("/webhooks"), 5000);
-  const summary = usePolled(() => api.get<ActivitySummary>("/activity/summary"), 15000);
+  const log = usePolled(() => api.get<ActivityLog>("/activity/log?limit=60"), 5000);
 
-  const verdict = status.data ? verdicts[status.data.verdict] : null;
+  const data = summary.data?.range === range ? summary.data : null;
+  const to = Date.now();
+  const from = to - RANGE_MS[range];
+  const points = useMemo(() => (data ? perSecond(data, from, to) : []), [data]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const minute = summary.data?.last_minute;
   const counts = markets.data?.counts;
+  const cluster = status?.cluster;
+  const latency = status?.latency;
+  const verdict = status ? verdictWords[status.verdict] : null;
   const delivery = webhooks.data ? webhookWords[webhooks.data.state] : null;
-  const rate = summary.data?.reports_per_minute ?? [];
-  // The newest bucket is the minute still running, so the one before it is the last whole one.
-  const lastMinute = Math.floor(Date.now() / 60000) - 1;
-  const latest = rate.find(
-    (point) => Math.floor(new Date(point.time).getTime() / 60000) === lastMinute,
-  );
+  const failing = status?.conditions ?? [];
+  const asOf = summary.data?.newest
+    ? `Newest ${utcClock(summary.data.newest)} UTC`
+    : "No orders yet";
 
   return (
-    <Page>
-      <PageHeader
-        title="Overview"
-        detail={verdict ? <Status state={verdict.state}>{verdict.title}</Status> : undefined}
-      />
-
-      {status.error && (
-        <Notice state="bad" title="Can't read status" className="mb-3">
-          {status.error}
-        </Notice>
-      )}
-
-      <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-        <Tile
-          label="Markets"
-          to="/markets"
-          value={counts ? count(counts.all) : markets.error ? "-" : null}
-          note={counts ? <span className="text-muted">{count(counts.open)} open</span> : null}
-        />
-        <Tile
-          label="Halted"
-          to="/markets?state=halted"
-          value={counts ? count(counts.halted) : markets.error ? "-" : null}
+    <div className="flex flex-1 flex-col xl:min-h-0">
+      <Tiles className="flex-none grid-cols-2 border-b border-line md:grid-cols-4 xl:grid-cols-8">
+        <Metric
+          label="Exchange"
+          value={verdict?.word}
+          tone={verdict?.tone}
           note={
-            counts && counts.out_of_sync > 0 ? (
-              <span className="text-warn">{count(counts.out_of_sync)} out of sync</span>
-            ) : null
+            status
+              ? failing.length
+                ? `${failing.length} failed ${failing.length === 1 ? "check" : "checks"}`
+                : "All checks pass"
+              : undefined
           }
         />
-        <Tile
-          label="Reports, last minute"
-          to="/activity"
-          value={summary.data ? count(latest?.reports ?? 0) : summary.error ? "-" : null}
+        <Metric
+          label="Cluster"
+          value={
+            !cluster
+              ? null
+              : cluster.mode === "cluster"
+                ? `${cluster.members_up} of ${cluster.members_total}`
+                : cluster.mode === "standalone"
+                  ? "Single"
+                  : "Unknown"
+          }
+          tone={
+            cluster && cluster.mode !== "standalone"
+              ? !cluster.quorum
+                ? "bad"
+                : cluster.members_up < cluster.members_total
+                  ? "warn"
+                  : "plain"
+              : "plain"
+          }
+          note={
+            cluster?.mode === "cluster"
+              ? `${cluster.quorum ? "Quorum" : "No quorum"}, leader ${cluster.leader ?? "none"}, term ${cluster.term}`
+              : undefined
+          }
         />
-        <Tile
+        <Metric
+          label="Orders/s, last minute"
+          value={minute ? rate(minute.orders / 60) : summary.error ? "-" : null}
+          note={minute ? `${count(minute.orders)} orders` : undefined}
+        />
+        <Metric
+          label="Trades/s"
+          value={minute ? rate(minute.trades / 60) : summary.error ? "-" : null}
+          note={minute ? `${count(minute.trades)} trades` : undefined}
+        />
+        <Metric
+          label="Cancels and rejects/min"
+          value={
+            minute
+              ? `${count(minute.cancels)} / ${count(minute.rejects)}`
+              : summary.error
+                ? "-"
+                : null
+          }
+          tone={minute && minute.rejects > 0 ? "bad" : "plain"}
+          note={
+            latency && latency.refused > 0
+              ? `${count(latency.refused)} refused by gateways`
+              : minute
+                ? "0 refused by gateways"
+                : undefined
+          }
+        />
+        <Metric
+          label="Order latency p99"
+          value={status ? (latency?.p99_ms ? millis(latency.p99_ms) : "-") : null}
+          note={
+            latency?.p50_ms
+              ? `p50 ${millis(latency.p50_ms)}, gateway to engine`
+              : "No orders in 60s"
+          }
+        />
+        <Metric
+          label="Markets open"
+          value={counts ? count(counts.open) : markets.error ? "-" : null}
+          tone={counts && counts.halted > 0 ? "warn" : "plain"}
+          note={
+            counts
+              ? `of ${count(counts.all)}, ${count(counts.halted)} halted${counts.out_of_sync ? `, ${count(counts.out_of_sync)} out of sync` : ""}`
+              : undefined
+          }
+        />
+        <Metric
           label="Webhook backlog"
-          to="/webhooks"
-          value={webhooks.data ? `${count(webhooks.data.backlog)} B` : webhooks.error ? "-" : null}
-          note={delivery ? <Status state={delivery.state}>{delivery.text}</Status> : null}
+          value={webhooks.data ? bytes(webhooks.data.backlog) : webhooks.error ? "-" : null}
+          tone={delivery?.tone === "bad" ? "bad" : "plain"}
+          note={
+            delivery && (
+              <Word tone={delivery.tone}>
+                {canTrade || delivery.tone === "bad" ? delivery.word : "Tape stopped"}
+              </Word>
+            )
+          }
         />
-      </div>
+      </Tiles>
 
-      <div className="mt-2 grid gap-2 lg:grid-cols-[2fr_1fr]">
-        <Card className="flex h-[260px] flex-col p-4">
-          <SectionTitle>Reports per minute, past hour</SectionTitle>
+      <div
+        className={cn(
+          "grid flex-1 gap-px bg-line xl:min-h-0",
+          "xl:grid-cols-[minmax(0,5fr)_minmax(0,3fr)] xl:grid-rows-[minmax(240px,1fr)_minmax(0,1fr)]",
+          "min-[1800px]:grid-cols-[minmax(0,5fr)_minmax(0,3fr)_minmax(0,3fr)]",
+        )}
+      >
+        <Panel
+          title="Throughput"
+          aside={
+            <>
+              <span className="tabular hidden sm:inline">{asOf}</span>
+              <Segmented
+                label="Range"
+                value={range}
+                onChange={setRange}
+                options={(["15m", "1h", "6h", "24h"] as Range[]).map((value) => ({
+                  value,
+                  label: value,
+                }))}
+              />
+            </>
+          }
+          className="h-[300px] xl:h-auto"
+          bodyClassName="flex flex-col"
+        >
           {summary.error && !summary.data ? (
-            <ErrorState title="Can't read the tape" detail={summary.error} />
-          ) : summary.data && rate.length === 0 ? (
-            <EmptyState title="No reports in the past hour" />
+            <p className="p-3 text-bad">{summary.error}</p>
+          ) : !data ? (
+            <Skeleton className="m-3 flex-1" />
           ) : (
-            <LineChart
-              className="mt-2 flex-1"
+            <TimeChart
+              className="flex-1"
+              series={SERIES}
+              points={points}
+              from={from}
+              to={to}
+              unit="/s"
               zero
-              ariaLabel="Reports per minute over the past hour"
-              format={(value) => count(Math.round(value))}
-              points={rate.map((point) => ({
-                label: new Date(point.time).toLocaleTimeString("en-GB", {
-                  hour: "2-digit",
-                  minute: "2-digit",
-                }),
-                value: point.reports,
-                text: `${count(point.reports)} reports`,
-              }))}
+              format={(value) =>
+                value >= 1000 ? `${value / 1000}k` : String(Number(value.toFixed(2)))
+              }
+              ariaLabel={`Orders, trades, cancels and rejects per second, past ${range}`}
             />
           )}
-        </Card>
+        </Panel>
 
-        <Card className="flex h-[260px] flex-col overflow-hidden">
-          <SectionTitle className="p-4 pb-2">Busiest markets, past hour</SectionTitle>
-          {summary.loading ? (
-            <SkeletonRows rows={4} />
-          ) : summary.error && !summary.data ? (
-            <ErrorState title="Can't read the tape" />
-          ) : summary.data?.busiest.length ? (
-            <ul className="min-h-0 flex-1 overflow-y-auto">
-              {summary.data.busiest.map((market) => (
-                <li key={market.symbol} className="border-t border-hairline">
-                  <Link
-                    to={`/markets/${market.symbol}`}
-                    className="flex items-center justify-between px-4 py-1.5 text-sm hover:bg-raised"
-                  >
-                    <span className="font-code">{market.symbol}</span>
-                    <span className="tabular text-muted">{count(market.reports)}</span>
-                  </Link>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <EmptyState title="No activity" />
-          )}
-        </Card>
-      </div>
+        <Panel
+          title="Recent events"
+          aside={log.data && <span>Since {utcClock(log.data.since)} UTC</span>}
+          className="h-[260px] xl:h-auto min-[1800px]:row-span-2"
+          bodyClassName="overflow-y-auto"
+        >
+          <EventLog log={log.data} />
+        </Panel>
 
-      <Card className="mt-2">
-        <SectionTitle className="px-4 pb-1 pt-3">Services</SectionTitle>
-        {status.loading ? (
-          <SkeletonRows rows={5} />
-        ) : !status.data ? (
-          <ErrorState title="Can't read services" onRetry={() => void status.refresh()} />
+        <Panel
+          title="Busiest markets"
+          aside={<span>Past {range}</span>}
+          className="min-[1800px]:col-start-3 min-[1800px]:row-start-1"
+          bodyClassName="overflow-y-auto"
+        >
+          <Busiest summary={data} />
+        </Panel>
+
+        <ServicesTable
+          id="overview-services"
+          status={status}
+          className="h-[320px] xl:row-start-2 xl:h-auto"
+        />
+
+        {failing.length > 0 ? (
+          <ConditionsTable
+            id="overview-conditions"
+            conditions={failing}
+            className="h-[220px] xl:h-auto min-[1800px]:col-start-3 min-[1800px]:row-start-2"
+          />
         ) : (
-          <TableFrame>
-            <table className="w-full min-w-[620px] text-left text-sm">
-              <thead>
-                <tr>
-                  <th className={thClass}>Service</th>
-                  <th className={thClass}>State</th>
-                  <th className={thClass}>Version</th>
-                  <th className={thClass}>Address</th>
-                </tr>
-              </thead>
-              <tbody>
-                {status.data?.services.map((service) => {
-                  const { state, text } = serviceState(service);
-                  return (
-                    <tr
-                      key={`${service.name}-${service.target}`}
-                      className="border-t border-hairline"
-                    >
-                      <td className={`${tdClass} font-medium`}>{service.name}</td>
-                      <td className={tdClass}>
-                        <Status state={state}>{text}</Status>
-                        {service.error && (
-                          <p className="max-w-md break-words text-xs text-muted">{service.error}</p>
-                        )}
-                      </td>
-                      <td className={`${tdClass} tabular text-muted`}>{service.version ?? "-"}</td>
-                      <td className={`${tdClass} font-code text-[12.5px] text-muted`}>
-                        {service.target}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </TableFrame>
+          <MembersTable
+            id="overview-members"
+            status={status}
+            className="h-[180px] xl:hidden min-[1800px]:col-start-3 min-[1800px]:row-start-2 min-[1800px]:block"
+          />
         )}
-      </Card>
-    </Page>
+      </div>
+    </div>
   );
 }

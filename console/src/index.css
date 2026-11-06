@@ -19,9 +19,17 @@
     --solid: 8 9 15;
     --on-solid: 255 255 255;
     --solid-hover: 36 54 240;
-    --good: 8 122 84;
     --warn: 146 96 0;
-    --bad: 196 23 128;
+    --warn-wash: 255 246 224;
+    /* Red, kept apart from the ask side's magenta, so a problem can't read as a sell. */
+    --bad: 196 28 40;
+    --bad-wash: 254 234 234;
+    --danger: 214 22 38;
+    --danger-hover: 184 14 28;
+    --s-orders: 47 68 232;
+    --s-trades: 165 106 0;
+    --s-cancels: 88 122 153;
+    --s-rejects: 217 32 48;
     --bid: 66 87 245;
     --ask: 229 53 159;
     --bid-text: 36 54 240;
@@ -45,9 +53,16 @@
     --solid: 255 255 255;
     --on-solid: 8 9 15;
     --solid-hover: 163 172 255;
-    --good: 59 227 166;
     --warn: 255 197 61;
-    --bad: 255 122 200;
+    --warn-wash: 44 34 10;
+    --bad: 255 112 118;
+    --bad-wash: 58 16 22;
+    --danger: 232 26 44;
+    --danger-hover: 255 56 72;
+    --s-orders: 133 144 247;
+    --s-trades: 201 154 46;
+    --s-cancels: 109 139 176;
+    --s-rejects: 238 85 96;
     --bid: 66 87 245;
     --ask: 229 53 159;
     --bid-text: 163 172 255;
@@ -60,11 +75,11 @@
   }
 
   body {
-    @apply min-h-dvh font-body text-[15px] leading-normal;
+    @apply min-h-dvh font-body text-[13px] leading-[18px];
   }
 
   :focus-visible {
-    @apply outline outline-2 outline-offset-2 outline-accent;
+    @apply outline outline-2 outline-offset-1 outline-accent;
   }
 
   /* Numbers line up in tables, so columns of prices can be scanned. */
@@ -85,6 +100,42 @@
   background-position: right 0.65rem center;
   background-repeat: no-repeat;
   background-size: 10px 6px;
+}
+
+/* The label over a number, in every strip and fact list. */
+.label {
+  @apply text-[11px] font-medium leading-4 text-faint;
+}
+
+/* A column's divider, which is also what you drag. */
+.resize-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: -4px;
+  width: 9px;
+  z-index: 2;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.resize-grip::after {
+  content: "";
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  left: 4px;
+  width: 1px;
+  background: rgb(var(--line));
+}
+
+.resize-grip:hover::after,
+.resize-grip[data-active="true"]::after {
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 3px;
+  background: rgb(var(--accent));
 }
 
 @keyframes skeleton {

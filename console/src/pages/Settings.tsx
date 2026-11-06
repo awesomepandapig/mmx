@@ -15,7 +15,6 @@ import {
   SectionTitle,
   Skeleton,
   Switch,
-  Tag,
   TextArea,
 } from "../components/ui";
 import { ApiError, api, messageOf } from "../lib/api";
@@ -120,7 +119,7 @@ function SignIn({
   }
 
   return (
-    <Card className="p-5">
+    <Card className="p-3">
       <SectionTitle>Sign-in</SectionTitle>
       <div className="mt-2">
         <Row title="Password login">
@@ -228,11 +227,11 @@ function SingleSignOn({ data, onSaved }: { data: SettingsData; onSaved: () => vo
   }
 
   return (
-    <Card className="p-5">
+    <Card className="p-3">
       <SectionTitle
         actions={
           managed ? (
-            <Tag>Set by the deployment</Tag>
+            <span className="text-[12px] text-muted">Set by the deployment</span>
           ) : (
             <Switch label="Single sign-on" checked={enabled} onChange={setEnabled} />
           )
@@ -359,7 +358,7 @@ export function Settings() {
   const denied = settings.failure instanceof ApiError && settings.failure.status === 403;
 
   return (
-    <Page className="max-w-[920px]">
+    <Page className="max-w-[1320px]">
       <PageHeader title="Settings" />
       {settings.error && !data && (
         <Card>
@@ -369,33 +368,35 @@ export function Settings() {
           />
         </Card>
       )}
-      {!data && !settings.error && <Skeleton className="h-64 w-full rounded-2xl" />}
+      {!data && !settings.error && <Skeleton className="h-64 w-full" />}
       {data && session && (
-        <div className="grid gap-2">
+        <div className="grid items-start gap-2 lg:grid-cols-[3fr_2fr]">
           <SingleSignOn data={data} onSaved={() => void settings.refresh()} />
-          <SignIn data={data} session={session} onSaved={() => void settings.refresh()} />
-          <Card className="p-5">
-            <SectionTitle>This install</SectionTitle>
-            <Facts
-              className="mt-3"
-              items={[
-                ["Version", data.version],
-                [
-                  "Settings",
-                  <span key="c" className="font-code text-[13px]">
-                    {data.store.config}
-                  </span>,
-                ],
-                [
-                  "Secrets",
-                  <span key="s" className="font-code text-[13px]">
-                    {data.store.secrets}
-                  </span>,
-                ],
-                ["Admin token", data.admin_token_set ? "Set" : "Not set"],
-              ]}
-            />
-          </Card>
+          <div className="grid gap-2">
+            <SignIn data={data} session={session} onSaved={() => void settings.refresh()} />
+            <Card className="p-3">
+              <SectionTitle>This install</SectionTitle>
+              <Facts
+                className="mt-2"
+                items={[
+                  ["Version", data.version],
+                  [
+                    "Settings",
+                    <span key="c" className="font-code text-[13px]">
+                      {data.store.config}
+                    </span>,
+                  ],
+                  [
+                    "Secrets",
+                    <span key="s" className="font-code text-[13px]">
+                      {data.store.secrets}
+                    </span>,
+                  ],
+                  ["Admin token", data.admin_token_set ? "Set" : "Not set"],
+                ]}
+              />
+            </Card>
+          </div>
         </div>
       )}
     </Page>

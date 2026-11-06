@@ -3,34 +3,32 @@ import type { FormEvent } from "react";
 import { Confirm } from "../components/Confirm";
 import {
   Button,
-  Card,
   Code,
   CopyButton,
   ErrorState,
-  Facts,
   Field,
+  Metric,
   Modal,
   Notice,
-  Page,
-  PageHeader,
-  SectionTitle,
-  Skeleton,
-  Status,
+  Panel,
+  Tiles,
+  Word,
 } from "../components/ui";
-import type { State } from "../components/ui";
 import { api, messageOf } from "../lib/api";
 import type { WebhookConfig, WebhookPosition } from "../lib/api";
-import { count } from "../lib/format";
+import { useExchange } from "../lib/exchange";
+import type { Tone } from "../lib/exchange";
+import { bytes, count } from "../lib/format";
 import { usePolled, useTitle } from "../lib/hooks";
 import { useCan } from "../lib/session";
 
-const deliveryWords: Record<WebhookPosition["state"], { state: State; text: string }> = {
-  not_configured: { state: "idle", text: "Not configured" },
-  halted: { state: "bad", text: "Halted" },
-  verifying: { state: "warn", text: "Verifying" },
-  failing: { state: "bad", text: "Failing" },
-  delivering: { state: "warn", text: "Delivering" },
-  idle: { state: "good", text: "Caught up" },
+const deliveryWords: Record<WebhookPosition["state"], { word: string; tone: Tone }> = {
+  not_configured: { word: "Not configured", tone: "warn" },
+  halted: { word: "Halted", tone: "bad" },
+  verifying: { word: "Verifying", tone: "plain" },
+  failing: { word: "Failing", tone: "bad" },
+  delivering: { word: "Delivering", tone: "plain" },
+  idle: { word: "Caught up", tone: "plain" },
 };
 
 function Restart({ config }: { config: WebhookConfig }) {
@@ -42,13 +40,11 @@ function Restart({ config }: { config: WebhookConfig }) {
       title={
         unknown ? "Can't confirm what the outbox is using" : "Restart the outbox to apply this"
       }
-      className="mb-2"
+      className="border-x-0 border-t-0"
     >
       {unknown && config.running_error && <p>{config.running_error}</p>}
-      <p>
-        It then delivers everything on the tape it hasn't sent, which can be a large first batch.
-      </p>
-      <div className="mt-2 flex flex-wrap items-center gap-2">
+      <p>It then delivers everything on the tape it hasn't sent, which can be a large batch.</p>
+      <div className="mt-1 flex flex-wrap items-center gap-2">
         <Code>{config.restart}</Code>
         <CopyButton text={config.restart} />
       </div>
@@ -59,6 +55,7 @@ function Restart({ config }: { config: WebhookConfig }) {
 export function Webhooks() {
   useTitle("Webhooks");
   const canEdit = useCan("admin");
+  const { canTrade, status } = useExchange();
   const config = usePolled(() => api.get<WebhookConfig>("/webhooks/config"), 5000);
   const delivery = usePolled(() => api.get<WebhookPosition>("/webhooks"), 3000);
   const [url, setUrl] = useState("");
@@ -98,51 +95,52 @@ export function Webhooks() {
   }
 
   const words = position ? deliveryWords[position.state] : null;
+  const stopped = !!status && !canTrade && words?.tone !== "bad";
+  const outbox = status?.consumers.find((row) => row.name === "outbox");
 
   return (
-    <Page className="max-w-[920px]">
-      <PageHeader
-        title="Webhooks"
-        detail={words ? <Status state={words.state}>{words.text}</Status> : undefined}
-      />
-
-      {config.error && !current && (
-        <Card>
-          <ErrorState
-            title="Can't read webhook settings"
-            detail={config.error}
-            onRetry={() => void config.refresh()}
-          />
-        </Card>
-      )}
+    <div className="flex flex-1 flex-col">
       {current && <Restart config={current} />}
-
-      <div className="grid gap-2">
-        <Card className="p-5">
-          <SectionTitle>Delivery</SectionTitle>
-          {delivery.error ? (
-            <p className="mt-2 text-sm text-bad">{delivery.error}</p>
-          ) : !position ? (
-            <Skeleton className="mt-3 h-14 w-full" />
-          ) : (
-            <>
-              {position.halted && <p className="mt-2 text-sm text-bad">{position.halted}</p>}
-              <Facts
-                className="tabular mt-3"
-                items={[
-                  ["Waiting to deliver", `${count(position.backlog)} bytes`],
-                  ["Failures in a row", count(position.consecutive_failures)],
-                  ["Delivered up to", count(position.delivered_position)],
-                  ["Tape position", count(position.durable_position)],
-                ]}
-              />
-            </>
-          )}
-        </Card>
-
-        <Card className="p-5">
-          <SectionTitle>Destination</SectionTitle>
-          <form onSubmit={(event) => void saveUrl(event)} className="mt-3 flex items-end gap-2">
+      <Tiles className="flex-none grid-cols-2 border-b border-line md:grid-cols-5">
+        <Metric
+          label="Delivery"
+          value={stopped ? "Tape stopped" : (words?.word ?? (delivery.error ? "-" : null))}
+          tone={stopped ? "muted" : words?.tone}
+          note={position?.halted ?? undefined}
+        />
+        <Metric
+          label="Backlog"
+          value={position ? bytes(position.backlog) : delivery.error ? "-" : null}
+        />
+        <Metric
+          label="Failures in a row"
+          value={position ? count(position.consecutive_failures) : delivery.error ? "-" : null}
+          tone={position && position.consecutive_failures > 0 ? "bad" : "plain"}
+        />
+        <Metric
+          label="Delivered to"
+          value={position ? bytes(position.delivered_position) : delivery.error ? "-" : null}
+          note={position ? `${count(position.delivered_position)} bytes` : undefined}
+        />
+        <Metric
+          label="Behind the tape"
+          value={
+            outbox?.behind !== undefined && !stopped ? `${count(outbox.behind)} events` : "Unknown"
+          }
+          note={position ? `Tape ${count(position.durable_position)} bytes` : undefined}
+        />
+      </Tiles>
+      {delivery.error && <p className="bg-surface px-3 py-1 text-bad">{delivery.error}</p>}
+      {config.error && !current && (
+        <ErrorState
+          title="Can't read webhook settings"
+          detail={config.error}
+          onRetry={() => void config.refresh()}
+        />
+      )}
+      <Tiles className="grid-cols-1 border-b border-line md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+        <Panel title="Destination" bodyClassName="p-3">
+          <form onSubmit={(event) => void saveUrl(event)} className="flex items-end gap-2">
             <Field
               label="Webhook URL"
               type="url"
@@ -167,35 +165,32 @@ export function Webhooks() {
               {failure}
             </Notice>
           )}
-        </Card>
-
-        <Card className="p-5">
-          <SectionTitle
-            actions={
-              canEdit && (
-                <Button
-                  tone={current?.secret_hint ? "danger" : "primary"}
-                  disabled={!current}
-                  onClick={() => setConfirming(true)}
-                >
-                  {current?.secret_hint ? "Replace secret" : "Generate secret"}
-                </Button>
-              )
-            }
-          >
-            Signing secret
-          </SectionTitle>
-          <p className="mt-2 text-sm text-muted">
-            {current?.secret_hint ? (
-              <>
-                Ends in <Code>{current.secret_hint}</Code>
-              </>
-            ) : (
-              "None generated here."
-            )}
-          </p>
-        </Card>
-      </div>
+        </Panel>
+        <Panel
+          title="Signing secret"
+          aside={
+            canEdit && (
+              <Button
+                tone={current?.secret_hint ? "caution" : "primary"}
+                className="h-[22px] px-1.5 text-[12px]"
+                disabled={!current}
+                onClick={() => setConfirming(true)}
+              >
+                {current?.secret_hint ? "Replace secret" : "Generate secret"}
+              </Button>
+            )
+          }
+          bodyClassName="p-3"
+        >
+          {current?.secret_hint ? (
+            <Word tone="muted">
+              Ends in <Code>{current.secret_hint}</Code>
+            </Word>
+          ) : (
+            <Word tone="muted">None generated here.</Word>
+          )}
+        </Panel>
+      </Tiles>
 
       {confirming && (
         <Confirm
@@ -222,7 +217,7 @@ export function Webhooks() {
         onClose={() => setSecret(null)}
       >
         <div className="space-y-3">
-          <p className="break-all rounded-xl bg-deep p-3 font-code text-sm" data-testid="secret">
+          <p className="break-all bg-deep p-2 font-code text-[12px]" data-testid="secret">
             {secret}
           </p>
           <div className="flex justify-end gap-2">
@@ -233,6 +228,6 @@ export function Webhooks() {
           </div>
         </div>
       </Modal>
-    </Page>
+    </div>
   );
 }

@@ -1,48 +1,48 @@
-import { useMemo, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { DataTable } from "../components/DataTable";
+import { MarketPicker, rememberMarket } from "../components/MarketPicker";
+import { MarketsNav } from "../components/MarketsNav";
 import { MarketDialogs, OutcomeNotice } from "../components/marketActions";
 import type { MarketDialog, Outcome } from "../components/marketActions";
 import { SampleNote } from "../components/SampleNote";
-import { LineChart } from "../components/Sparkline";
-import { RowDrawer, SideText, eventClass, eventOf } from "../components/Tape";
-import { VirtualRows } from "../components/VirtualRows";
+import { RowDetail, useTapeColumns } from "../components/Tape";
+import { TimeChart } from "../components/TimeChart";
+import type { TimePoint } from "../components/TimeChart";
 import {
   Button,
   EmptyState,
   ErrorState,
   Facts,
-  Page,
+  Notice,
+  Panel,
   SearchField,
   Segmented,
-  Select,
   Skeleton,
-  Status,
-  cn,
+  Word,
   buttonClass,
+  cn,
 } from "../components/ui";
 import { ApiError, BASE, api } from "../lib/api";
-import type { BookFrame, Candle, Market, MarketHistory, TapeRow } from "../lib/api";
-import { clock, short } from "../lib/format";
+import type { BookFrame, Market, MarketHistory, TapeRow } from "../lib/api";
+import { tradingState, useExchange } from "../lib/exchange";
+import { ago, count, priced, utcClock } from "../lib/format";
 import { usePolled, useSize, useStream, useTitle } from "../lib/hooks";
 import { useCan, useSession } from "../lib/session";
 import { rowKey, useTape } from "../lib/tape";
 import type { TapeFilter } from "../lib/tape";
-import { marketState } from "./Markets";
 
-const LOG_ROW = 28;
-const BOOK_ROW = 22;
+const BOOK_ROW = 20;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type Range = "15m" | "1h" | "6h" | "24h";
-
-function Stat({ label, value }: { label: string; value: string | null | undefined }) {
-  return (
-    <div className="min-w-[72px]">
-      <p className="text-xs text-faint">{label}</p>
-      <p className="tabular font-code text-sm">{value ?? "-"}</p>
-    </div>
-  );
-}
+const RANGE_MS: Record<Range, number> = {
+  "15m": 900000,
+  "1h": 3600000,
+  "6h": 21600000,
+  "24h": 86400000,
+};
 
 function subtract(ask?: string, bid?: string) {
   if (!ask || !bid) return null;
@@ -50,32 +50,36 @@ function subtract(ask?: string, bid?: string) {
   return (Number(ask) - Number(bid)).toFixed(places);
 }
 
-/** Prices to the market's tick, so a column of them lines up. */
-function priced(price: string, tick: string) {
-  const places = (tick.split(".")[1] ?? "").length;
-  const [whole, fraction = ""] = price.split(".");
-  return places ? `${whole}.${fraction.padEnd(places, "0")}` : price;
+function Stat({ label, value }: { label: string; value: string | null | undefined }) {
+  return (
+    <div className="min-w-[56px] flex-none">
+      <p className="label whitespace-nowrap">{label}</p>
+      <p className="tabular whitespace-nowrap font-code text-[12px]">{value ?? "-"}</p>
+    </div>
+  );
 }
 
 function BookRow({
   price,
   size,
+  total,
   width,
   side,
 }: {
   price: string;
   size: string;
+  total: number;
   width: number;
   side: "bid" | "ask";
 }) {
   return (
     <div
       style={{ height: BOOK_ROW }}
-      className="relative grid grid-cols-2 items-center px-4 font-code text-[12.5px]"
+      className="relative grid grid-cols-[1fr_1fr_1fr] items-center gap-1 px-3 font-code text-[12px]"
     >
       <i
         className={cn(
-          "absolute inset-y-px right-0 rounded-l-sm opacity-[.22]",
+          "absolute inset-y-px right-0 opacity-[.2]",
           side === "bid" ? "bg-bid" : "bg-ask",
         )}
         style={{ width: `${width}%` }}
@@ -84,94 +88,118 @@ function BookRow({
         {price}
       </span>
       <span className="relative text-right">{size}</span>
+      <span className="relative text-right text-faint">{Number(total.toFixed(4))}</span>
     </div>
   );
 }
 
-/** The largest size in view sets the scale, so depth reads at a glance without any numbers. */
+/** Depth is cumulative from the touch, which is what a large order would actually walk through. */
 function OrderBook({
   frame,
   failed,
   tick,
+  stale,
 }: {
   frame: BookFrame | null;
   failed: string | null;
   tick: string;
+  stale: boolean;
 }) {
   const [box, { height }] = useSize<HTMLDivElement>();
-  const rows = Math.max(3, Math.floor((height - 32) / 2 / BOOK_ROW));
+  const rows = Math.max(3, Math.floor((height - 26) / 2 / BOOK_ROW));
   const asks = frame?.asks.slice(0, rows) ?? [];
   const bids = frame?.bids.slice(0, rows) ?? [];
-  const sizes = [...asks, ...bids].map(([, size]) => Number(size));
-  const largest = Math.max(...sizes, 1);
-  const width = (size: string) => (Math.min(1, Number(size) / largest) * 56).toFixed(1);
+  const sum = (levels: [string, string][]) => {
+    let running = 0;
+    return levels.map(([price, size]) => {
+      running += Number(size);
+      return { price, size, total: running };
+    });
+  };
+  const askDepth = sum(asks);
+  const bidDepth = sum(bids);
+  const largest = Math.max(
+    askDepth[askDepth.length - 1]?.total ?? 0,
+    bidDepth[bidDepth.length - 1]?.total ?? 0,
+    1,
+  );
+  const width = (total: number) => Math.min(1, total / largest) * 100;
   const spread = subtract(frame?.asks[0]?.[0], frame?.bids[0]?.[0]);
-  const hidden = frame ? frame.bid_levels + frame.ask_levels - asks.length - bids.length : 0;
+  const levels = frame ? frame.bid_levels + frame.ask_levels : 0;
 
   return (
-    <section aria-label="Order book" className="flex min-h-[340px] min-w-0 flex-1 flex-col">
-      <div className="flex h-9 flex-none items-center justify-between px-4 text-[13px]">
-        <span className="font-medium">Order book</span>
-        {frame && (
-          <span className="tabular text-faint">
-            {hidden > 0
-              ? `${asks.length + bids.length} of ${(frame.bid_levels + frame.ask_levels).toLocaleString()} levels`
-              : `${frame.bid_levels + frame.ask_levels} levels`}
-          </span>
-        )}
-      </div>
+    <Panel
+      title="Order book"
+      aside={
+        frame && frame.coverage !== "loading" ? (
+          <span className="tabular">{count(levels)} levels</span>
+        ) : undefined
+      }
+      className="min-h-[320px]"
+      bodyClassName="flex flex-col"
+    >
       {frame?.coverage === "partial" && (
-        <p className="px-4 pb-1 text-xs text-warn">
-          Can't read the tape, so this only shows levels that changed since you opened it.
-        </p>
+        <p className="px-3 py-1 text-[12px] text-warn">Levels changed since opening only.</p>
       )}
-      <div ref={box} className="tabular flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div
+        ref={box}
+        className={cn(
+          "tabular flex min-h-0 flex-1 flex-col overflow-hidden",
+          stale && "opacity-50",
+        )}
+      >
         {!frame || frame.coverage === "loading" ? (
           failed ? (
-            <p className="p-4 text-sm text-bad">{failed}</p>
+            <p className="p-3 text-bad">{failed}</p>
           ) : (
-            <div role="status" aria-label="Loading the book" className="space-y-1.5 p-4">
+            <div role="status" aria-label="Loading the book" className="space-y-1.5 p-3">
               {Array.from({ length: 8 }, (_, index) => (
-                <Skeleton key={index} className="h-4 w-full" />
+                <Skeleton key={index} className="h-3 w-full" />
               ))}
             </div>
           )
         ) : frame.bids.length === 0 && frame.asks.length === 0 ? (
-          <EmptyState title="The book is empty" />
+          <EmptyState title="Book is empty" />
         ) : (
           <>
             <div className="flex min-h-0 flex-1 flex-col justify-end overflow-hidden">
-              {[...asks].reverse().map(([price, size]) => (
+              {[...askDepth].reverse().map(({ price, size, total }) => (
                 <BookRow
                   key={price}
                   price={priced(price, tick)}
                   size={size}
+                  total={total}
                   side="ask"
-                  width={Number(width(size))}
+                  width={width(total)}
                 />
               ))}
             </div>
-            <div className="flex h-8 flex-none items-center justify-between border-y border-hairline px-4 text-[13px] text-faint">
-              <span>Spread</span>
-              <span className="font-code text-ink">{spread ?? "-"}</span>
+            <div className="flex h-[26px] flex-none items-center justify-between border-y border-line bg-raised px-3 text-[12px]">
+              <span className="text-faint">Spread</span>
+              <span className="font-code">{spread ?? "-"}</span>
             </div>
             <div className="min-h-0 flex-1 overflow-hidden">
-              {bids.map(([price, size]) => (
+              {bidDepth.map(({ price, size, total }) => (
                 <BookRow
                   key={price}
                   price={priced(price, tick)}
                   size={size}
+                  total={total}
                   side="bid"
-                  width={Number(width(size))}
+                  width={width(total)}
                 />
               ))}
             </div>
           </>
         )}
       </div>
-    </section>
+    </Panel>
   );
 }
+
+const PRICE_SERIES = [
+  { key: "price", label: "Last", stroke: "stroke-accent", fill: "bg-accent fill-accent" },
+];
 
 function PriceChart({
   symbol,
@@ -188,26 +216,22 @@ function PriceChart({
   error: string | null;
   live: string | null;
 }) {
+  const to = Date.now();
+  const from = to - RANGE_MS[range];
   const points = useMemo(() => {
-    const text = (candle: Candle) => ({
-      label: new Date(candle.time).toLocaleTimeString("en-GB", {
-        hour: "2-digit",
-        minute: "2-digit",
-      }),
-      value: Number(candle.close),
-      text: candle.close,
-    });
-    const shown = history?.candles.map(text) ?? [];
-    if (live && shown.length) {
-      shown.push({ label: "Now", value: Number(live), text: live });
-    }
+    const shown: TimePoint[] =
+      history?.candles.map((candle) => ({
+        time: new Date(candle.time).getTime(),
+        values: { price: Number(candle.close) },
+      })) ?? [];
+    if (live && shown.length) shown.push({ time: to, values: { price: Number(live) } });
     return shown;
-  }, [history, live]);
+  }, [history, live]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <section aria-label="Price" className="flex h-[250px] flex-none flex-col p-4 pb-2">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-[13px] font-medium">Last price</span>
+    <Panel
+      title="Last price"
+      aside={
         <Segmented
           label="Range"
           value={range}
@@ -217,95 +241,80 @@ function PriceChart({
             label: value,
           }))}
         />
-      </div>
+      }
+      className="h-[240px] lg:h-auto"
+      bodyClassName="flex flex-col"
+    >
       {error && !history ? (
-        <p className="py-6 text-sm text-bad">{error}</p>
+        <p className="p-3 text-bad">{error}</p>
       ) : !history ? (
-        <Skeleton className="mt-3 flex-1" />
+        <Skeleton className="m-3 flex-1" />
       ) : points.length === 0 ? (
         <EmptyState title={`No trades in the past ${range}`} />
       ) : (
-        <LineChart
-          className="mt-2 flex-1"
+        <TimeChart
+          className="flex-1"
           step
-          ariaLabel={`${symbol} last price, past ${range}`}
-          format={(value) => String(Number(value.toFixed(4)))}
+          series={PRICE_SERIES}
           points={points}
-          startLabel={`${range} ago`}
-          endLabel="Now"
+          from={from}
+          to={to}
+          unit=""
+          format={(value) => String(Number(value.toFixed(4)))}
+          ariaLabel={`${symbol} last price, past ${range}`}
         />
       )}
-    </section>
+    </Panel>
   );
 }
 
-function Gateways({ market }: { market: Market }) {
+function Details({ market }: { market: Market }) {
+  const disagree = market.gateways.filter((gateway) => !gateway.in_sync || !gateway.reachable);
+  const code = (text?: string) => <span className="font-code text-[12px]">{text ?? "-"}</span>;
   return (
-    <section aria-label="Gateways" className="p-4">
-      <p className="text-[13px] font-medium">Gateways</p>
-      <ul className="mt-1.5 space-y-1.5">
-        {market.gateways.map((gateway) => (
-          <li key={gateway.gateway} className="text-[13px]">
-            <p className="break-all font-code text-xs text-muted">{gateway.gateway}</p>
-            {!gateway.reachable ? (
-              <Status state="bad">Unreachable</Status>
-            ) : gateway.market?.halted ? (
-              <Status state="bad">Halted</Status>
-            ) : gateway.in_sync ? (
-              <Status state="good">In sync</Status>
-            ) : (
-              <Status state="warn">Out of sync</Status>
-            )}
-          </li>
-        ))}
-      </ul>
-    </section>
+    <>
+      <Panel title="Limits" className="flex-none" bodyClassName="p-3">
+        <Facts
+          items={[
+            ["Tick", code(market.tick_size)],
+            ["Min size", code(market.min_size)],
+            ["Max size", code(market.max_size)],
+            [
+              "Open orders",
+              code(market.open_orders === undefined ? undefined : count(market.open_orders)),
+            ],
+          ]}
+        />
+      </Panel>
+      <Panel
+        title="Gateways"
+        aside={disagree.length === 0 ? <span>{market.gateways.length} agree</span> : undefined}
+        className="flex-1"
+        bodyClassName="overflow-y-auto"
+      >
+        <ul>
+          {market.gateways.map((gateway) => (
+            <li key={gateway.gateway} className="border-b border-hairline px-3 py-1">
+              <p className="break-all font-code text-[12px] text-muted">{gateway.gateway}</p>
+              {!gateway.reachable ? (
+                <Word tone="bad">Unreachable</Word>
+              ) : !gateway.in_sync ? (
+                <Word tone="warn">Differs from the file</Word>
+              ) : gateway.market?.halted !== market.halted ? (
+                <Word tone="warn">
+                  {gateway.market?.halted ? "Halted here" : "Not halted here"}
+                </Word>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </Panel>
+    </>
   );
 }
 
-function LogLine({
-  row,
-  selected,
-  onOpen,
-}: {
-  row: TapeRow;
-  selected: boolean;
-  onOpen: () => void;
-}) {
-  const event = eventOf(row);
-  const reason = row.kind === "order" && row.reason && row.reason !== "none" ? row.reason : null;
-  const status = row.kind === "order" ? row.status : "";
-  const result = reason ?? (status === "partially_filled" ? "partial" : status);
-  return (
-    <button
-      type="button"
-      onClick={onOpen}
-      aria-pressed={selected}
-      className={cn(
-        "tabular grid h-full w-full whitespace-pre grid-cols-[62px_58px_34px_1fr_auto] items-center gap-2 border-t border-hairline px-4 text-left font-code text-[12.5px] hover:bg-raised sm:grid-cols-[92px_62px_34px_1fr_auto]",
-        selected && "bg-raised",
-      )}
-    >
-      <time dateTime={row.time} className="truncate text-[11px] text-faint">
-        {clock(row.time)}
-      </time>
-      <b className={cn("font-medium", eventClass(event))}>{event}</b>
-      <SideText side={row.side} />
-      <span className="min-w-0 truncate">
-        {row.size ?? "-"} @ {row.price ?? "market"}
-        <span className="hidden sm:inline">
-          {"  "}player {short(row.player)}
-          {"  "}order {short(row.client_order_id)}
-        </span>
-      </span>
-      <em className={cn("not-italic", reason ? "text-bad" : "text-faint")}>{result}</em>
-    </button>
-  );
-}
-
-function LogPanel({ symbol }: { symbol: string }) {
-  const [side, setSide] = useState("");
-  const [event, setEvent] = useState("");
+function EventPanel({ symbol }: { symbol: string }) {
+  const [view, setView] = useState<"events" | "trades">("events");
   const [player, setPlayer] = useState("");
   const [order, setOrder] = useState("");
   const [paused, setPaused] = useState(false);
@@ -316,96 +325,123 @@ function LogPanel({ symbol }: { symbol: string }) {
   const badOrder = !!orderText && !UUID.test(orderText) && !/^\d+$/.test(orderText);
   const filter: TapeFilter = {
     symbol,
-    side: side || undefined,
-    event: event || undefined,
     player: !badPlayer ? player.trim() || undefined : undefined,
     order: !badOrder ? orderText || undefined : undefined,
   };
   const tape = useTape(filter, paused);
-  const filtered = !!(side || event || player || order);
+  const columns = useTapeColumns(false);
+  const rows = tape.rows.filter((row) => (view === "trades") === (row.kind === "trade"));
 
   return (
-    <section aria-label="Event log" className="flex min-h-0 min-w-0 flex-1 flex-col bg-deep">
-      <div className="flex flex-none flex-wrap items-center justify-between gap-2 px-4 py-2.5">
-        <SampleNote link={tape.link} sample={tape.sample} />
-        <Button className="h-8 px-2.5 text-[13px]" onClick={() => setPaused(!paused)}>
-          {paused ? "Resume" : "Pause"}
-        </Button>
-      </div>
-      <div className="flex flex-none flex-wrap items-center gap-2 px-4 pb-2.5">
-        <Select label="Side" value={side} onChange={(e) => setSide(e.target.value)}>
-          <option value="">Any side</option>
-          <option value="buy">Buy</option>
-          <option value="sell">Sell</option>
-        </Select>
-        <Select label="Event" value={event} onChange={(e) => setEvent(e.target.value)}>
-          <option value="">Any event</option>
-          {["new", "trade", "canceled", "rejected", "expired"].map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </Select>
-        <SearchField
-          label="Player"
-          className="min-w-[170px] flex-1"
-          placeholder="Player UUID"
-          aria-invalid={badPlayer}
-          value={player}
-          onChange={(e) => setPlayer(e.target.value)}
-        />
-        <SearchField
-          label="Order"
-          className="min-w-[170px] flex-1"
-          placeholder="Order UUID or number"
-          aria-invalid={badOrder}
-          value={order}
-          onChange={(e) => setOrder(e.target.value)}
-        />
-        {filtered && (
-          <Button
-            tone="quiet"
-            onClick={() => {
-              setSide("");
-              setEvent("");
-              setPlayer("");
-              setOrder("");
-            }}
-          >
-            Clear
-          </Button>
-        )}
-      </div>
+    <div className="flex min-h-[300px] min-w-0 flex-col lg:min-h-0">
       {Object.entries(tape.sources).map(([source, error]) => (
-        <p key={source} className="break-words px-4 pb-2 text-[13px] text-bad">
+        <p key={source} className="break-words bg-surface px-3 py-1 text-[12px] text-bad">
           {source}: {error}
         </p>
       ))}
-      {tape.rows.length === 0 ? (
-        <EmptyState title={tape.link === "live" ? "No reports yet" : "Waiting for the tape"}>
-          {filtered ? "Nothing matches these filters so far." : undefined}
-        </EmptyState>
-      ) : (
-        <VirtualRows
-          label="Events"
-          rows={tape.rows}
-          height={LOG_ROW}
-          rowKey={rowKey}
-          render={(row) => (
-            <LogLine row={row} selected={open === row} onOpen={() => setOpen(row)} />
-          )}
+      <div className="flex min-h-0 flex-1">
+        <DataTable
+          id="market-events"
+          className="min-w-0 flex-1"
+          columns={columns}
+          data={rows}
+          rowId={rowKey}
+          virtual
+          selected={open ? rowKey(open) : null}
+          onRowClick={setOpen}
+          defaultSorting={[{ id: "time", desc: true }]}
+          empty={tape.link === "live" ? "No events yet" : "Waiting for the tape"}
+          title=""
+          toolbar={
+            <div className="flex flex-wrap items-center gap-2">
+              <Segmented
+                label="Show"
+                value={view}
+                onChange={setView}
+                options={[
+                  { value: "events", label: "Order events" },
+                  { value: "trades", label: "Trades" },
+                ]}
+              />
+              <SearchField
+                label="Player"
+                className="w-40"
+                placeholder="Player UUID"
+                aria-invalid={badPlayer}
+                value={player}
+                onChange={(event) => setPlayer(event.target.value)}
+              />
+              <SearchField
+                label="Order"
+                className="w-40"
+                placeholder="Order UUID or number"
+                aria-invalid={badOrder}
+                value={order}
+                onChange={(event) => setOrder(event.target.value)}
+              />
+              <Button className="h-[26px]" onClick={() => setPaused(!paused)}>
+                {paused ? "Follow" : "Pause"}
+              </Button>
+              <SampleNote link={tape.link} sample={tape.sample} />
+            </div>
+          }
         />
-      )}
-      <RowDrawer
-        row={open}
-        onClose={() => setOpen(null)}
-        onFilter={(name, value) => {
-          setOpen(null);
-          if (name === "player") setPlayer(value);
-          else setOrder(value);
-        }}
-      />
-    </section>
+        {open && (
+          <RowDetail
+            row={open}
+            onClose={() => setOpen(null)}
+            onFilter={(name, value) => {
+              setOpen(null);
+              if (name === "player") setPlayer(value);
+              else setOrder(value);
+            }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MoreActions({
+  market,
+  onDialog,
+}: {
+  market: Market;
+  onDialog: (dialog: MarketDialog) => void;
+}) {
+  const item =
+    "cursor-pointer px-3 py-1 outline-none data-[disabled]:pointer-events-none data-[disabled]:opacity-40 data-[highlighted]:bg-raised";
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <Button>More</Button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={4}
+          className="z-50 w-44 border border-line bg-surface py-1 text-[13px] text-ink shadow-xl"
+        >
+          <DropdownMenu.Item className={item} onSelect={() => onDialog({ kind: "edit", market })}>
+            Edit limits
+          </DropdownMenu.Item>
+          <DropdownMenu.Separator className="my-1 h-px bg-hairline" />
+          <DropdownMenu.Item
+            className={cn(item, "text-bad")}
+            onSelect={() => onDialog({ kind: "cancel", market })}
+          >
+            Cancel all orders
+          </DropdownMenu.Item>
+          <DropdownMenu.Item
+            className={cn(item, "text-bad")}
+            disabled={!market.in_file}
+            onSelect={() => onDialog({ kind: "delete", market })}
+          >
+            Delete market
+          </DropdownMenu.Item>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
   );
 }
 
@@ -416,6 +452,7 @@ function Header({
   last,
   canAct,
   onDialog,
+  startOpen,
 }: {
   market: Market;
   history: MarketHistory | null;
@@ -423,51 +460,70 @@ function Header({
   last: string | null;
   canAct: boolean;
   onDialog: (dialog: MarketDialog) => void;
+  startOpen: boolean;
 }) {
-  const { state, text } = marketState(market);
+  const navigate = useNavigate();
+  const { canTrade, status } = useExchange();
+  const state = tradingState(market, canTrade, !!status);
   const day = history?.day;
+  const bid = book?.bids[0]?.[0];
+  const ask = book?.asks[0]?.[0];
   return (
-    <div className="flex flex-none flex-wrap items-center gap-x-6 gap-y-2 border-b border-line px-4 py-3 lg:px-6">
-      <div className="flex items-baseline gap-2.5">
-        <h1 className="font-display text-[28px] font-medium leading-8 tracking-heading">
-          {market.symbol}
-        </h1>
-        <Status state={state}>{text}</Status>
+    <div className="flex flex-none flex-wrap items-center gap-x-5 gap-y-1.5 border-b border-line bg-surface px-3 py-1.5">
+      <div className="flex flex-none items-center gap-2.5">
+        <MarketPicker
+          value={market.symbol}
+          startOpen={startOpen}
+          onPick={(symbol) => navigate(`/markets/${symbol}`)}
+        />
+        <Word tone={state.tone} className="whitespace-nowrap text-[13px]">
+          {state.word}
+        </Word>
       </div>
-      <div className="flex flex-wrap gap-x-5 gap-y-1">
-        <Stat label="Last" value={last ?? day?.last} />
-        <Stat label="Bid" value={book?.bids[0]?.[0]} />
-        <Stat label="Ask" value={book?.asks[0]?.[0]} />
+      <div className="flex min-w-0 flex-wrap gap-x-5 gap-y-1">
+        <Stat label="Last" value={last ?? market.last ?? day?.last} />
+        <Stat label="Bid" value={bid} />
+        <Stat label="Ask" value={ask} />
+        <Stat label="Spread" value={subtract(ask, bid)} />
         <Stat label="24h high" value={day?.high} />
         <Stat label="24h low" value={day?.low} />
         <Stat label="24h volume" value={day?.volume} />
         <Stat label="24h trades" value={day ? String(day.trades) : null} />
       </div>
       {canAct && (
-        <div className="ml-auto flex flex-wrap gap-2">
+        <div className="ml-auto flex flex-none items-center gap-2">
+          <MoreActions market={market} onDialog={onDialog} />
           {market.halted ? (
             <Button tone="primary" onClick={() => onDialog({ kind: "resume", market })}>
-              Resume
+              Resume trading
             </Button>
           ) : (
-            <Button disabled={!market.enabled} onClick={() => onDialog({ kind: "halt", market })}>
-              Halt
+            <Button
+              tone="danger"
+              disabled={!market.enabled}
+              onClick={() => onDialog({ kind: "halt", market })}
+            >
+              Halt market
             </Button>
           )}
-          <Button onClick={() => onDialog({ kind: "edit", market })}>Edit</Button>
-          <Button tone="danger" onClick={() => onDialog({ kind: "cancel", market })}>
-            Cancel all
-          </Button>
-          <Button
-            tone="danger"
-            disabled={!market.in_file}
-            onClick={() => onDialog({ kind: "delete", market })}
-          >
-            Delete
-          </Button>
         </div>
       )}
     </div>
+  );
+}
+
+/** Old prices are still useful in an outage, as long as nobody takes them for current ones. */
+function StaleNotice({ book, last }: { book: BookFrame | null; last?: string }) {
+  const { canTrade, status, error } = useExchange();
+  if (canTrade || !status) return null;
+  const at = book?.as_of || last;
+  return (
+    <Notice state="warn" className="border-x-0 border-t-0 py-1">
+      {at
+        ? `Book and prices are as of ${utcClock(at)} UTC, ${ago(at)}. They are not current.`
+        : "Book and prices are not current."}
+      {error ? ` ${error}` : ""}
+    </Notice>
   );
 }
 
@@ -475,12 +531,15 @@ function Live({
   symbol,
   market,
   refresh,
+  startOpen,
 }: {
   symbol: string;
   market: Market;
   refresh: () => void;
+  startOpen: boolean;
 }) {
   const { load } = useSession();
+  const { canTrade, status } = useExchange();
   const canAct = useCan("operator");
   const [range, setRange] = useState<Range>("1h");
   const [book, setBook] = useState<BookFrame | null>(null);
@@ -488,7 +547,8 @@ function Live({
   const [failed, setFailed] = useState<string | null>(null);
   const [dialog, setDialog] = useState<MarketDialog>(null);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
-  const [pane, setPane] = useState<"market" | "log">("market");
+
+  useEffect(() => rememberMarket(symbol), [symbol]);
 
   useStream(
     `${BASE}/markets/${symbol}/stream`,
@@ -512,7 +572,8 @@ function Live({
   );
 
   return (
-    <div className="flex min-h-[640px] flex-1 flex-col lg:min-h-0">
+    <div className="flex flex-1 flex-col lg:min-h-0">
+      <MarketsNav />
       <Header
         market={market}
         history={history.data}
@@ -520,38 +581,18 @@ function Live({
         last={last}
         canAct={canAct}
         onDialog={setDialog}
+        startOpen={startOpen}
       />
-      {outcome && (
-        <div className="flex-none px-4 pt-2 lg:px-6">
-          <OutcomeNotice outcome={outcome} onClose={() => setOutcome(null)} />
-        </div>
-      )}
-      <div className="flex-none p-2 lg:hidden">
-        <Segmented
-          label="Pane"
-          value={pane}
-          onChange={setPane}
-          options={[
-            { value: "market", label: "Market" },
-            { value: "log", label: "Log" },
-          ]}
+      <StaleNotice book={book} last={market.last_time} />
+      {outcome && <OutcomeNotice outcome={outcome} onClose={() => setOutcome(null)} />}
+      <div className="grid gap-px bg-line lg:min-h-0 lg:flex-1 lg:grid-cols-[minmax(250px,300px)_minmax(0,1fr)_minmax(200px,240px)]">
+        <OrderBook
+          frame={book}
+          failed={failed}
+          tick={market.tick_size}
+          stale={!canTrade && !!status}
         />
-      </div>
-      <div className="flex min-h-0 flex-1 lg:grid lg:grid-cols-2">
-        <div
-          className={cn(
-            "min-h-0 min-w-0 flex-1 flex-col border-r border-line lg:flex",
-            pane === "log" ? "flex" : "hidden",
-          )}
-        >
-          <LogPanel symbol={symbol} />
-        </div>
-        <div
-          className={cn(
-            "min-h-0 min-w-0 flex-1 flex-col overflow-y-auto lg:flex",
-            pane === "market" ? "flex" : "hidden",
-          )}
-        >
+        <div className="grid min-w-0 gap-px bg-line lg:min-h-0 lg:grid-rows-[minmax(180px,2fr)_minmax(0,3fr)]">
           <PriceChart
             symbol={symbol}
             range={range}
@@ -560,37 +601,10 @@ function Live({
             error={history.error}
             live={last}
           />
-          <div className="flex min-h-0 flex-1 flex-col border-t border-line xl:flex-row">
-            <OrderBook frame={book} failed={failed} tick={market.tick_size} />
-            <div className="flex-none border-t border-line xl:w-[260px] xl:border-l xl:border-t-0">
-              <section aria-label="Limits" className="border-b border-line p-4">
-                <Facts
-                  className="tabular"
-                  items={[
-                    [
-                      "Tick",
-                      <span key="t" className="font-code text-[13px]">
-                        {market.tick_size}
-                      </span>,
-                    ],
-                    [
-                      "Min size",
-                      <span key="n" className="font-code text-[13px]">
-                        {market.min_size ?? "-"}
-                      </span>,
-                    ],
-                    [
-                      "Max size",
-                      <span key="x" className="font-code text-[13px]">
-                        {market.max_size ?? "-"}
-                      </span>,
-                    ],
-                  ]}
-                />
-              </section>
-              <Gateways market={market} />
-            </div>
-          </div>
+          <EventPanel symbol={symbol} />
+        </div>
+        <div className="flex min-h-0 flex-col gap-px bg-line">
+          <Details market={market} />
         </div>
       </div>
       <MarketDialogs
@@ -608,42 +622,59 @@ function Live({
 
 export function MarketPage() {
   const { symbol: raw = "" } = useParams();
+  const [params, setParams] = useSearchParams();
   const symbol = raw.toUpperCase();
   useTitle(symbol);
   const market = usePolled(() => api.get<Market>(`/markets/${symbol}`), 5000, symbol);
   const missing = market.failure instanceof ApiError && market.failure.status === 404;
+  const startOpen = !!params.get("pick");
+
+  useEffect(() => {
+    if (startOpen) setParams({}, { replace: true });
+  }, [startOpen, setParams]);
 
   if (missing) {
     return (
-      <Page>
+      <>
+        <MarketsNav />
         <EmptyState
           title={`No market ${symbol}`}
           action={
-            <Link to="/markets" className={buttonClass()}>
+            <Link to="/all-markets" className={buttonClass()}>
               All markets
             </Link>
           }
         />
-      </Page>
+      </>
     );
   }
-  if (!market.data) {
+  if (!market.data || market.data.symbol !== symbol) {
     return market.error ? (
-      <Page>
+      <>
+        <MarketsNav />
         <ErrorState
           title={`Can't read ${symbol}`}
           detail={market.error}
           onRetry={() => void market.refresh()}
         />
-      </Page>
+      </>
     ) : (
-      <div className="space-y-3 p-6" role="status" aria-label="Loading">
-        <Skeleton className="h-9 w-48" />
-        <Skeleton className="h-64 w-full rounded-2xl" />
+      <div className="flex flex-1 flex-col">
+        <MarketsNav />
+        <div role="status" aria-label="Loading" className="flex-1 space-y-2 p-3">
+          <Skeleton className="h-8 w-64" />
+          <Skeleton className="h-64 w-full" />
+        </div>
       </div>
     );
   }
   return (
-    <Live key={symbol} symbol={symbol} market={market.data} refresh={() => void market.refresh()} />
+    <Live
+      key={symbol}
+      symbol={symbol}
+      market={market.data}
+      refresh={() => void market.refresh()}
+      startOpen={startOpen}
+    />
   );
 }

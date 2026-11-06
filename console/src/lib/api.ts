@@ -108,12 +108,69 @@ export interface ServiceStatus {
   ready: boolean;
   version?: string;
   error?: string;
+  checks?: Record<string, unknown>;
+  last_seen?: string;
+}
+
+export interface Member {
+  member: number;
+  role: "leader" | "follower" | "unreachable";
+  connected: boolean;
+  position?: number;
+  lag_bytes?: number;
+}
+
+export interface Cluster {
+  mode: "cluster" | "standalone" | "unknown";
+  members_up: number;
+  members_total: number;
+  quorum_needed: number;
+  quorum: boolean;
+  leader: number | null;
+  term: number;
+  leader_changes: number;
+  last_leader_change: string | null;
+  head_exec_id: number;
+  gateways_reporting: number;
+  gateways_total: number;
+  members: Member[];
+}
+
+export interface Consumer {
+  name: string;
+  state: "caught_up" | "behind" | "stalled" | "unknown";
+  behind?: number;
+  exec_id?: number;
+  last_seen?: string;
+}
+
+export interface Condition {
+  subject: string;
+  check: string;
+  detail: string;
+  severity: "bad" | "warn";
+  since: string;
+}
+
+export interface Latency {
+  window_secs: number;
+  orders: number;
+  p50_ms: number | null;
+  p99_ms: number | null;
+  refused: number;
+  refused_by_reason: Record<string, number>;
 }
 
 export interface Status {
   verdict: "ok" | "degraded" | "down";
+  can_trade: boolean;
   version: string;
+  as_of: string;
   services: ServiceStatus[];
+  cluster: Cluster;
+  consumers: Consumer[];
+  latency: Latency | null;
+  conditions: Condition[];
 }
 
 export interface GatewayView {
@@ -134,6 +191,14 @@ export interface Market {
   in_file: boolean;
   in_sync: boolean;
   gateways: GatewayView[];
+  last?: string;
+  last_time?: string;
+  volume_24h?: string;
+  trades_24h?: number;
+  open_orders?: number;
+  best_bid?: string;
+  best_ask?: string;
+  spread?: string;
 }
 
 export interface Delivery {
@@ -325,7 +390,34 @@ export interface BookFrame {
   as_of: string;
 }
 
+export interface Tally {
+  orders: number;
+  trades: number;
+  cancels: number;
+  rejects: number;
+  expired: number;
+}
+
 export interface ActivitySummary {
-  reports_per_minute: { time: string; reports: number }[];
-  busiest: { symbol: string; reports: number }[];
+  range: string;
+  bucket_secs: number;
+  /** The newest row on the tape's query view, which says how current all of this is. */
+  newest: string | null;
+  last_minute: Tally;
+  totals: Tally;
+  series: { time: string; counts: Tally }[];
+  busiest: { symbol: string; counts: Tally }[];
+}
+
+export interface LogEntry {
+  time: string;
+  level: "info" | "warn" | "bad";
+  subject: string;
+  message: string;
+  actor?: string;
+}
+
+export interface ActivityLog {
+  since: string;
+  entries: LogEntry[];
 }

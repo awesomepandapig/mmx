@@ -22,11 +22,7 @@ export function OutcomeNotice({ outcome, onClose }: { outcome: Outcome; onClose:
     <Notice
       state={outcome.state}
       title={outcome.title}
-      action={
-        <Button className="h-8 px-2.5 text-[13px]" onClick={onClose}>
-          Dismiss
-        </Button>
-      }
+      action={<Button onClick={onClose}>Dismiss</Button>}
     >
       {outcome.body}
       {outcome.gateways && failed(outcome.gateways).length > 0 && (

@@ -1,51 +1,40 @@
 import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { MarketSearch } from "../components/MarketSearch";
+import { DataTable } from "../components/DataTable";
 import { SampleNote } from "../components/SampleNote";
-import { RowDrawer, TAPE_GRID, TapeHeader, TapeLine } from "../components/Tape";
-import { VirtualRows } from "../components/VirtualRows";
-import {
-  Button,
-  Card,
-  EmptyState,
-  ErrorState,
-  Notice,
-  PageHeader,
-  SearchField,
-  Segmented,
-  Select,
-  SkeletonRows,
-  cn,
-} from "../components/ui";
+import { RowDetail, useTapeColumns } from "../components/Tape";
+import { Button, Notice, SearchField, Segmented, Select } from "../components/ui";
 import { api, queryString } from "../lib/api";
 import type { OrderRow, TapeRow, TradeRow } from "../lib/api";
 import { useDebounced, usePolled, useTitle } from "../lib/hooks";
 import { rowKey, useTape } from "../lib/tape";
 import type { TapeFilter } from "../lib/tape";
 
-const ROW_HEIGHT = 32;
-const PAGE = 50;
-
-type Mode = "live" | "history";
-type Table = "orders" | "trades";
-
+const PAGE = 100;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function History({
-  table,
-  filter,
-  onOpen,
-}: {
-  table: Table;
-  filter: TapeFilter;
-  onOpen: (row: TapeRow) => void;
-}) {
-  // Each page starts just past the last row of the one before, so paging stays cheap at any depth.
-  const [cursors, setCursors] = useState<string[]>([]);
-  const before = cursors[cursors.length - 1];
-  const query = queryString({ ...filter, before, limit: PAGE });
-  const page = usePolled<TapeRow[]>(
+type Mode = "live" | "history";
+type View = "all" | "new" | "trade" | "canceled" | "rejected";
+
+const VIEWS: { value: View; label: string }[] = [
+  { value: "all", label: "All events" },
+  { value: "new", label: "New orders" },
+  { value: "trade", label: "Trades" },
+  { value: "canceled", label: "Cancels" },
+  { value: "rejected", label: "Rejects" },
+];
+
+function useHistory(view: View, filter: TapeFilter, before: string | undefined, enabled: boolean) {
+  const table = view === "trade" ? "trades" : "orders";
+  const query = queryString({
+    ...filter,
+    event: table === "orders" && view !== "all" ? view : undefined,
+    before,
+    limit: PAGE,
+  });
+  return usePolled<TapeRow[]>(
     async () => {
+      if (!enabled) return [];
       if (table === "orders") {
         const body = await api.get<{ orders: OrderRow[] }>(`/orders${query}`);
         return body.orders.map((row) => ({ ...row, kind: "order" as const }));
@@ -54,55 +43,7 @@ function History({
       return body.trades.map((row) => ({ ...row, kind: "trade" as const }));
     },
     60000,
-    table + query,
-  );
-
-  const rows = page.data ?? [];
-  if (page.error && !page.data) {
-    return (
-      <ErrorState
-        title="Can't read the tape"
-        detail={page.error}
-        onRetry={() => void page.refresh()}
-      />
-    );
-  }
-  return (
-    <>
-      <div className="min-h-0 flex-1 overflow-auto">
-        <TapeHeader />
-        {page.loading ? (
-          <SkeletonRows rows={10} />
-        ) : rows.length === 0 ? (
-          <EmptyState title={cursors.length ? "No older rows" : `No ${table} match`} />
-        ) : (
-          rows.map((row) => (
-            <div key={rowKey(row)} style={{ height: ROW_HEIGHT }}>
-              <TapeLine row={row} onOpen={() => onOpen(row)} />
-            </div>
-          ))
-        )}
-      </div>
-      <div className="flex flex-none items-center justify-between border-t border-line px-4 py-2 text-[13px] text-muted">
-        <span>Page {cursors.length + 1}</span>
-        <div className="flex gap-2">
-          <Button
-            className="h-8 px-2.5 text-[13px]"
-            disabled={cursors.length === 0}
-            onClick={() => setCursors(cursors.slice(0, -1))}
-          >
-            Newer
-          </Button>
-          <Button
-            className="h-8 px-2.5 text-[13px]"
-            disabled={rows.length < PAGE}
-            onClick={() => setCursors([...cursors, rows[rows.length - 1].time])}
-          >
-            Older
-          </Button>
-        </div>
-      </div>
-    </>
+    table + query + String(enabled),
   );
 }
 
@@ -110,65 +51,59 @@ export function Activity() {
   useTitle("Activity");
   const [params, setParams] = useSearchParams();
   const [mode, setMode] = useState<Mode>("live");
-  const [table, setTable] = useState<Table>("orders");
   const [paused, setPaused] = useState(false);
   const [open, setOpen] = useState<TapeRow | null>(null);
+  const [cursors, setCursors] = useState<string[]>([]);
 
   const symbol = params.get("symbol") ?? "";
   const side = params.get("side") ?? "";
-  const event = params.get("event") ?? "";
+  const view = (params.get("view") ?? "all") as View;
+  const [symbolText, setSymbolText] = useState(symbol);
   const [playerText, setPlayerText] = useState(params.get("player") ?? "");
   const [orderText, setOrderText] = useState(params.get("order") ?? "");
   const player = useDebounced(playerText.trim(), 300);
   const order = useDebounced(orderText.trim(), 300);
+  const market = useDebounced(symbolText.trim().toUpperCase(), 300);
 
   function set(name: string, value: string) {
     const next = new URLSearchParams(params);
     if (value) next.set(name, value);
     else next.delete(name);
     setParams(next, { replace: true });
+    setCursors([]);
   }
 
   const badPlayer = !!player && !UUID.test(player);
   const badOrder = !!order && !UUID.test(order) && !/^\d+$/.test(order);
   const filter: TapeFilter = {
-    symbol: symbol || undefined,
+    symbol: market || undefined,
     side: side || undefined,
-    event: event || undefined,
     player: player && !badPlayer ? player : undefined,
     order: order && !badOrder ? order : undefined,
   };
-  const filtered = !!(symbol || side || event || player || order);
+  const filtered = !!(market || side || player || order);
 
-  const live = useTape(filter, paused || mode !== "live");
-  const shown = live.rows.filter((row) => (table === "orders") === (row.kind === "order"));
+  const live = useTape(
+    { ...filter, event: view === "all" ? undefined : view },
+    paused || mode !== "live",
+  );
+  const history = useHistory(view, filter, cursors[cursors.length - 1], mode === "history");
+  const columns = useTapeColumns(true);
+
+  const liveRows = live.rows.filter((row) =>
+    view === "trade" ? row.kind === "trade" : row.kind === "order",
+  );
+  const rows = mode === "live" ? liveRows : (history.data ?? []);
   const problems = Object.entries(live.sources);
 
   return (
-    <div className="flex min-h-[520px] flex-1 flex-col p-4 lg:p-6">
-      <PageHeader
-        title="Activity"
-        detail={mode === "live" ? <SampleNote link={live.link} sample={live.sample} /> : undefined}
-        actions={
-          <>
-            <Segmented
-              label="Mode"
-              value={mode}
-              options={[
-                { value: "live", label: "Live" },
-                { value: "history", label: "History" },
-              ]}
-              onChange={setMode}
-            />
-            {mode === "live" && (
-              <Button onClick={() => setPaused(!paused)}>{paused ? "Resume" : "Pause"}</Button>
-            )}
-          </>
-        }
-      />
-
+    <div className="flex min-h-[480px] flex-1 flex-col lg:min-h-0">
       {problems.length > 0 && (
-        <Notice state="warn" title="Part of the tape can't be read" className="mb-2">
+        <Notice
+          state="warn"
+          title="Part of the tape can't be read"
+          className="border-x-0 border-t-0"
+        >
           {problems.map(([source, error]) => (
             <p key={source} className="break-words">
               {source}: {error}
@@ -176,121 +111,147 @@ export function Activity() {
           ))}
         </Notice>
       )}
-
-      <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        <div className="flex flex-none flex-wrap items-center gap-2 border-b border-line p-3">
-          <Segmented
-            label="Table"
-            value={table}
-            options={[
-              { value: "orders", label: "Orders" },
-              { value: "trades", label: "Trades" },
-            ]}
-            onChange={setTable}
-          />
-          <MarketSearch
-            className="w-44"
-            placeholder="Market"
-            value={symbol}
-            onPick={(next) => set("symbol", next)}
-          />
-          <Select label="Side" value={side} onChange={(e) => set("side", e.target.value)}>
-            <option value="">Any side</option>
-            <option value="buy">Buy</option>
-            <option value="sell">Sell</option>
-          </Select>
-          <Select
-            label="Event"
-            value={event}
-            disabled={table === "trades"}
-            onChange={(e) => set("event", e.target.value)}
+      <div className="flex flex-none flex-wrap items-center gap-2 border-b border-line bg-surface px-3 py-1.5">
+        <h1 className="text-[15px] font-semibold">Activity</h1>
+        <Segmented
+          label="Show"
+          value={view}
+          options={VIEWS}
+          onChange={(next) => {
+            set("view", next === "all" ? "" : next);
+          }}
+        />
+        <SearchField
+          label="Market"
+          className="w-24"
+          placeholder="Market"
+          value={symbolText}
+          onChange={(event) => {
+            setSymbolText(event.target.value);
+            set("symbol", event.target.value.trim().toUpperCase());
+          }}
+        />
+        <Select label="Side" value={side} onChange={(event) => set("side", event.target.value)}>
+          <option value="">Any side</option>
+          <option value="buy">Buy</option>
+          <option value="sell">Sell</option>
+        </Select>
+        <SearchField
+          label="Player"
+          className="w-full sm:w-72"
+          placeholder="Player UUID"
+          aria-invalid={badPlayer}
+          value={playerText}
+          onChange={(event) => {
+            setPlayerText(event.target.value);
+            set("player", event.target.value.trim());
+          }}
+        />
+        <SearchField
+          label="Order"
+          className="w-full sm:w-72"
+          placeholder="Order UUID or number"
+          aria-invalid={badOrder}
+          value={orderText}
+          onChange={(event) => {
+            setOrderText(event.target.value);
+            set("order", event.target.value.trim());
+          }}
+        />
+        {filtered && (
+          <Button
+            tone="quiet"
+            onClick={() => {
+              setPlayerText("");
+              setOrderText("");
+              setSymbolText("");
+              setParams({}, { replace: true });
+              setCursors([]);
+            }}
           >
-            <option value="">Any event</option>
-            {["new", "trade", "canceled", "rejected", "expired"].map((name) => (
-              <option key={name} value={name}>
-                {name}
-              </option>
-            ))}
-          </Select>
-          <SearchField
-            label="Player"
-            className="w-full sm:w-64"
-            placeholder="Player UUID"
-            aria-invalid={badPlayer}
-            value={playerText}
-            onChange={(e) => {
-              setPlayerText(e.target.value);
-              set("player", e.target.value.trim());
-            }}
-          />
-          <SearchField
-            label="Order"
-            className="w-full sm:w-64"
-            placeholder="Order UUID or number"
-            aria-invalid={badOrder}
-            value={orderText}
-            onChange={(e) => {
-              setOrderText(e.target.value);
-              set("order", e.target.value.trim());
-            }}
-          />
-          {filtered && (
-            <Button
-              tone="quiet"
-              onClick={() => {
-                setPlayerText("");
-                setOrderText("");
-                setParams({}, { replace: true });
-              }}
-            >
-              Clear
-            </Button>
-          )}
-          {(badPlayer || badOrder) && (
-            <p className="w-full text-[13px] text-bad">
-              {badPlayer ? "A player is a full UUID." : "An order is a UUID or a number."}
-            </p>
-          )}
-        </div>
-
-        {mode === "history" ? (
-          <History
-            key={table + queryString({ ...filter })}
-            table={table}
-            filter={filter}
-            onOpen={setOpen}
-          />
-        ) : shown.length === 0 ? (
-          <div className="flex-1">
-            <div className={cn("hidden", TAPE_GRID)} />
-            <EmptyState title={live.link === "live" ? `No ${table} yet` : "Waiting for the tape"}>
-              {filtered ? "Nothing matches these filters so far." : undefined}
-            </EmptyState>
-          </div>
-        ) : (
-          <div className="flex min-h-0 flex-1 flex-col overflow-x-auto">
-            <TapeHeader />
-            <VirtualRows
-              label={`Live ${table}`}
-              rows={shown}
-              height={ROW_HEIGHT}
-              rowKey={rowKey}
-              render={(row) => <TapeLine row={row} onOpen={() => setOpen(row)} />}
-            />
-          </div>
+            Clear
+          </Button>
         )}
-      </Card>
-
-      <RowDrawer
-        row={open}
-        onClose={() => setOpen(null)}
-        onFilter={(name, value) => {
-          setOpen(null);
-          if (name === "player") setPlayerText(value);
-          else setOrderText(value);
-          set(name, value);
-        }}
-      />
+        {(badPlayer || badOrder) && (
+          <p className="text-[12px] text-bad">
+            {badPlayer ? "A player is a full UUID." : "An order is a UUID or a number."}
+          </p>
+        )}
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+        <DataTable
+          id="activity"
+          className="min-h-[320px] flex-1"
+          columns={columns}
+          data={rows}
+          rowId={rowKey}
+          virtual={mode === "live"}
+          selected={open ? rowKey(open) : null}
+          onRowClick={setOpen}
+          loading={mode === "history" && history.loading}
+          error={mode === "history" ? history.error : null}
+          onRetry={() => void history.refresh()}
+          defaultSorting={[{ id: "time", desc: true }]}
+          empty={
+            mode === "live" && live.link !== "live" ? "Waiting for the tape" : "No events match"
+          }
+          title=""
+          toolbar={
+            <div className="flex items-center gap-2">
+              <Segmented
+                label="Mode"
+                value={mode}
+                options={[
+                  { value: "live", label: "Following" },
+                  { value: "history", label: "History" },
+                ]}
+                onChange={(next) => {
+                  setMode(next);
+                  setCursors([]);
+                }}
+              />
+              {mode === "live" ? (
+                <>
+                  <Button className="h-[26px]" onClick={() => setPaused(!paused)}>
+                    {paused ? "Follow" : "Pause"}
+                  </Button>
+                  <SampleNote link={live.link} sample={live.sample} />
+                </>
+              ) : (
+                <>
+                  <Button
+                    className="h-[26px]"
+                    disabled={cursors.length === 0}
+                    onClick={() => setCursors(cursors.slice(0, -1))}
+                  >
+                    Newer
+                  </Button>
+                  <Button
+                    className="h-[26px]"
+                    disabled={rows.length < PAGE}
+                    onClick={() => setCursors([...cursors, rows[rows.length - 1].time])}
+                  >
+                    Older
+                  </Button>
+                  <span className="text-[12px] text-faint">Page {cursors.length + 1}</span>
+                </>
+              )}
+            </div>
+          }
+        />
+        {open && (
+          <RowDetail
+            row={open}
+            onClose={() => setOpen(null)}
+            onFilter={(name, value) => {
+              setOpen(null);
+              if (name === "player") setPlayerText(value);
+              else setOrderText(value);
+              set(name, value);
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }
