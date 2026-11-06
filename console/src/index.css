@@ -3,54 +3,94 @@
 @tailwind utilities;
 
 @layer base {
+  /* The landing page's light surfaces: the sample game beside the event log. */
   :root {
-    --canvas: 246 245 240;
+    --canvas: 247 247 250;
     --surface: 255 255 255;
-    --raised: 239 238 232;
-    --line: 224 223 215;
-    --ink: 18 20 18;
-    --muted: 96 101 95;
-    /* In light mode the bright colour can't carry text, so the accent is ink on lime only where
-       it's a fill. */
-    --accent: 217 242 75;
-    --on-accent: 18 20 18;
-    --good: 22 121 72;
-    --warn: 158 98 0;
-    --bad: 196 44 44;
+    --raised: 241 241 245;
+    --deep: 247 247 250;
+    --line: 226 226 233;
+    --hairline: 236 236 241;
+    --ink: 8 9 15;
+    --muted: 88 90 104;
+    --faint: 108 110 124;
+    --accent: 36 54 240;
+    --brand: 36 54 240;
+    --solid: 8 9 15;
+    --on-solid: 255 255 255;
+    --solid-hover: 36 54 240;
+    --good: 8 122 84;
+    --warn: 146 96 0;
+    --bad: 196 23 128;
+    --bid: 66 87 245;
+    --ask: 229 53 159;
+    --bid-text: 36 54 240;
+    --ask-text: 196 23 128;
     color-scheme: light;
   }
 
+  /* `mmx.*` in the landing page's Tailwind config, and its log colours. */
   .dark {
-    --canvas: 12 15 13;
-    --surface: 20 24 21;
-    --raised: 30 35 31;
-    --line: 41 47 43;
-    --ink: 236 239 232;
-    --muted: 146 154 147;
-    --accent: 217 242 75;
-    --on-accent: 18 20 18;
-    --good: 86 214 148;
-    --warn: 240 184 76;
-    --bad: 255 124 118;
+    --canvas: 7 8 14;
+    --surface: 18 19 29;
+    --raised: 23 25 38;
+    --deep: 11 12 21;
+    --line: 38 40 64;
+    --hairline: 32 34 58;
+    --ink: 255 255 255;
+    --muted: 162 165 187;
+    --faint: 143 146 173;
+    --accent: 163 172 255;
+    --brand: 36 54 240;
+    --solid: 255 255 255;
+    --on-solid: 8 9 15;
+    --solid-hover: 163 172 255;
+    --good: 59 227 166;
+    --warn: 255 197 61;
+    --bad: 255 122 200;
+    --bid: 66 87 245;
+    --ask: 229 53 159;
+    --bid-text: 163 172 255;
+    --ask-text: 255 122 200;
     color-scheme: dark;
   }
 
   html {
-    @apply bg-canvas text-ink;
-    font-feature-settings: "cv11", "ss03";
-    -webkit-font-smoothing: antialiased;
+    @apply bg-canvas text-ink antialiased;
   }
 
   body {
-    @apply min-h-dvh font-sans text-[15px] leading-6;
+    @apply min-h-dvh font-body text-[15px] leading-normal;
   }
 
   :focus-visible {
-    @apply outline outline-2 outline-offset-2 outline-ink;
+    @apply outline outline-2 outline-offset-2 outline-accent;
   }
 
   /* Numbers line up in tables, so columns of prices can be scanned. */
   .tabular {
     font-variant-numeric: tabular-nums;
+  }
+
+  /* Scroll areas stay quiet until they're needed. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line)) transparent;
+  }
+}
+
+@keyframes skeleton {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.skeleton {
+  animation: skeleton 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
   }
 }

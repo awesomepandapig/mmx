@@ -1,29 +1,37 @@
 import { Link } from "react-router-dom";
-import { Card, Notice, PageHeader, SectionTitle, Status, TableFrame, cn } from "../components/ui";
+import { LineChart } from "../components/Sparkline";
+import {
+  Card,
+  EmptyState,
+  ErrorState,
+  Notice,
+  Page,
+  PageHeader,
+  SectionTitle,
+  Skeleton,
+  SkeletonRows,
+  Status,
+  TableFrame,
+  tdClass,
+  thClass,
+} from "../components/ui";
 import type { State } from "../components/ui";
 import { api } from "../lib/api";
 import type {
+  ActivitySummary,
   MarketList,
   ServiceStatus,
   Status as ExchangeStatus,
   WebhookPosition,
 } from "../lib/api";
-import { usePolled } from "../lib/hooks";
+import { count } from "../lib/format";
+import { usePolled, useTitle } from "../lib/hooks";
 
-const verdicts: Record<ExchangeStatus["verdict"], { state: State; title: string; detail: string }> =
-  {
-    ok: { state: "good", title: "Everything is running", detail: "Every service is ready." },
-    degraded: {
-      state: "warn",
-      title: "Trading works, with something missing",
-      detail: "A gateway can take orders, but at least one other service isn't ready.",
-    },
-    down: {
-      state: "bad",
-      title: "No gateway can take orders",
-      detail: "Trading has stopped until a gateway is ready.",
-    },
-  };
+const verdicts: Record<ExchangeStatus["verdict"], { state: State; title: string }> = {
+  ok: { state: "good", title: "All services ready" },
+  degraded: { state: "warn", title: "Degraded: a service isn't ready" },
+  down: { state: "bad", title: "Down: no gateway can take orders" },
+};
 
 function serviceState(service: ServiceStatus): { state: State; text: string } {
   if (service.ready) return { state: "good", text: "Ready" };
@@ -31,113 +39,187 @@ function serviceState(service: ServiceStatus): { state: State; text: string } {
   return { state: service.required ? "bad" : "warn", text: "Unreachable" };
 }
 
-const webhookWords: Record<WebhookPosition["state"], string> = {
-  not_configured: "Not configured",
-  halted: "Halted",
-  verifying: "Verifying",
-  failing: "Failing",
-  delivering: "Delivering",
-  idle: "Caught up",
+const webhookWords: Record<WebhookPosition["state"], { state: State; text: string }> = {
+  not_configured: { state: "idle", text: "Not configured" },
+  halted: { state: "bad", text: "Halted" },
+  verifying: { state: "warn", text: "Verifying" },
+  failing: { state: "bad", text: "Failing" },
+  delivering: { state: "warn", text: "Delivering" },
+  idle: { state: "good", text: "Caught up" },
 };
 
-function Stat({ label, value, to }: { label: string; value: string; to: string }) {
+function Tile({
+  label,
+  to,
+  value,
+  note,
+}: {
+  label: string;
+  to: string;
+  value: React.ReactNode;
+  note?: React.ReactNode;
+}) {
   return (
-    <Link to={to} className="block rounded-card border border-line bg-surface p-5 hover:bg-raised">
-      <p className="text-sm text-muted">{label}</p>
-      <p className="tabular mt-1 text-3xl font-semibold tracking-heading">{value}</p>
+    <Link
+      to={to}
+      className="block rounded-2xl border border-line bg-surface p-4 transition-colors hover:border-accent"
+    >
+      <p className="text-[13px] text-muted">{label}</p>
+      <div className="tabular mt-1 font-display text-[28px] font-medium leading-9 tracking-heading">
+        {value ?? <Skeleton className="my-1 h-7 w-16" />}
+      </div>
+      <div className="mt-0.5 h-5 text-[13px]">{note}</div>
     </Link>
   );
 }
 
 export function Overview() {
+  useTitle("Overview");
   const status = usePolled(() => api.get<ExchangeStatus>("/status"), 5000);
-  const markets = usePolled(() => api.get<MarketList>("/markets"), 5000);
+  const markets = usePolled(() => api.get<MarketList>("/markets?limit=1"), 5000);
   const webhooks = usePolled(() => api.get<WebhookPosition>("/webhooks"), 5000);
+  const summary = usePolled(() => api.get<ActivitySummary>("/activity/summary"), 15000);
 
   const verdict = status.data ? verdicts[status.data.verdict] : null;
-  const list = markets.data?.markets ?? [];
-  const halted = list.filter((market) => market.halted).length;
+  const counts = markets.data?.counts;
+  const delivery = webhooks.data ? webhookWords[webhooks.data.state] : null;
+  const rate = summary.data?.reports_per_minute ?? [];
+  const latest = rate.length ? rate[rate.length - 1].reports : null;
 
   return (
-    <>
-      <PageHeader title="Overview" />
+    <Page>
+      <PageHeader
+        title="Overview"
+        detail={verdict ? <Status state={verdict.state}>{verdict.title}</Status> : undefined}
+      />
+
       {status.error && (
-        <div className="mb-4">
-          <Notice state="bad" title="Can't read status">
-            {status.error}
-            {status.data ? " What's below is the last good reading." : ""}
-          </Notice>
-        </div>
+        <Notice state="bad" title="Can't read status" className="mb-3">
+          {status.error}
+        </Notice>
       )}
 
-      {verdict && (
-        <Card className="mb-4 p-6">
-          <Status state={verdict.state}>
-            {status.data?.verdict === "ok"
-              ? "Healthy"
-              : status.data?.verdict === "down"
-                ? "Down"
-                : "Degraded"}
-          </Status>
-          <p className="mt-2 text-2xl font-semibold tracking-heading md:text-3xl">
-            {verdict.title}
-          </p>
-          <p className="mt-1 text-muted">{verdict.detail}</p>
-        </Card>
-      )}
-
-      <div className="mb-4 grid gap-4 sm:grid-cols-3">
-        <Stat label="Markets" value={markets.data ? String(list.length) : "-"} to="/markets" />
-        <Stat label="Halted" value={markets.data ? String(halted) : "-"} to="/markets" />
-        <Stat
-          label="Webhooks"
-          value={
-            webhooks.data ? webhookWords[webhooks.data.state] : webhooks.error ? "Unknown" : "-"
+      <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
+        <Tile
+          label="Markets"
+          to="/markets"
+          value={counts ? count(counts.all) : markets.error ? "-" : null}
+          note={counts ? <span className="text-muted">{count(counts.open)} open</span> : null}
+        />
+        <Tile
+          label="Halted"
+          to="/markets?state=halted"
+          value={counts ? count(counts.halted) : markets.error ? "-" : null}
+          note={
+            counts && counts.out_of_sync > 0 ? (
+              <span className="text-warn">{count(counts.out_of_sync)} out of sync</span>
+            ) : null
           }
+        />
+        <Tile
+          label="Reports, last minute"
+          to="/activity"
+          value={summary.data ? count(latest ?? 0) : summary.error ? "-" : null}
+        />
+        <Tile
+          label="Webhook backlog"
           to="/webhooks"
+          value={webhooks.data ? `${count(webhooks.data.backlog)} B` : webhooks.error ? "-" : null}
+          note={delivery ? <Status state={delivery.state}>{delivery.text}</Status> : null}
         />
       </div>
 
-      <Card>
-        <div className="p-5 pb-3">
-          <SectionTitle>Services</SectionTitle>
-        </div>
-        <TableFrame>
-          <table className="w-full min-w-[620px] text-left text-sm">
-            <thead className="text-muted">
-              <tr className="border-y border-line">
-                <th className="px-5 py-2 font-medium">Service</th>
-                <th className="px-5 py-2 font-medium">State</th>
-                <th className="px-5 py-2 font-medium">Version</th>
-                <th className="px-5 py-2 font-medium">Address</th>
-              </tr>
-            </thead>
-            <tbody>
-              {status.data?.services.map((service) => {
-                const { state, text } = serviceState(service);
-                return (
-                  <tr
-                    key={`${service.name}-${service.target}`}
-                    className={cn("border-b border-line last:border-b-0")}
+      <div className="mt-2 grid gap-2 lg:grid-cols-[2fr_1fr]">
+        <Card className="flex h-[260px] flex-col p-4">
+          <SectionTitle>Reports per minute, past hour</SectionTitle>
+          {summary.error && !summary.data ? (
+            <ErrorState title="Can't read the tape" detail={summary.error} />
+          ) : summary.data && rate.length === 0 ? (
+            <EmptyState title="No reports in the past hour" />
+          ) : (
+            <LineChart
+              className="mt-2 flex-1"
+              zero
+              ariaLabel="Reports per minute over the past hour"
+              format={(value) => count(Math.round(value))}
+              points={rate.map((point) => ({
+                label: new Date(point.time).toLocaleTimeString("en-GB", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                }),
+                value: point.reports,
+                text: `${count(point.reports)} reports`,
+              }))}
+            />
+          )}
+        </Card>
+
+        <Card className="flex h-[260px] flex-col overflow-hidden">
+          <SectionTitle className="p-4 pb-2">Busiest markets, past hour</SectionTitle>
+          {summary.loading ? (
+            <SkeletonRows rows={4} />
+          ) : summary.data?.busiest.length ? (
+            <ul className="min-h-0 flex-1 overflow-y-auto">
+              {summary.data.busiest.map((market) => (
+                <li key={market.symbol} className="border-t border-hairline">
+                  <Link
+                    to={`/markets/${market.symbol}`}
+                    className="flex items-center justify-between px-4 py-1.5 text-sm hover:bg-raised"
                   >
-                    <td className="px-5 py-3 font-medium">{service.name}</td>
-                    <td className="px-5 py-3">
-                      <Status state={state}>{text}</Status>
-                      {service.error && (
-                        <p className="mt-0.5 max-w-sm break-words text-xs text-muted">
-                          {service.error}
-                        </p>
-                      )}
-                    </td>
-                    <td className="tabular px-5 py-3 text-muted">{service.version ?? "-"}</td>
-                    <td className="px-5 py-3 font-mono text-xs text-muted">{service.target}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </TableFrame>
+                    <span className="font-code">{market.symbol}</span>
+                    <span className="tabular text-muted">{count(market.reports)}</span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <EmptyState title="No activity" />
+          )}
+        </Card>
+      </div>
+
+      <Card className="mt-2">
+        <SectionTitle className="px-4 pb-1 pt-3">Services</SectionTitle>
+        {status.loading ? (
+          <SkeletonRows rows={5} />
+        ) : (
+          <TableFrame>
+            <table className="w-full min-w-[620px] text-left text-sm">
+              <thead>
+                <tr>
+                  <th className={thClass}>Service</th>
+                  <th className={thClass}>State</th>
+                  <th className={thClass}>Version</th>
+                  <th className={thClass}>Address</th>
+                </tr>
+              </thead>
+              <tbody>
+                {status.data?.services.map((service) => {
+                  const { state, text } = serviceState(service);
+                  return (
+                    <tr
+                      key={`${service.name}-${service.target}`}
+                      className="border-t border-hairline"
+                    >
+                      <td className={`${tdClass} font-medium`}>{service.name}</td>
+                      <td className={tdClass}>
+                        <Status state={state}>{text}</Status>
+                        {service.error && (
+                          <p className="max-w-md break-words text-xs text-muted">{service.error}</p>
+                        )}
+                      </td>
+                      <td className={`${tdClass} tabular text-muted`}>{service.version ?? "-"}</td>
+                      <td className={`${tdClass} font-code text-[12.5px] text-muted`}>
+                        {service.target}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </TableFrame>
+        )}
       </Card>
-    </>
+    </Page>
   );
 }

@@ -1,20 +1,26 @@
 import { useEffect, useState } from "react";
-import type { FormEvent } from "react";
+import type { FormEvent, ReactNode } from "react";
+import { Confirm } from "../components/Confirm";
 import {
   Button,
   Card,
   Code,
   CopyButton,
+  ErrorState,
+  Facts,
   Field,
-  Modal,
   Notice,
+  Page,
   PageHeader,
   SectionTitle,
+  Skeleton,
   Switch,
+  Tag,
+  TextArea,
 } from "../components/ui";
-import { api, messageOf } from "../lib/api";
+import { ApiError, api, messageOf } from "../lib/api";
 import type { OidcConfig, Session, Settings as SettingsData } from "../lib/api";
-import { usePolled } from "../lib/hooks";
+import { usePolled, useTitle } from "../lib/hooks";
 import { useSession } from "../lib/session";
 
 type Result = { state: "good" | "bad"; text: string } | null;
@@ -23,46 +29,12 @@ function Line({ result }: { result: Result }) {
   return result ? <Notice state={result.state}>{result.text}</Notice> : null;
 }
 
-function PublicUrl({ data, onSaved }: { data: SettingsData; onSaved: () => void }) {
-  const [url, setUrl] = useState(data.public_url ?? "");
-  const [result, setResult] = useState<Result>(null);
-
-  async function save(event: FormEvent) {
-    event.preventDefault();
-    try {
-      await api.put("/settings", { public_url: url });
-      setResult({ state: "good", text: "Saved." });
-      onSaved();
-    } catch (error) {
-      setResult({ state: "bad", text: messageOf(error) });
-    }
-  }
-
+function Row({ title, children }: { title: ReactNode; children: ReactNode }) {
   return (
-    <Card className="p-5">
-      <SectionTitle>Public URL</SectionTitle>
-      <p className="mt-1 text-sm text-muted">
-        Where people reach this console. Single sign-on builds its redirect URI from this, and an
-        https address makes session cookies Secure.
-      </p>
-      <form onSubmit={(event) => void save(event)} className="mt-3 space-y-3">
-        <Field
-          label="URL"
-          placeholder="https://mmx.game.example"
-          value={url}
-          onChange={(event) => setUrl(event.target.value)}
-        />
-        {!url && (
-          <Button onClick={() => setUrl(window.location.origin)}>
-            Use {window.location.origin}
-          </Button>
-        )}
-        <Line result={result} />
-        <Button tone="primary" type="submit" disabled={url === (data.public_url ?? "")}>
-          Save
-        </Button>
-      </form>
-    </Card>
+    <div className="flex items-center justify-between gap-4 border-t border-hairline py-3 first:border-t-0">
+      <div className="min-w-0 text-sm font-medium">{title}</div>
+      {children}
+    </div>
   );
 }
 
@@ -81,14 +53,17 @@ function Password({ session }: { session: Session }) {
       accept(await api.post<Session>("/password", body));
       setCurrent("");
       setNext("");
-      setResult({ state: "good", text: "Password changed. Other sessions were signed out." });
+      setResult({ state: "good", text: "Password changed. Everyone else was signed out." });
     } catch (error) {
       setResult({ state: "bad", text: messageOf(error) });
     }
   }
 
   return (
-    <form onSubmit={(event) => void save(event)} className="mt-3 grid gap-3 sm:grid-cols-2">
+    <form
+      onSubmit={(event) => void save(event)}
+      className="grid gap-3 border-t border-hairline py-3 sm:grid-cols-2"
+    >
       {needsCurrent && (
         <Field
           label="Current password"
@@ -109,7 +84,7 @@ function Password({ session }: { session: Session }) {
         onChange={(event) => setNext(event.target.value)}
         hint="At least 12 characters."
       />
-      <div className="space-y-3 sm:col-span-2">
+      <div className="space-y-2 sm:col-span-2">
         <Line result={result} />
         <Button type="submit" disabled={!next}>
           Change password
@@ -130,105 +105,109 @@ function SignIn({
 }) {
   const { accept } = useSession();
   const [result, setResult] = useState<Result>(null);
-  const [confirming, setConfirming] = useState(false);
+  const [confirm, setConfirm] = useState<"off" | "on" | "revoke" | null>(null);
 
   async function setPasswordLogin(on: boolean) {
-    setResult(null);
-    try {
-      await api.put("/settings", { password_login: on });
-      onSaved();
-    } catch (error) {
-      setResult({ state: "bad", text: messageOf(error) });
-    }
+    await api.put("/settings", { password_login: on });
+    setConfirm(null);
+    onSaved();
   }
 
   async function revoke() {
-    setConfirming(false);
-    try {
-      accept(await api.post<Session>("/sessions/revoke"));
-      setResult({ state: "good", text: "Every other session was signed out." });
-    } catch (error) {
-      setResult({ state: "bad", text: messageOf(error) });
-    }
+    accept(await api.post<Session>("/sessions/revoke"));
+    setConfirm(null);
+    setResult({ state: "good", text: "Everyone else was signed out." });
   }
 
   return (
     <Card className="p-5">
       <SectionTitle>Sign-in</SectionTitle>
-      <div className="mt-3 flex items-start justify-between gap-4">
-        <div>
-          <p className="font-medium">Password login</p>
-          <p className="text-sm text-muted">
-            It can only be turned off by someone signed in through single sign-on, which proves that
-            works. <Code>mmx auth password-login on</Code> turns it back on.
-          </p>
-        </div>
-        <Switch
-          label="Password login"
-          checked={data.password_login}
-          onChange={(on) => void setPasswordLogin(on)}
-        />
-      </div>
-      {data.password_login && <Password session={session} />}
-      <div className="mt-4 border-t border-line pt-4">
+      <div className="mt-2">
+        <Row title="Password login">
+          <Switch
+            label="Password login"
+            checked={data.password_login}
+            onChange={(on) => setConfirm(on ? "on" : "off")}
+          />
+        </Row>
+        {data.password_login && <Password session={session} />}
+        <Row title="Sessions">
+          <Button onClick={() => setConfirm("revoke")}>Sign out everyone else</Button>
+        </Row>
         <Line result={result} />
-        <Button className="mt-2" onClick={() => setConfirming(true)}>
-          Sign out other sessions
-        </Button>
       </div>
-      <Modal
-        open={confirming}
-        title="Sign out every other session?"
-        description="Everyone else has to sign in again. You stay signed in here."
-        onClose={() => setConfirming(false)}
-      >
-        <div className="flex justify-end gap-2">
-          <Button onClick={() => setConfirming(false)}>Cancel</Button>
-          <Button tone="danger" onClick={() => void revoke()}>
-            Sign them out
-          </Button>
-        </div>
-      </Modal>
+      {confirm === "off" && (
+        <Confirm
+          title="Turn off password login?"
+          body={
+            <>
+              <Code>mmx auth password-login on</Code> turns it back on.
+            </>
+          }
+          action="Turn off"
+          stepUp
+          run={() => setPasswordLogin(false)}
+          onClose={() => setConfirm(null)}
+        />
+      )}
+      {confirm === "on" && (
+        <Confirm
+          title="Turn on password login?"
+          action="Turn on"
+          tone="primary"
+          stepUp
+          run={() => setPasswordLogin(true)}
+          onClose={() => setConfirm(null)}
+        />
+      )}
+      {confirm === "revoke" && (
+        <Confirm
+          title="Sign out everyone else?"
+          action="Sign them out"
+          stepUp
+          run={revoke}
+          onClose={() => setConfirm(null)}
+        />
+      )}
     </Card>
   );
 }
 
+const toLines = (groups: string[]) => groups.join("\n");
+const toList = (text: string) => text.split(/[\n,]/);
+
 function SingleSignOn({ data, onSaved }: { data: SettingsData; onSaved: () => void }) {
   const saved: OidcConfig = data.oidc;
+  const managed = saved.managed;
   const [enabled, setEnabled] = useState(saved.enabled);
   const [issuer, setIssuer] = useState(saved.issuer);
   const [clientId, setClientId] = useState(saved.client_id);
   const [secret, setSecret] = useState("");
   const [label, setLabel] = useState(saved.display_name ?? "");
-  const [allowed, setAllowed] = useState(saved.allowed.join("\n"));
+  const [claim, setClaim] = useState(saved.groups_claim);
+  const [admin, setAdmin] = useState(toLines(saved.roles.admin));
+  const [operator, setOperator] = useState(toLines(saved.roles.operator));
+  const [viewer, setViewer] = useState(toLines(saved.roles.viewer));
   const [result, setResult] = useState<Result>(null);
   const [probe, setProbe] = useState<Result>(null);
+  const [confirming, setConfirming] = useState(false);
 
   useEffect(() => setEnabled(saved.enabled), [saved.enabled]);
 
-  async function save(event: FormEvent) {
-    event.preventDefault();
-    setResult(null);
-    try {
-      await api.put("/settings/oidc", {
-        enabled,
-        issuer,
-        client_id: clientId,
-        client_secret: secret || undefined,
-        display_name: label || undefined,
-        allowed: allowed.split(/[\n,]/),
-      });
-      setSecret("");
-      setResult({
-        state: "good",
-        text: enabled
-          ? "Saved. Sign out and use the provider once to prove it works."
-          : "Saved. Single sign-on is off.",
-      });
-      onSaved();
-    } catch (error) {
-      setResult({ state: "bad", text: messageOf(error) });
-    }
+  async function save() {
+    await api.put("/settings/oidc", {
+      enabled,
+      issuer,
+      client_id: clientId,
+      client_secret: secret || undefined,
+      display_name: label || undefined,
+      groups_claim: claim,
+      roles: { admin: toList(admin), operator: toList(operator), viewer: toList(viewer) },
+    });
+    setSecret("");
+    setConfirming(false);
+    setResult({ state: "good", text: "Saved. Everyone else was signed out." });
+    onSaved();
   }
 
   async function test() {
@@ -240,11 +219,8 @@ function SingleSignOn({ data, onSaved }: { data: SettingsData; onSaved: () => vo
       );
       setProbe(
         reply.ok
-          ? {
-              state: "good",
-              text: `Found the provider at ${reply.issuer}. That doesn't test the client ID or secret: only a sign-in does.`,
-            }
-          : { state: "bad", text: reply.error ?? "It didn't answer." },
+          ? { state: "good", text: `Found ${reply.issuer}` }
+          : { state: "bad", text: reply.error ?? "No answer." },
       );
     } catch (error) {
       setProbe({ state: "bad", text: messageOf(error) });
@@ -253,40 +229,48 @@ function SingleSignOn({ data, onSaved }: { data: SettingsData; onSaved: () => vo
 
   return (
     <Card className="p-5">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <SectionTitle>Single sign-on</SectionTitle>
-          <p className="mt-1 text-sm text-muted">
-            Sign in to this console through an OpenID Connect provider, using the authorization code
-            flow with PKCE.
-          </p>
-        </div>
-        <Switch label="Single sign-on" checked={enabled} onChange={setEnabled} />
-      </div>
+      <SectionTitle
+        actions={
+          managed ? (
+            <Tag>Set by the deployment</Tag>
+          ) : (
+            <Switch label="Single sign-on" checked={enabled} onChange={setEnabled} />
+          )
+        }
+      >
+        Single sign-on
+      </SectionTitle>
 
-      <div className="mt-3">
-        <p className="text-sm font-medium">Redirect URI to register with the provider</p>
-        {saved.redirect_uri ? (
+      {saved.redirect_uri && (
+        <div className="mt-3">
+          <p className="text-[13px] font-medium">Redirect URI to register with your provider</p>
           <div className="mt-1 flex flex-wrap items-center gap-2">
             <Code>{saved.redirect_uri}</Code>
             <CopyButton text={saved.redirect_uri} />
           </div>
-        ) : (
-          <p className="text-sm text-muted">Set the public URL above to get this.</p>
-        )}
-      </div>
+        </div>
+      )}
 
-      <form onSubmit={(event) => void save(event)} className="mt-4 grid gap-3 sm:grid-cols-2">
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          setResult(null);
+          setConfirming(true);
+        }}
+        className="mt-4 grid gap-3 sm:grid-cols-2"
+      >
         <Field
           label="Issuer"
           className="sm:col-span-2"
           placeholder="https://id.game.example"
+          readOnly={managed}
           value={issuer}
           onChange={(event) => setIssuer(event.target.value)}
         />
         <Field
           label="Client ID"
           autoComplete="off"
+          readOnly={managed}
           value={clientId}
           onChange={(event) => setClientId(event.target.value)}
         />
@@ -294,96 +278,126 @@ function SingleSignOn({ data, onSaved }: { data: SettingsData; onSaved: () => vo
           label="Client secret"
           type="password"
           autoComplete="new-password"
+          readOnly={managed}
           value={secret}
           onChange={(event) => setSecret(event.target.value)}
           placeholder={saved.client_secret_hint ?? ""}
-          hint={saved.client_secret_hint ? "Leave empty to keep the current one." : undefined}
         />
         <Field
           label="Button label"
           placeholder="single sign-on"
+          readOnly={managed}
           value={label}
           onChange={(event) => setLabel(event.target.value)}
-          hint="Shown as Continue with this."
         />
-        <div className="sm:col-span-2">
-          <label htmlFor="allowed" className="mb-1 block text-sm font-medium">
-            Who may sign in
-          </label>
-          <textarea
-            id="allowed"
-            rows={3}
-            value={allowed}
-            onChange={(event) => setAllowed(event.target.value)}
-            placeholder={"admin@game.example\n@game.example"}
-            className="w-full rounded-xl border border-line bg-canvas px-3 py-2 font-mono text-sm placeholder:text-muted/70 focus:border-ink focus:outline-none"
-          />
-          <p className="mt-1 text-xs text-muted">
-            One per line: an email, an @domain, or a subject ID. Anyone listed is a full admin.
-            Emails only count if the provider marks them verified. If yours doesn't, use subject
-            IDs.
-          </p>
-        </div>
-        <div className="space-y-3 sm:col-span-2">
+        <Field
+          label="Groups claim"
+          readOnly={managed}
+          value={claim}
+          onChange={(event) => setClaim(event.target.value)}
+        />
+        <TextArea
+          label="Admin groups"
+          rows={3}
+          readOnly={managed}
+          value={admin}
+          onChange={(event) => setAdmin(event.target.value)}
+        />
+        <TextArea
+          label="Operator groups"
+          rows={3}
+          readOnly={managed}
+          value={operator}
+          onChange={(event) => setOperator(event.target.value)}
+        />
+        <TextArea
+          label="Viewer groups"
+          rows={3}
+          readOnly={managed}
+          value={viewer}
+          onChange={(event) => setViewer(event.target.value)}
+        />
+        <p className="self-end text-[13px] text-faint">
+          One group per line, by exact name. Anyone else is refused.
+        </p>
+        <div className="space-y-2 sm:col-span-2">
           <Line result={probe} />
           <Line result={result} />
           <div className="flex flex-wrap gap-2">
-            <Button tone="primary" type="submit">
-              Save
-            </Button>
+            {!managed && (
+              <Button tone="primary" type="submit">
+                Save
+              </Button>
+            )}
             <Button disabled={!issuer} onClick={() => void test()}>
               Test issuer
             </Button>
           </div>
         </div>
       </form>
+
+      {confirming && (
+        <Confirm
+          title="Save single sign-on?"
+          body="Everyone else has to sign in again."
+          action="Save"
+          tone="primary"
+          stepUp
+          run={save}
+          onClose={() => setConfirming(false)}
+        />
+      )}
     </Card>
   );
 }
 
 export function Settings() {
+  useTitle("Settings");
   const { session } = useSession();
   const settings = usePolled(() => api.get<SettingsData>("/settings"), 30000);
   const data = settings.data;
+  const denied = settings.failure instanceof ApiError && settings.failure.status === 403;
 
   return (
-    <>
+    <Page className="max-w-[920px]">
       <PageHeader title="Settings" />
-      <div className="grid gap-4">
-        {settings.error && (
-          <Notice state="bad" title="Can't read settings">
-            {settings.error}
-          </Notice>
-        )}
-        {data && session && (
-          <>
-            <PublicUrl data={data} onSaved={() => void settings.refresh()} />
-            <SignIn data={data} session={session} onSaved={() => void settings.refresh()} />
-            <SingleSignOn data={data} onSaved={() => void settings.refresh()} />
-            <Card className="p-5">
-              <SectionTitle>This install</SectionTitle>
-              <dl className="mt-3 grid gap-3 text-sm sm:grid-cols-2">
-                <div>
-                  <dt className="text-muted">Version</dt>
-                  <dd>{data.version}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted">Settings are kept in</dt>
-                  <dd className="break-all">{data.store.config}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted">Secrets are kept in</dt>
-                  <dd className="break-all">{data.store.secrets}</dd>
-                </div>
-                <div>
-                  <dt className="text-muted">Admin token for the CLI</dt>
-                  <dd>{data.admin_token_set ? "Set" : "Not set"}</dd>
-                </div>
-              </dl>
-            </Card>
-          </>
-        )}
-      </div>
-    </>
+      {settings.error && !data && (
+        <Card>
+          <ErrorState
+            title={denied ? "Admins only" : "Can't read settings"}
+            detail={settings.error}
+          />
+        </Card>
+      )}
+      {!data && !settings.error && <Skeleton className="h-64 w-full rounded-2xl" />}
+      {data && session && (
+        <div className="grid gap-2">
+          <SingleSignOn data={data} onSaved={() => void settings.refresh()} />
+          <SignIn data={data} session={session} onSaved={() => void settings.refresh()} />
+          <Card className="p-5">
+            <SectionTitle>This install</SectionTitle>
+            <Facts
+              className="mt-3"
+              items={[
+                ["Version", data.version],
+                [
+                  "Settings",
+                  <span key="c" className="font-code text-[13px]">
+                    {data.store.config}
+                  </span>,
+                ],
+                [
+                  "Secrets",
+                  <span key="s" className="font-code text-[13px]">
+                    {data.store.secrets}
+                  </span>,
+                ],
+                ["Admin token", data.admin_token_set ? "Set" : "Not set"],
+              ]}
+            />
+          </Card>
+        </div>
+      )}
+    </Page>
   );
 }

@@ -37,11 +37,8 @@ export function Setup() {
 
   return (
     <AuthPage>
-      <h1 className="text-2xl font-semibold tracking-heading">Choose a password</h1>
-      <p className="mt-1 text-sm text-muted">
-        The first password only opens this page. Once you've chosen your own, it stops working.
-      </p>
-      <form onSubmit={(event) => void submit(event)} className="mt-4 space-y-4">
+      <h1 className="font-display text-[22px] font-medium tracking-heading">Choose a password</h1>
+      <form onSubmit={(event) => void submit(event)} className="mt-4 space-y-3">
         {failure && <Notice state="bad">{failure}</Notice>}
         <Field
           label="New password"
@@ -60,7 +57,7 @@ export function Setup() {
           required
           value={repeat}
           onChange={(event) => setRepeat(event.target.value)}
-          hint={mismatch ? "These don't match yet." : undefined}
+          hint={mismatch ? "These don't match." : undefined}
         />
         <Button
           tone="primary"

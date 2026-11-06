@@ -53,7 +53,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   const fields = (parsed ?? {}) as { code?: string; message?: string; gateways?: unknown };
   // Per-gateway answers still say what happened, so a partial failure carries them along.
   if (fields.gateways) return parsed as T;
-  if (response.status === 401 && path !== "/login") onSignedOut();
+  if (response.status === 401 && path !== "/login" && path !== "/reauth") onSignedOut();
   throw new ApiError(
     response.status,
     fields.code ?? "failed",
@@ -73,12 +73,27 @@ export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+export function queryString(values: Record<string, string | number | undefined>) {
+  const query = new URLSearchParams();
+  for (const [name, value] of Object.entries(values)) {
+    if (value !== undefined && value !== "") query.set(name, String(value));
+  }
+  const text = query.toString();
+  return text ? `?${text}` : "";
+}
+
+export type Role = "viewer" | "operator" | "admin";
+
 export interface Session {
   authenticated: boolean;
   user: string | null;
   method: "password" | "oidc" | null;
+  role: Role | null;
+  /** Until when, in Unix seconds, destructive actions need no new sign-in. */
+  reauth_until: number | null;
   csrf_token: string | null;
   must_set_password: boolean;
+  first_run: boolean;
   password_login: boolean;
   oidc: { label: string } | null;
   version: string;
@@ -129,8 +144,18 @@ export interface Delivery {
   expected_secs?: number;
 }
 
+export interface MarketCounts {
+  all: number;
+  open: number;
+  halted: number;
+  disabled: number;
+  out_of_sync: number;
+}
+
 export interface MarketList {
   markets: Market[];
+  total: number;
+  counts: MarketCounts;
   delivery: Delivery;
 }
 
@@ -198,10 +223,13 @@ export interface OrderRow {
   reason?: string;
   player?: string;
   client_order_id?: string;
+  order_id?: number;
   exec_id: number;
   price?: string;
   size?: string;
+  leaves_size?: string;
   filled_size?: string;
+  avg_price?: string;
 }
 
 export interface TradeRow {
@@ -211,10 +239,13 @@ export interface TradeRow {
   player?: string;
   client_order_id?: string;
   match_id?: number;
+  order_id?: number;
   exec_id: number;
   price?: string;
   size?: string;
 }
+
+export type TapeRow = (OrderRow & { kind: "order" }) | (TradeRow & { kind: "trade" });
 
 export interface WebhookPosition {
   state: "not_configured" | "halted" | "verifying" | "failing" | "delivering" | "idle";
@@ -235,21 +266,66 @@ export interface WebhookConfig {
   secret?: string;
 }
 
+export interface RoleGroups {
+  admin: string[];
+  operator: string[];
+  viewer: string[];
+}
+
 export interface OidcConfig {
   enabled: boolean;
   issuer: string;
   client_id: string;
   display_name: string | null;
-  allowed: string[];
+  groups_claim: string;
+  roles: RoleGroups;
   client_secret_hint: string | null;
   redirect_uri: string | null;
+  managed: boolean;
 }
 
 export interface Settings {
-  public_url: string | null;
   password_login: boolean;
   oidc: OidcConfig;
   store: { backend: string; config: string; secrets: string; delivery: string };
   admin_token_set: boolean;
   version: string;
+}
+
+export interface Candle {
+  time: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+}
+
+export interface MarketHistory {
+  range: string;
+  bucket_secs: number;
+  candles: Candle[];
+  day: {
+    open: string | null;
+    high: string | null;
+    low: string | null;
+    volume: string | null;
+    trades: number;
+    last: string | null;
+    last_time: string | null;
+  };
+}
+
+export interface BookFrame {
+  bids: [string, string][];
+  asks: [string, string][];
+  bid_levels: number;
+  ask_levels: number;
+  coverage: "loading" | "complete" | "partial";
+  as_of: string;
+}
+
+export interface ActivitySummary {
+  reports_per_minute: { time: string; reports: number }[];
+  busiest: { symbol: string; reports: number }[];
 }

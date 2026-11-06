@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { Navigate, useSearchParams } from "react-router-dom";
 import { Wordmark } from "../components/Layout";
-import { Button, Card, Field, Notice } from "../components/ui";
-import { BASE, api, messageOf } from "../lib/api";
+import { Button, Card, Field, Notice, buttonClass, cn } from "../components/ui";
+import { BASE, api, messageOf, queryString } from "../lib/api";
 import type { Session } from "../lib/api";
 import { useSession } from "../lib/session";
 
@@ -11,7 +11,7 @@ export function AuthPage({ children }: { children: ReactNode }) {
   return (
     <main className="flex min-h-dvh items-center justify-center p-4">
       <div className="w-full max-w-sm">
-        <Wordmark className="mb-6 block text-center text-2xl" />
+        <Wordmark className="mb-5 block text-center" />
         <Card className="p-6">{children}</Card>
       </div>
     </main>
@@ -24,9 +24,25 @@ export function Login() {
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(params.get("error"));
+  const [usePassword, setUsePassword] = useState(false);
+  const target = params.get("return") ?? "/";
+  const start = `${BASE}/oidc/start${queryString({ return: target })}`;
 
-  if (!session) return null;
-  if (session.authenticated) return <Navigate to="/" replace />;
+  // With only a provider there's nothing to ask here, so a person never sees this page, unless
+  // they just signed out or something went wrong.
+  const straightThrough =
+    !!session &&
+    !session.authenticated &&
+    !!session.oidc &&
+    !session.password_login &&
+    !failure &&
+    !params.has("signed_out");
+  useEffect(() => {
+    if (straightThrough) window.location.replace(start);
+  }, [straightThrough, start]);
+
+  if (!session || straightThrough) return null;
+  if (session.authenticated) return <Navigate to={target} replace />;
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -42,40 +58,51 @@ export function Login() {
     }
   }
 
+  const form = (
+    <form onSubmit={(event) => void submit(event)} className="space-y-3">
+      <Field
+        label="Password"
+        type="password"
+        autoComplete="current-password"
+        autoFocus
+        required
+        value={password}
+        onChange={(event) => setPassword(event.target.value)}
+        hint={session.first_run ? "The first password is in the mmx serve log." : undefined}
+      />
+      <Button
+        tone={session.oidc ? "plain" : "primary"}
+        type="submit"
+        disabled={busy || !password}
+        className="w-full"
+      >
+        {busy ? "Signing in" : "Sign in"}
+      </Button>
+    </form>
+  );
+
   return (
     <AuthPage>
-      <h1 className="text-2xl font-semibold tracking-heading">Sign in</h1>
-      <div className="mt-4 space-y-4">
+      <h1 className="font-display text-[22px] font-medium tracking-heading">Sign in</h1>
+      <div className="mt-4 space-y-3">
         {failure && <Notice state="bad">{failure}</Notice>}
-        {session.password_login && (
-          <form onSubmit={(event) => void submit(event)} className="space-y-4">
-            <Field
-              label="Password"
-              type="password"
-              autoComplete="current-password"
-              autoFocus
-              required
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              hint="On a new install, the first password is in the mmx serve log."
-            />
-            <Button tone="primary" type="submit" disabled={busy || !password} className="w-full">
-              {busy ? "Signing in" : "Sign in"}
-            </Button>
-          </form>
-        )}
         {session.oidc && (
           // A full navigation, because the provider's page has to take over the tab.
-          <a
-            href={`${BASE}/oidc/start`}
-            className="inline-flex h-9 w-full items-center justify-center rounded-full border border-line bg-surface px-4 text-sm font-medium hover:bg-raised"
-          >
+          <a href={start} className={cn(buttonClass("primary"), "w-full")}>
             Continue with {session.oidc.label}
           </a>
         )}
+        {session.password_login &&
+          (session.oidc && !usePassword ? (
+            <Button tone="quiet" className="w-full" onClick={() => setUsePassword(true)}>
+              Use the admin password
+            </Button>
+          ) : (
+            form
+          ))}
         {!session.password_login && !session.oidc && (
           <Notice state="warn">
-            No way to sign in is turned on. Run <code>mmx auth password-login on</code>.
+            No sign-in method is on. Run <code>mmx auth password-login on</code>.
           </Notice>
         )}
       </div>

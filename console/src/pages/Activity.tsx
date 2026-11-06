@@ -1,318 +1,296 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Button, Card, Notice, PageHeader, Status, TableFrame, cn } from "../components/ui";
-import type { State } from "../components/ui";
-import { BASE, api, messageOf } from "../lib/api";
-import { useSession } from "../lib/session";
-import type { OrderRow, TradeRow, WebhookPosition } from "../lib/api";
+import { MarketSearch } from "../components/MarketSearch";
+import { SampleNote } from "../components/SampleNote";
+import { RowDrawer, TAPE_GRID, TapeHeader, TapeLine } from "../components/Tape";
+import { VirtualRows } from "../components/VirtualRows";
+import {
+  Button,
+  Card,
+  EmptyState,
+  ErrorState,
+  Notice,
+  PageHeader,
+  SearchField,
+  Segmented,
+  Select,
+  SkeletonRows,
+  cn,
+} from "../components/ui";
+import { api, queryString } from "../lib/api";
+import type { OrderRow, TapeRow, TradeRow } from "../lib/api";
+import { useDebounced, usePolled, useTitle } from "../lib/hooks";
+import { rowKey, useTape } from "../lib/tape";
+import type { TapeFilter } from "../lib/tape";
 
-const KEEP = 500;
-const FIRST_LOAD = 100;
+const ROW_HEIGHT = 32;
+const PAGE = 50;
 
-type Tab = "orders" | "trades" | "webhooks";
-type Link = "connecting" | "live" | "lost";
+type Mode = "live" | "history";
+type Table = "orders" | "trades";
 
-/** Newest first, with each execution report once, because a first load and the stream overlap. */
-function merge<T extends { exec_id: number }>(rows: T[], incoming: T[]): T[] {
-  const seen = new Set(rows.map((row) => row.exec_id));
-  const fresh = incoming.filter((row) => !seen.has(row.exec_id));
-  return [...fresh.reverse(), ...rows].slice(0, KEEP);
-}
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-function clock(time: string) {
-  const parsed = new Date(time);
-  return Number.isNaN(parsed.getTime()) ? time : parsed.toLocaleTimeString();
-}
-
-/** The end of an ID, because a UUIDv7 starts with its timestamp, so the starts all look alike. */
-function short(id?: string) {
-  return id ? id.slice(-8) : "-";
-}
-
-function Side({ side }: { side: string }) {
-  return <span className={side === "buy" ? "text-good" : "text-bad"}>{side}</span>;
-}
-
-function Empty({ what }: { what: string }) {
-  return (
-    <div className="p-10 text-center">
-      <p className="text-lg font-semibold tracking-heading">No {what} yet</p>
-      <p className="mt-1 text-muted">They appear here as they're recorded.</p>
-    </div>
+function History({
+  table,
+  filter,
+  onOpen,
+}: {
+  table: Table;
+  filter: TapeFilter;
+  onOpen: (row: TapeRow) => void;
+}) {
+  // Each page starts just past the last row of the one before, so paging stays cheap at any depth.
+  const [cursors, setCursors] = useState<string[]>([]);
+  const before = cursors[cursors.length - 1];
+  const query = queryString({ ...filter, before, limit: PAGE });
+  const page = usePolled<TapeRow[]>(
+    async () => {
+      if (table === "orders") {
+        const body = await api.get<{ orders: OrderRow[] }>(`/orders${query}`);
+        return body.orders.map((row) => ({ ...row, kind: "order" as const }));
+      }
+      const body = await api.get<{ trades: TradeRow[] }>(`/trades${query}`);
+      return body.trades.map((row) => ({ ...row, kind: "trade" as const }));
+    },
+    60000,
+    table + query,
   );
-}
 
-function Orders({ rows }: { rows: OrderRow[] }) {
-  if (rows.length === 0) return <Empty what="orders" />;
+  const rows = page.data ?? [];
+  if (page.error && !page.data) {
+    return (
+      <ErrorState
+        title="Can't read the tape"
+        detail={page.error}
+        onRetry={() => void page.refresh()}
+      />
+    );
+  }
   return (
-    <TableFrame>
-      <table className="w-full min-w-[760px] text-left text-sm">
-        <thead className="text-muted">
-          <tr className="border-b border-line">
-            {[
-              "Time",
-              "Market",
-              "Side",
-              "Event",
-              "Status",
-              "Size",
-              "Price",
-              "Filled",
-              "Player",
-              "Order",
-            ].map((name) => (
-              <th key={name} className="px-4 py-3 font-medium">
-                {name}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody className="tabular">
-          {rows.map((row) => (
-            <tr key={row.exec_id} className="border-b border-line last:border-b-0">
-              <td className="whitespace-nowrap px-4 py-2 text-muted">{clock(row.time)}</td>
-              <td className="px-4 py-2 font-mono text-xs">{row.symbol}</td>
-              <td className="px-4 py-2">
-                <Side side={row.side} />
-              </td>
-              <td className="px-4 py-2">{row.exec_type ?? "-"}</td>
-              <td className="px-4 py-2">
-                {row.status ?? "-"}
-                {row.reason && row.reason !== "none" && (
-                  <span className="block text-xs text-muted">{row.reason}</span>
-                )}
-              </td>
-              <td className="px-4 py-2 font-mono text-xs">{row.size ?? "-"}</td>
-              <td className="px-4 py-2 font-mono text-xs">{row.price ?? "market"}</td>
-              <td className="px-4 py-2 font-mono text-xs">{row.filled_size ?? "-"}</td>
-              <td className="px-4 py-2 font-mono text-xs text-muted" title={row.player}>
-                {short(row.player)}
-              </td>
-              <td className="px-4 py-2 font-mono text-xs text-muted" title={row.client_order_id}>
-                {short(row.client_order_id)}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </TableFrame>
-  );
-}
-
-function Trades({ rows }: { rows: TradeRow[] }) {
-  if (rows.length === 0) return <Empty what="trades" />;
-  return (
-    <TableFrame>
-      <table className="w-full min-w-[620px] text-left text-sm">
-        <thead className="text-muted">
-          <tr className="border-b border-line">
-            {["Time", "Market", "Side", "Size", "Price", "Match", "Player", "Order"].map((name) => (
-              <th key={name} className="px-4 py-3 font-medium">
-                {name}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody className="tabular">
-          {rows.map((row) => (
-            <tr key={row.exec_id} className="border-b border-line last:border-b-0">
-              <td className="whitespace-nowrap px-4 py-2 text-muted">{clock(row.time)}</td>
-              <td className="px-4 py-2 font-mono text-xs">{row.symbol}</td>
-              <td className="px-4 py-2">
-                <Side side={row.side} />
-              </td>
-              <td className="px-4 py-2 font-mono text-xs">{row.size ?? "-"}</td>
-              <td className="px-4 py-2 font-mono text-xs">{row.price ?? "-"}</td>
-              <td className="px-4 py-2 font-mono text-xs">{row.match_id ?? "-"}</td>
-              <td className="px-4 py-2 font-mono text-xs text-muted" title={row.player}>
-                {short(row.player)}
-              </td>
-              <td className="px-4 py-2 font-mono text-xs text-muted" title={row.client_order_id}>
-                {short(row.client_order_id)}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </TableFrame>
-  );
-}
-
-const deliveryWords: Record<WebhookPosition["state"], { state: State; text: string }> = {
-  not_configured: { state: "warn", text: "Not configured" },
-  halted: { state: "bad", text: "Halted" },
-  verifying: { state: "warn", text: "Verifying" },
-  failing: { state: "bad", text: "Failing" },
-  delivering: { state: "warn", text: "Delivering" },
-  idle: { state: "good", text: "Caught up" },
-};
-
-export function WebhookFacts({ position }: { position: WebhookPosition }) {
-  const { state, text } = deliveryWords[position.state];
-  const facts: [string, string][] = [
-    ["Waiting to deliver", `${position.backlog.toLocaleString()} bytes`],
-    ["Failures in a row", position.consecutive_failures.toLocaleString()],
-    ["Delivered up to", position.delivered_position.toLocaleString()],
-  ];
-  return (
-    <div>
-      <Status state={state}>{text}</Status>
-      {position.halted && <p className="mt-1 text-sm text-bad">{position.halted}</p>}
-      <dl className="mt-3 grid gap-3 sm:grid-cols-3">
-        {facts.map(([label, value]) => (
-          <div key={label}>
-            <dt className="text-sm text-muted">{label}</dt>
-            <dd className="tabular font-mono text-sm">{value}</dd>
-          </div>
-        ))}
-      </dl>
-    </div>
-  );
-}
-
-function Webhooks({ position }: { position: WebhookPosition | null }) {
-  return (
-    <div className="p-5">
-      {position ? (
-        <WebhookFacts position={position} />
-      ) : (
-        <p className="text-muted">Waiting for the outbox.</p>
-      )}
-      <p className="mt-4 text-sm text-muted">
-        The outbox reports how far it has delivered, and doesn't keep a record of each delivery.
-      </p>
-    </div>
+    <>
+      <div className="min-h-0 flex-1 overflow-auto">
+        <TapeHeader />
+        {page.loading ? (
+          <SkeletonRows rows={10} />
+        ) : rows.length === 0 ? (
+          <EmptyState title={cursors.length ? "No older rows" : `No ${table} match`} />
+        ) : (
+          rows.map((row) => (
+            <div key={rowKey(row)} style={{ height: ROW_HEIGHT }}>
+              <TapeLine row={row} onOpen={() => onOpen(row)} />
+            </div>
+          ))
+        )}
+      </div>
+      <div className="flex flex-none items-center justify-between border-t border-line px-4 py-2 text-[13px] text-muted">
+        <span>Page {cursors.length + 1}</span>
+        <div className="flex gap-2">
+          <Button
+            className="h-8 px-2.5 text-[13px]"
+            disabled={cursors.length === 0}
+            onClick={() => setCursors(cursors.slice(0, -1))}
+          >
+            Newer
+          </Button>
+          <Button
+            className="h-8 px-2.5 text-[13px]"
+            disabled={rows.length < PAGE}
+            onClick={() => setCursors([...cursors, rows[rows.length - 1].time])}
+          >
+            Older
+          </Button>
+        </div>
+      </div>
+    </>
   );
 }
 
 export function Activity() {
-  const { load } = useSession();
+  useTitle("Activity");
   const [params, setParams] = useSearchParams();
-  const symbol = params.get("symbol") ?? "";
-  const [tab, setTab] = useState<Tab>("orders");
-  const [orders, setOrders] = useState<OrderRow[]>([]);
-  const [trades, setTrades] = useState<TradeRow[]>([]);
-  const [position, setPosition] = useState<WebhookPosition | null>(null);
-  const [link, setLink] = useState<Link>("connecting");
-  const [sources, setSources] = useState<Record<string, string>>({});
+  const [mode, setMode] = useState<Mode>("live");
+  const [table, setTable] = useState<Table>("orders");
   const [paused, setPaused] = useState(false);
-  const pausedRef = useRef(paused);
-  pausedRef.current = paused;
+  const [open, setOpen] = useState<TapeRow | null>(null);
 
-  useEffect(() => {
-    void api
-      .get<{ orders: OrderRow[] }>(`/orders?limit=${FIRST_LOAD}`)
-      .then((body) => setOrders((rows) => merge(rows, [...body.orders].reverse())))
-      .catch((error) => setSources((now) => ({ ...now, orders: messageOf(error) })));
-    void api
-      .get<{ trades: TradeRow[] }>(`/trades?limit=${FIRST_LOAD}`)
-      .then((body) => setTrades((rows) => merge(rows, [...body.trades].reverse())))
-      .catch((error) => setSources((now) => ({ ...now, trades: messageOf(error) })));
+  const symbol = params.get("symbol") ?? "";
+  const side = params.get("side") ?? "";
+  const event = params.get("event") ?? "";
+  const [playerText, setPlayerText] = useState(params.get("player") ?? "");
+  const [orderText, setOrderText] = useState(params.get("order") ?? "");
+  const player = useDebounced(playerText.trim(), 300);
+  const order = useDebounced(orderText.trim(), 300);
 
-    const stream = new EventSource(`${BASE}/events`);
-    stream.onopen = () => setLink("live");
-    // A stream can't show a 401, so this finds out whether the session is what ended.
-    stream.onerror = () => {
-      setLink("lost");
-      void load();
-    };
-    const on = <T,>(kind: string, handle: (data: T) => void) =>
-      stream.addEventListener(kind, (event) => handle(JSON.parse(event.data) as T));
+  function set(name: string, value: string) {
+    const next = new URLSearchParams(params);
+    if (value) next.set(name, value);
+    else next.delete(name);
+    setParams(next, { replace: true });
+  }
 
-    on<OrderRow>("order", (row) => {
-      if (!pausedRef.current) setOrders((rows) => merge(rows, [row]));
-    });
-    on<TradeRow>("trade", (row) => {
-      if (!pausedRef.current) setTrades((rows) => merge(rows, [row]));
-    });
-    on<WebhookPosition>("webhook", setPosition);
-    on<{ source: string; error: string }>("source_failed", ({ source, error }) =>
-      setSources((now) => ({ ...now, [source]: error })),
-    );
-    on<{ source: string }>("source_recovered", ({ source }) =>
-      setSources(({ [source]: _gone, ...rest }) => rest),
-    );
-    return () => stream.close();
-  }, [load]);
-
-  const symbols = useMemo(
-    () => [...new Set([...orders, ...trades].map((row) => row.symbol))].sort(),
-    [orders, trades],
-  );
-  const shownOrders = symbol ? orders.filter((row) => row.symbol === symbol) : orders;
-  const shownTrades = symbol ? trades.filter((row) => row.symbol === symbol) : trades;
-
-  const tabs: [Tab, string][] = [
-    ["orders", "Orders"],
-    ["trades", "Trades"],
-    ["webhooks", "Webhooks"],
-  ];
-  const linkState: Record<Link, { state: State; text: string }> = {
-    connecting: { state: "idle", text: "Connecting" },
-    live: paused ? { state: "warn", text: "Paused" } : { state: "good", text: "Live" },
-    lost: { state: "bad", text: "Reconnecting" },
+  const badPlayer = !!player && !UUID.test(player);
+  const badOrder = !!order && !UUID.test(order) && !/^\d+$/.test(order);
+  const filter: TapeFilter = {
+    symbol: symbol || undefined,
+    side: side || undefined,
+    event: event || undefined,
+    player: player && !badPlayer ? player : undefined,
+    order: order && !badOrder ? order : undefined,
   };
+  const filtered = !!(symbol || side || event || player || order);
+
+  const live = useTape(filter, paused || mode !== "live");
+  const shown = live.rows.filter((row) => (table === "orders") === (row.kind === "order"));
+  const problems = Object.entries(live.sources);
 
   return (
-    <>
+    <div className="flex min-h-[520px] flex-1 flex-col p-4 lg:p-6">
       <PageHeader
         title="Activity"
-        detail="Orders, trades and webhook delivery across every player, as recorded from the tape."
-        actions={<Status state={linkState[link].state}>{linkState[link].text}</Status>}
+        detail={mode === "live" ? <SampleNote link={live.link} sample={live.sample} /> : undefined}
+        actions={
+          <>
+            <Segmented
+              label="Mode"
+              value={mode}
+              options={[
+                { value: "live", label: "Live" },
+                { value: "history", label: "History" },
+              ]}
+              onChange={setMode}
+            />
+            {mode === "live" && (
+              <Button onClick={() => setPaused(!paused)}>{paused ? "Resume" : "Pause"}</Button>
+            )}
+          </>
+        }
       />
 
-      {Object.keys(sources).length > 0 && (
-        <div className="mb-4">
-          <Notice state="warn" title="Some activity can't be read right now">
-            {Object.entries(sources).map(([source, error]) => (
-              <p key={source} className="break-words">
-                {source}: {error}
-              </p>
-            ))}
-          </Notice>
-        </div>
+      {problems.length > 0 && (
+        <Notice state="warn" title="Part of the tape can't be read" className="mb-2">
+          {problems.map(([source, error]) => (
+            <p key={source} className="break-words">
+              {source}: {error}
+            </p>
+          ))}
+        </Notice>
       )}
 
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <div role="tablist" aria-label="Activity" className="flex rounded-full bg-raised p-1">
-          {tabs.map(([value, label]) => (
-            <button
-              key={value}
-              type="button"
-              role="tab"
-              aria-selected={tab === value}
-              onClick={() => setTab(value)}
-              className={cn(
-                "h-7 rounded-full px-4 text-sm font-medium",
-                tab === value ? "bg-surface text-ink" : "text-muted hover:text-ink",
-              )}
+      <Card className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="flex flex-none flex-wrap items-center gap-2 border-b border-line p-3">
+          <Segmented
+            label="Table"
+            value={table}
+            options={[
+              { value: "orders", label: "Orders" },
+              { value: "trades", label: "Trades" },
+            ]}
+            onChange={setTable}
+          />
+          <MarketSearch
+            className="w-44"
+            placeholder="Market"
+            value={symbol}
+            onPick={(next) => set("symbol", next)}
+          />
+          <Select label="Side" value={side} onChange={(e) => set("side", e.target.value)}>
+            <option value="">Any side</option>
+            <option value="buy">Buy</option>
+            <option value="sell">Sell</option>
+          </Select>
+          <Select
+            label="Event"
+            value={event}
+            disabled={table === "trades"}
+            onChange={(e) => set("event", e.target.value)}
+          >
+            <option value="">Any event</option>
+            {["new", "trade", "canceled", "rejected", "expired"].map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </Select>
+          <SearchField
+            label="Player"
+            className="w-full sm:w-64"
+            placeholder="Player UUID"
+            aria-invalid={badPlayer}
+            value={playerText}
+            onChange={(e) => {
+              setPlayerText(e.target.value);
+              set("player", e.target.value.trim());
+            }}
+          />
+          <SearchField
+            label="Order"
+            className="w-full sm:w-64"
+            placeholder="Order UUID or number"
+            aria-invalid={badOrder}
+            value={orderText}
+            onChange={(e) => {
+              setOrderText(e.target.value);
+              set("order", e.target.value.trim());
+            }}
+          />
+          {filtered && (
+            <Button
+              tone="quiet"
+              onClick={() => {
+                setPlayerText("");
+                setOrderText("");
+                setParams({}, { replace: true });
+              }}
             >
-              {label}
-            </button>
-          ))}
+              Clear
+            </Button>
+          )}
+          {(badPlayer || badOrder) && (
+            <p className="w-full text-[13px] text-bad">
+              {badPlayer ? "A player is a full UUID." : "An order is a UUID or a number."}
+            </p>
+          )}
         </div>
-        <label className="sr-only" htmlFor="market-filter">
-          Market
-        </label>
-        <select
-          id="market-filter"
-          value={symbol}
-          onChange={(event) => setParams(event.target.value ? { symbol: event.target.value } : {})}
-          className="h-9 rounded-full border border-line bg-surface px-3 text-sm"
-        >
-          <option value="">All markets</option>
-          {[...new Set([...symbols, ...(symbol ? [symbol] : [])])].map((name) => (
-            <option key={name}>{name}</option>
-          ))}
-        </select>
-        <Button onClick={() => setPaused(!paused)}>{paused ? "Resume" : "Pause"}</Button>
-      </div>
 
-      <Card>
-        {tab === "orders" && <Orders rows={shownOrders} />}
-        {tab === "trades" && <Trades rows={shownTrades} />}
-        {tab === "webhooks" && <Webhooks position={position} />}
+        {mode === "history" ? (
+          <History
+            key={table + queryString({ ...filter })}
+            table={table}
+            filter={filter}
+            onOpen={setOpen}
+          />
+        ) : shown.length === 0 ? (
+          <div className="flex-1">
+            <div className={cn("hidden", TAPE_GRID)} />
+            <EmptyState title={live.link === "live" ? `No ${table} yet` : "Waiting for the tape"}>
+              {filtered ? "Nothing matches these filters so far." : undefined}
+            </EmptyState>
+          </div>
+        ) : (
+          <div className="flex min-h-0 flex-1 flex-col overflow-x-auto">
+            <TapeHeader />
+            <VirtualRows
+              label={`Live ${table}`}
+              rows={shown}
+              height={ROW_HEIGHT}
+              rowKey={rowKey}
+              render={(row) => <TapeLine row={row} onOpen={() => setOpen(row)} />}
+            />
+          </div>
+        )}
       </Card>
-    </>
+
+      <RowDrawer
+        row={open}
+        onClose={() => setOpen(null)}
+        onFilter={(name, value) => {
+          setOpen(null);
+          if (name === "player") setPlayerText(value);
+          else setOrderText(value);
+          set(name, value);
+        }}
+      />
+    </div>
   );
 }
