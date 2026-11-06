@@ -15,6 +15,10 @@ use tokio::time::timeout;
 
 use transport::{AeronExclusivePublication, AeronOfferError};
 
+/// How long a request may wait to go out and be answered. A cluster gateway stops sending at this
+/// deadline, which is what makes the time an order can land bounded.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(3);
+
 const ORDER_QUEUE_LENGTH: usize = 1024;
 const BACK_PRESSURE_TIMEOUT: Duration = Duration::from_millis(100);
 const LINK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
@@ -41,12 +45,11 @@ pub enum OrderOutcome {
     Accepted,
     /// The engine refused the order, so it won't execute.
     Rejected,
-    /// This order ID already reached the engine, so nothing new happened.
-    Repeat,
     Canceled,
     /// There's nothing to cancel, because the order finished or never existed.
     NotOpen,
-    /// No answer before the deadline. The request may still have landed, so retry with the same ID.
+    /// No answer before the deadline. The request may still have landed, so it must not be sent
+    /// again. Its status says what became of it.
     TimedOut,
     Failed(String),
 }
@@ -64,6 +67,8 @@ pub enum EngineRequest {
 pub struct OutboundOrder {
     pub request: EngineRequest,
     pub message: Vec<u8>,
+    /// Set before any wait, so that nothing this request queues behind can extend it.
+    pub send_by: Instant,
     pub published: oneshot::Sender<OrderOutcome>,
 }
 

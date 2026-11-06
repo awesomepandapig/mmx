@@ -78,6 +78,8 @@ spec:
               value: {{ include "mmx.reportChannels" . | quote }}
             - name: CLUSTER_RESPONSE_CHANNEL
               value: "aeron:udp?endpoint=$(POD_IP):{{ $gateway.responsePort }}"
+            - name: CLUSTER_SESSION_TIMEOUT
+              value: {{ .Values.cluster.sessionTimeout | quote }}
             - name: MARKETS_FILE
               value: /etc/mmx/markets.yaml
             - name: MMX_DEMO

@@ -199,6 +199,10 @@ fn render_webhooks(body: &Value) -> String {
 }
 
 fn render_order(order: &Value) -> String {
+    // An order with no record has only a status and what to do about it.
+    if order.get("product_id").is_none() {
+        return format!("{} {}: {}", text(order, "id"), text(order, "status"), text(order, "message"));
+    }
     format!(
         "{} {:<6} {:<4} {} @ {} {} filled={}",
         text(order, "id"),
@@ -417,7 +421,8 @@ impl Orders {
         output::note(&format!("client_order_id {id}"));
         let reply = send(self.request(Method::POST, "/api/v1/orders").json(order)).await;
         let reply = reply.map_err(|err| outcome_unknown(id, &err))?;
-        if reply.status == 503 {
+        // Other refusals say nothing was sent, so only this one leaves the order in doubt.
+        if reply.body.get("code").and_then(Value::as_str) == Some("outcome_unknown") {
             finish(self.json, &reply, render_order).map_err(|err| outcome_unknown(id, &err))
         } else {
             finish(self.json, &reply, render_order)
@@ -464,6 +469,12 @@ impl Orders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_order_with_no_record_shows_its_status_and_what_to_do() {
+        let body = json!({ "id": "x", "status": "unknown", "settled": false, "message": "Keep funds on hold." });
+        assert_eq!(render_order(&body), "x unknown: Keep funds on hold.");
+    }
 
     #[test]
     fn status_shows_each_service_and_why_it_failed() {

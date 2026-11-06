@@ -22,7 +22,7 @@ services haven't been run there. Steps marked untested haven't been tried.
 | Apple `container` | 1.6.1 | Infrastructure on macOS |
 | NATS | `nats:2-alpine` | Market data bus |
 | QuestDB | `questdb/questdb:8.2.3` | Time-series storage |
-| Valkey | `valkey/valkey:8-alpine` | Per-player rate limits, in cluster mode |
+| Valkey | `valkey/valkey:8-alpine` | Order ID claims and per-player rate limits, in cluster mode |
 | Postgres | `postgres:16-alpine` | Auth database |
 | Grafana LGTM | `grafana/otel-lgtm:latest` | Optional metrics viewer |
 
@@ -229,12 +229,63 @@ Settings that `sbx.py` chooses here:
 |---|---|---|
 | `LEADER_HEARTBEAT_TIMEOUT`, election timeout | `500ms` | A failover then fits inside the gateway's 3-second hold, at about 1.3 seconds here |
 | `aeron.image.liveness.timeout` on the client driver | `2s` | Consumers notice a dead node sooner than the default 10 seconds |
-| `RETRY_WINDOW_SECS` | `0` | Callers don't retry. With the check on, new orders wait on the recorder for the gateway's first 5 minutes, so a node loss bounces them with `recorder_behind` |
+| `CLUSTER_SESSION_TIMEOUT` | `30s` | Must match the nodes' session timeout. The gateway won't start in cluster mode without it, because `never_landed` relies on it |
+
+### Placing an order safely
+
+In cluster mode `client_order_id` is required and must be a UUIDv7 made in the last 60 seconds, or
+`ORDER_ID_WINDOW_SECS` if that's set. It may be dated up to 5 seconds ahead. Callers never retry a
+POST, but a proxy can replay one, so every gateway first claims the ID in Valkey, in the same atomic
+step as the rate limit. A repeat places nothing, even if the first order already filled.
+
+Every refusal below says nothing was sent. Only `outcome_unknown` leaves an order in doubt.
+
+| Status | `code` | What the game does |
+|---|---|---|
+| 201 | | The engine took the order |
+| 400 | `invalid_client_order_id`, `stale_client_order_id`, `future_client_order_id` | Fix the ID. To place the order, make a new one |
+| 409 | `duplicate_order` | This request placed nothing, but an earlier one with this ID may have. Keep funds on hold and ask for the status |
+| 503 | `claim_unavailable` | Valkey didn't confirm the claim. Cancels still work. Make a new ID to try again |
+| 503 | `claims_recovering` | Valkey lost its data, so new orders stop for 70 seconds. Cancels still work. `Retry-After` says when, then make a new ID |
+| 503 | `outcome_unknown` | Never send it again. Keep funds on hold and ask for the status |
+
+`/readyz` shows `order_claims`. A gateway with it false stays in rotation, because it still has to
+take cancels.
+
+A new Valkey looks exactly like one that lost its data, so a first install also waits 70 seconds.
+
+### Asking for an order's status
+
+`GET /api/v1/orders/{client_order_id}` works on any gateway, for any order, at any later time.
+It answers from QuestDB, with the order as usual if it's there. If not, it still answers 200, with
+one of these and never a 404:
+
+```json
+{"id": "...", "status": "unknown", "settled": false, "message": "..."}
+{"id": "...", "status": "never_landed", "settled": true, "message": "..."}
+```
+
+Only `never_landed` means the funds can be released. It needs all of these, and anything less
+answers `unknown`, so keep the funds on hold and ask again:
+
+1. The ID is older than its window, 5 seconds of skew, the gateway's 3-second deadline and the
+   session timeout, which is 98 seconds by default. It has to include the window, because an ID 40
+   seconds old can still be posted.
+2. A marker sent through the log comes back. This proves that the cluster has a quorum and that
+   anything logged before it has been reported. The marker is a cancel for a random ID, so the game
+   gets one `cancel_rejected` webhook with an ID it never used for each such answer, and ignores it.
+3. The recorder has passed the marker, and a second read still finds nothing.
+
+Gateways, Valkey and the machine holding QuestDB need clocks within 5 seconds of each other.
 
 ### What `e2e` checks
 
 It needs a running stack, and exits non-zero with a message on the first failure. It's safe to run
 again and again, and it cancels anything an earlier failed run left resting.
+
+It waits for `order_claims` first, which takes 70 seconds on a new Valkey. It also starts a second
+gateway on port 8001, and takes Valkey down, so nothing else should be using either. A run takes
+about 6 minutes.
 
 1. A resting sell and a crossing buy, placed over REST with `client_order_id`, are both accepted.
 2. Both fill webhooks arrive with valid signatures. The legs share `match_id`, and each `fill_id` is
@@ -245,6 +296,15 @@ again and again, and it cancels anything an earlier failed run left resting.
 6. It kills the leader while 60 orders are flowing, then places another. Every order must be answered.
 7. Each order's webhooks must match how it ended, with none missing and no `fill_id` delivered twice.
 8. Trading, webhooks and market data still work, and the killed node catches up with the leader.
+9. Simultaneous POSTs of one ID to two gateways never place more than one order, even when it fills
+   at once. If Valkey is slow some are refused with `claim_unavailable`, so the fills are counted
+   against what was placed.
+10. Stale, future and non-UUIDv7 IDs are refused.
+11. With Valkey stopped, new orders are refused, cancels work, and `/readyz` says so.
+12. With Valkey emptied, new orders wait out the hold, on a gateway that starts during it too, and a
+    replay of a lost ID is never sent.
+13. Status works from a gateway that never saw the order. An unknown ID answers `unknown`, and later
+    `never_landed`.
 
 `tools/scripts/sbx.py e2e --kill 0` kills node 0 instead. Consumers start on node 0, so this is the
 one that makes them move. Stopping the whole stack and bringing it back isn't part of `e2e`.
@@ -477,8 +537,8 @@ Confirmed with the tools above:
   It moves to another node at the same position, so nothing is lost.
 - **A POST answers at the first report.** A crossing order comes back `open` with `filled_size` 0
   even when it filled at once. Fills arrive by webhook, and `GET` catches up shortly after.
-- **Valkey checks sometimes miss their 100 ms limit** around a failover on this Mac. Those orders go
-  through unchecked, by design.
+- **Valkey checks sometimes miss their 100 ms limit** around a failover on this Mac. Those orders are
+  refused with `claim_unavailable`, by design, because an order is never sent unclaimed.
 
 Also known:
 

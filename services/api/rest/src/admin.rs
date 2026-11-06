@@ -8,12 +8,13 @@ use super::decimal;
 use super::errors::AppError;
 use super::identity::Player;
 use super::markets::{Market, normalize_symbol};
-use super::repeat::await_recorder;
+use super::recorder::await_recorder;
 use super::routes::{MAX_CANCEL_ALL, outcome, submit_cancel};
 
 use std::collections::BTreeMap;
 use std::env;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::{
     Json,
@@ -79,14 +80,17 @@ pub struct Readiness {
     checks: BTreeMap<&'static str, bool>,
 }
 
-/// Ready only depends on the engine. A gateway with no halt list still has to take cancels, so it
-/// must stay in rotation, and `checks` shows why it's refusing new orders.
+/// Ready only depends on the engine. A gateway with no halt list or claim store still has to take
+/// cancels, so it must stay in rotation, and `checks` shows why it's refusing new orders.
 pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Readiness>) {
     let engine = state.engine.is_up() && !state.orders.is_closed();
 
     let mut checks = BTreeMap::from([("engine", engine), ("halts_known", state.halts.is_known())]);
     if let Some(healthy) = state.halts.store_healthy() {
         checks.insert("valkey", healthy);
+    }
+    if let Some(claims) = &state.claims_ready {
+        checks.insert("order_claims", claims.load(Ordering::Relaxed));
     }
 
     let status = if engine { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };

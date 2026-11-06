@@ -1039,6 +1039,10 @@ async fn order_route(
             let body = json!({ "code": "outcome_unknown", "message": "The order's outcome isn't known yet." });
             return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
         }
+        if id == "00000000-0000-0000-0000-000000000ccc" {
+            let body = json!({ "code": "claim_unavailable", "message": "New orders are refused." });
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+        }
         let order = json!({ "id": id, "product_id": "ITEM", "side": "buy", "type": "limit", "size": "1", "price": "10", "filled_size": "0", "status": "open" });
         return (StatusCode::CREATED, Json(order)).into_response();
     }
@@ -1075,6 +1079,12 @@ async fn orders_go_to_the_gateway_as_a_game_server_sends_them() {
         "{error}"
     );
 
+    // Nothing was sent, so this order isn't in doubt.
+    let refused = Uuid::parse_str("00000000-0000-0000-0000-000000000ccc").unwrap();
+    let error = orders.place(&order(refused)).await.unwrap_err();
+    assert!(error.contains("New orders are refused"), "{error}");
+    assert!(!error.contains("unknown"), "{error}");
+
     orders.cancel(Uuid::from_u128(2)).await.unwrap();
     orders
         .list(Some("ITEM"), Some("open"), Some(5))
@@ -1082,7 +1092,7 @@ async fn orders_go_to_the_gateway_as_a_game_server_sends_them() {
         .unwrap();
 
     let requests = log.requests.lock().unwrap();
-    assert_eq!(requests.len(), 4, "an unknown outcome must not be retried");
+    assert_eq!(requests.len(), 5, "an unknown outcome must not be retried");
     let (method, uri, sent_player, body) = &requests[0];
     assert_eq!((method.as_str(), uri.as_str()), ("POST", "/api/v1/orders"));
     assert_eq!(sent_player.as_deref(), Some(player.to_string().as_str()));
@@ -1099,11 +1109,11 @@ async fn orders_go_to_the_gateway_as_a_game_server_sends_them() {
         })
     );
     assert_eq!(
-        requests[2].1,
+        requests[3].1,
         format!("/api/v1/orders/{}", Uuid::from_u128(2))
     );
     assert_eq!(
-        requests[3].1,
+        requests[4].1,
         "/api/v1/orders?product_id=ITEM&status=open&limit=5"
     );
 }

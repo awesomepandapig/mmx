@@ -40,8 +40,9 @@ cluster:
   # The kernel caps this at net.core.rmem_max and wmem_max, which are set on the node.
   socketBuffer: 4m
   logTermLength: 16m
-  # 0 relies on replication. 1 syncs data and 2 also syncs metadata, on every write.
-  archiveSyncLevel: 0
+  # 0 relies on replication. 1 syncs data and 2 also syncs metadata, on every write. At 1 a commit is
+  # on a quorum's disks, so those disks must survive power loss.
+  archiveSyncLevel: 1
   # Any other Aeron properties, which override everything above.
   extraProperties: {}
 
@@ -98,6 +99,7 @@ gateway:
   # Must be free on the pod. Cluster responses arrive here.
   responsePort: 20301
   rustLog: info
+  # For example ORDER_ID_WINDOW_SECS, which is how old a client_order_id may be. Default 60.
   env: {}
   service:
     type: ClusterIP

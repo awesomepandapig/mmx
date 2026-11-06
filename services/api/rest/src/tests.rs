@@ -8,19 +8,18 @@ use super::identity::{PLAYER_HEADER, TrustedGameServer};
 use super::markets::MarketRegistry;
 use super::metrics::Metrics;
 use super::order::{MESSAGE_SIZE, uuid_to_u64s};
-use super::rate_limit::{Decision, RateLimiter, Unlimited};
-use super::repeat::{RepeatGuard, ReportStream};
+use super::order_id::OrderIdRules;
+use super::rate_limit::{Claim, Decision, RateLimiter, Unlimited};
+use super::recorder::ReportStream;
 use super::routes::router;
-use super::store::{
-    OpenOrder, OrderKey, OrderQuery, OrderStore, OrdersCommits, RecordedOrder, RecordedStatus,
-};
+use super::store::{OpenOrder, OrderQuery, OrderStore, OrdersCommits, RecordedOrder, RecordedStatus};
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
@@ -45,7 +44,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const MARKETS: &str = "markets:\n  - {symbol: ITEM, tick_size: \"0.05\", min_size: \"1\", max_size: \"100\"}\n";
-const HOUR: Duration = Duration::from_secs(3600);
+const RULES: OrderIdRules =
+    OrderIdRules { window: Duration::from_secs(60), session_timeout: Duration::from_secs(30) };
 const ADMIN_TOKEN: &str = "test-admin-token";
 
 /// Answers each request in turn, and keeps what it was sent.
@@ -87,11 +87,11 @@ struct FakeStore {
     position: AtomicI64,
     commits_applied: AtomicI64,
     commits_made: AtomicI64,
-    repeat: AtomicBool,
     failing: AtomicBool,
     orders: Mutex<Vec<RecordedOrder>>,
+    /// How many reads miss the orders, as when the recorder hasn't reached them yet.
+    missed_reads: AtomicUsize,
     queries: Mutex<Vec<OrderQuery>>,
-    repeat_checks: AtomicUsize,
     open_in_market: Mutex<Vec<OpenOrder>>,
     market_queries: Mutex<Vec<(String, usize)>>,
 }
@@ -112,17 +112,13 @@ impl OrderStore for FakeStore {
         })
     }
 
-    async fn order_reached_engine(&self, _key: &OrderKey, _window: Duration) -> Result<bool, String> {
-        self.repeat_checks.fetch_add(1, Ordering::Relaxed);
-        Ok(self.repeat.load(Ordering::Relaxed))
-    }
-
     async fn orders(&self, query: &OrderQuery) -> Result<Vec<RecordedOrder>, String> {
         if self.failing.load(Ordering::Relaxed) {
             return Err("down".to_string());
         }
         self.queries.lock().unwrap().push(query.clone());
-        Ok(self.orders.lock().unwrap().clone())
+        let missed = self.missed_reads.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1));
+        Ok(if missed.is_ok() { Vec::new() } else { self.orders.lock().unwrap().clone() })
     }
 
     async fn open_orders_in_market(&self, symbol: &str, limit: usize) -> Result<Vec<OpenOrder>, String> {
@@ -138,8 +134,27 @@ struct FakeLimiter(Result<Decision, String>);
 
 #[async_trait]
 impl RateLimiter for FakeLimiter {
-    async fn check(&self, _player: Uuid) -> Result<Decision, String> {
+    async fn check(&self, _player: Uuid, _claim: Option<Claim>) -> Result<Decision, String> {
         self.0.clone()
+    }
+}
+
+/// Claims the way the script does, in one step that a repeat can't get past.
+#[derive(Default)]
+struct FakeClaims {
+    claimed: Mutex<HashSet<(Uuid, Uuid)>>,
+    counted: AtomicUsize,
+}
+
+#[async_trait]
+impl RateLimiter for FakeClaims {
+    async fn check(&self, player: Uuid, claim: Option<Claim>) -> Result<Decision, String> {
+        let claim = claim.ok_or("the order wasn't claimed")?;
+        if !self.claimed.lock().unwrap().insert((player, claim.id)) {
+            return Ok(Decision::Duplicate);
+        }
+        self.counted.fetch_add(1, Ordering::Relaxed);
+        Ok(Decision::Allowed)
     }
 }
 
@@ -152,6 +167,7 @@ struct Gateway {
     player: Uuid,
     link: Arc<EngineLink>,
     halts: Arc<Halts>,
+    claims_ready: Arc<AtomicBool>,
 }
 
 impl Drop for Gateway {
@@ -163,8 +179,6 @@ impl Drop for Gateway {
 struct Setup {
     outcomes: Vec<OrderOutcome>,
     limiter: Arc<dyn RateLimiter>,
-    /// How long the retry window is. Memory covers a zero window from the start.
-    window: Duration,
     clustered: bool,
     halts: Option<Arc<Halts>>,
     admin_token: Option<String>,
@@ -175,7 +189,6 @@ impl Default for Setup {
         Self {
             outcomes: Vec::new(),
             limiter: Arc::new(Unlimited),
-            window: Duration::ZERO,
             clustered: true,
             halts: None,
             admin_token: Some(ADMIN_TOKEN.to_string()),
@@ -190,24 +203,19 @@ fn gateway(setup: Setup) -> Gateway {
     let markets_file = std::env::temp_dir().join(format!("markets-{}.yaml", Uuid::new_v4()));
     fs::write(&markets_file, MARKETS).unwrap();
 
-    let dyn_store: Arc<dyn OrderStore> = store.clone();
-    let repeats = setup.clustered.then(|| RepeatGuard {
-        stream: stream.clone(),
-        store: dyn_store.clone(),
-        window: setup.window,
-    });
     let link = Arc::new(EngineLink::default());
     link.set(true);
     let halts = setup.halts.unwrap_or_else(|| Arc::new(Halts::standalone()));
+    let claims_ready = Arc::new(AtomicBool::new(true));
     let state = AppState {
         orders: engine.start(),
         auth: Arc::new(TrustedGameServer),
         markets: MarketRegistry::load(&markets_file).unwrap(),
         rate_limiter: setup.limiter,
-        store: dyn_store,
+        store: store.clone(),
         report_stream: setup.clustered.then(|| stream.clone()),
-        repeats,
-        require_client_order_id: setup.clustered,
+        id_rules: setup.clustered.then_some(RULES),
+        claims_ready: setup.clustered.then(|| claims_ready.clone()),
         engine: link.clone(),
         halts: halts.clone(),
         metrics: Metrics::default(),
@@ -222,6 +230,7 @@ fn gateway(setup: Setup) -> Gateway {
         player: Uuid::new_v4(),
         link,
         halts,
+        claims_ready,
     }
 }
 
@@ -299,6 +308,18 @@ fn limit_order(id: Uuid) -> Value {
     })
 }
 
+/// An ID made this long ago.
+fn id_aged(age: Duration) -> Uuid {
+    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    let then = now.saturating_sub(age);
+    Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, then.as_secs(), then.subsec_nanos()))
+}
+
+/// An ID old enough that its order can't land any more.
+fn settled_id() -> Uuid {
+    id_aged(RULES.settled_after() + Duration::from_secs(1))
+}
+
 fn recorded(status: RecordedStatus, price: Option<i64>) -> RecordedOrder {
     RecordedOrder {
         id: Uuid::new_v4(),
@@ -317,7 +338,7 @@ fn recorded(status: RecordedStatus, price: Option<i64>) -> RecordedOrder {
 #[tokio::test]
 async fn an_accepted_order_returns_strings_and_omits_nulls() {
     let gateway = gateway(Setup::default());
-    let id = Uuid::new_v4();
+    let id = Uuid::now_v7();
     let reply = gateway.post(limit_order(id)).await;
 
     assert_eq!(reply.status, StatusCode::CREATED);
@@ -337,7 +358,7 @@ async fn an_accepted_order_returns_strings_and_omits_nulls() {
 async fn a_market_order_has_no_price_field() {
     let gateway = gateway(Setup::default());
     let body = json!({
-        "client_order_id": Uuid::new_v4(), "product_id": "ITEM", "side": "sell", "type": "market", "size": "1",
+        "client_order_id": Uuid::now_v7(), "product_id": "ITEM", "side": "sell", "type": "market", "size": "1",
     });
     let reply = gateway.post(body).await;
     assert_eq!(reply.status, StatusCode::CREATED);
@@ -347,7 +368,7 @@ async fn a_market_order_has_no_price_field() {
 #[tokio::test]
 async fn the_engine_receives_the_players_account_and_exact_values() {
     let gateway = gateway(Setup::default());
-    let id = Uuid::new_v4();
+    let id = Uuid::now_v7();
     gateway.post(limit_order(id)).await;
 
     let message = gateway.engine.message(0);
@@ -366,7 +387,7 @@ async fn the_engine_receives_the_players_account_and_exact_values() {
 #[tokio::test]
 async fn a_player_is_required() {
     let gateway = gateway(Setup::default());
-    let body = limit_order(Uuid::new_v4());
+    let body = limit_order(Uuid::now_v7());
 
     let reply = gateway.send(Method::POST, "/api/v1/orders", None, Some(body.clone())).await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
@@ -390,7 +411,7 @@ async fn a_player_is_required() {
 #[tokio::test]
 async fn bad_requests_never_reach_the_engine() {
     let gateway = gateway(Setup::default());
-    let good = limit_order(Uuid::new_v4());
+    let good = limit_order(Uuid::now_v7());
     let with = |field: &str, value: Value| {
         let mut body = good.clone();
         body[field] = value;
@@ -424,7 +445,7 @@ async fn a_limited_player_is_bounced_before_the_engine() {
         limiter: Arc::new(FakeLimiter(Ok(Decision::Limited { retry_after_ms: 1500 }))),
         ..Default::default()
     });
-    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
+    let reply = gateway.post(limit_order(Uuid::now_v7())).await;
 
     assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(reply.retry_after.as_deref(), Some("2"));
@@ -438,18 +459,144 @@ async fn an_invalid_order_does_not_spend_the_limit() {
         limiter: Arc::new(FakeLimiter(Ok(Decision::Limited { retry_after_ms: 1 }))),
         ..Default::default()
     });
-    let mut body = limit_order(Uuid::new_v4());
+    let mut body = limit_order(Uuid::now_v7());
     body["price"] = json!("1.01");
     assert_eq!(gateway.post(body).await.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
-async fn valkey_being_down_does_not_stop_trading() {
+async fn without_a_cluster_valkey_being_down_does_not_stop_trading() {
     let gateway = gateway(Setup {
+        clustered: false,
         limiter: Arc::new(FakeLimiter(Err("connection refused".to_string()))),
         ..Default::default()
     });
     assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn in_a_cluster_an_unconfirmed_claim_sends_nothing() {
+    let gateway = gateway(Setup {
+        limiter: Arc::new(FakeLimiter(Err("timed out".to_string()))),
+        ..Default::default()
+    });
+    let id = Uuid::now_v7();
+    let reply = gateway.post(limit_order(id)).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.body["code"], "claim_unavailable");
+    assert_eq!(reply.body["id"], id.to_string());
+    assert!(reply.body["details"].as_str().unwrap().contains("Nothing was sent"));
+    assert_eq!(gateway.engine.sent(), 0);
+}
+
+#[tokio::test]
+async fn cancels_work_while_claims_do_not() {
+    let gateway = gateway(Setup {
+        outcomes: vec![OrderOutcome::Canceled],
+        limiter: Arc::new(FakeLimiter(Err("connection refused".to_string()))),
+        ..Default::default()
+    });
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.status, StatusCode::SERVICE_UNAVAILABLE);
+    let uri = format!("/api/v1/orders/{}", Uuid::now_v7());
+    assert_eq!(gateway.call(Method::DELETE, &uri, None).await.status, StatusCode::OK);
+    assert_eq!(gateway.engine.sent(), 1, "only the cancel");
+}
+
+#[tokio::test]
+async fn orders_wait_out_a_lost_claim_store_and_cancels_do_not() {
+    let gateway = gateway(Setup {
+        outcomes: vec![OrderOutcome::Canceled],
+        limiter: Arc::new(FakeLimiter(Ok(Decision::Recovering { retry_after_ms: 2500 }))),
+        ..Default::default()
+    });
+    let reply = gateway.post(limit_order(Uuid::now_v7())).await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.body["code"], "claims_recovering");
+    assert_eq!(reply.retry_after.as_deref(), Some("3"));
+    assert_eq!(gateway.engine.sent(), 0);
+
+    let uri = format!("/api/v1/orders/{}", Uuid::now_v7());
+    assert_eq!(gateway.call(Method::DELETE, &uri, None).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_second_post_of_an_id_places_nothing() {
+    let claims = Arc::new(FakeClaims::default());
+    let gateway = gateway(Setup { limiter: claims.clone(), ..Default::default() });
+    let id = Uuid::now_v7();
+
+    assert_eq!(gateway.post(limit_order(id)).await.status, StatusCode::CREATED);
+    let reply = gateway.post(limit_order(id)).await;
+    assert_eq!(reply.status, StatusCode::CONFLICT);
+    assert_eq!(reply.body["code"], "duplicate_order");
+    assert_eq!(reply.body["id"], id.to_string());
+    assert!(reply.body["details"].as_str().unwrap().contains("placed nothing new"));
+    assert_eq!(gateway.engine.sent(), 1);
+    assert_eq!(claims.counted.load(Ordering::Relaxed), 1, "a repeat isn't a new order");
+}
+
+#[tokio::test]
+async fn simultaneous_posts_of_an_id_place_one_order() {
+    let gateway = Arc::new(gateway(Setup {
+        limiter: Arc::new(FakeClaims::default()),
+        ..Default::default()
+    }));
+    let id = Uuid::now_v7();
+    let posts: Vec<_> = (0..16)
+        .map(|_| {
+            let gateway = gateway.clone();
+            tokio::spawn(async move { gateway.post(limit_order(id)).await.status })
+        })
+        .collect();
+    let mut created = 0;
+    for post in posts {
+        created += usize::from(post.await.unwrap() == StatusCode::CREATED);
+    }
+    assert_eq!(created, 1);
+    assert_eq!(gateway.engine.sent(), 1);
+}
+
+#[tokio::test]
+async fn two_players_can_each_use_an_id() {
+    let gateway = gateway(Setup { limiter: Arc::new(FakeClaims::default()), ..Default::default() });
+    let id = Uuid::now_v7();
+    let (first, second) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+    let uri = "/api/v1/orders";
+    let reply = gateway.send(Method::POST, uri, Some(&first), Some(limit_order(id))).await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+    let reply = gateway.send(Method::POST, uri, Some(&second), Some(limit_order(id))).await;
+    assert_eq!(reply.status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_order_id_must_be_a_fresh_uuid_v7() {
+    let claims = Arc::new(FakeClaims::default());
+    let gateway = gateway(Setup { limiter: claims.clone(), ..Default::default() });
+    let future = Uuid::new_v7(uuid::Timestamp::from_unix(uuid::NoContext, 4_000_000_000, 0));
+    for (id, code) in [
+        (Uuid::new_v4(), "invalid_client_order_id"),
+        (Uuid::nil(), "invalid_client_order_id"),
+        (id_aged(RULES.window + Duration::from_secs(1)), "stale_client_order_id"),
+        (future, "future_client_order_id"),
+    ] {
+        let reply = gateway.post(limit_order(id)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{code}");
+        assert_eq!(reply.body["code"], code);
+        assert_eq!(reply.body["id"], id.to_string());
+    }
+    assert_eq!(gateway.engine.sent(), 0);
+    assert_eq!(claims.counted.load(Ordering::Relaxed), 0, "a refused ID spends nothing");
+}
+
+#[tokio::test]
+async fn valkeys_clock_can_still_refuse_an_id() {
+    let gateway = gateway(Setup {
+        limiter: Arc::new(FakeLimiter(Ok(Decision::OutOfDate))),
+        ..Default::default()
+    });
+    let reply = gateway.post(limit_order(Uuid::now_v7())).await;
+    assert_eq!(reply.body["code"], "stale_client_order_id");
+    assert_eq!(gateway.engine.sent(), 0);
 }
 
 #[tokio::test]
@@ -466,149 +613,40 @@ async fn cancels_are_not_rate_limited() {
 #[tokio::test]
 async fn an_unknown_outcome_is_a_503_with_the_same_id() {
     let gateway = gateway(Setup { outcomes: vec![OrderOutcome::TimedOut], ..Default::default() });
-    let id = Uuid::new_v4();
+    let id = Uuid::now_v7();
     let reply = gateway.post(limit_order(id)).await;
 
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(reply.body["id"], id.to_string());
     assert_eq!(reply.body["code"], "outcome_unknown");
+    let details = reply.body["details"].as_str().unwrap();
+    assert!(details.contains("Do not send this again"), "{details}");
+    assert!(details.contains("on hold"), "{details}");
+    assert!(details.contains("status"), "{details}");
 }
 
 #[tokio::test]
-async fn engine_refusals_say_which_kind_they_are() {
-    let gateway = gateway(Setup {
-        outcomes: vec![OrderOutcome::Rejected, OrderOutcome::Repeat],
-        ..Default::default()
-    });
-
-    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
+async fn an_engine_refusal_says_so() {
+    let gateway = gateway(Setup { outcomes: vec![OrderOutcome::Rejected], ..Default::default() });
+    let reply = gateway.post(limit_order(Uuid::now_v7())).await;
     assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(reply.body["code"], "order_rejected");
-
-    let id = Uuid::new_v4();
-    let reply = gateway.post(limit_order(id)).await;
-    assert_eq!(reply.status, StatusCode::CONFLICT);
-    assert_eq!(reply.body["code"], "repeat_order");
-    assert_eq!(reply.body["id"], id.to_string());
 }
 
 #[tokio::test]
-async fn orders_skip_questdb_once_memory_covers_the_window() {
+async fn placing_an_order_never_touches_questdb() {
     let gateway = gateway(Setup::default());
     gateway.store.failing.store(true, Ordering::Relaxed);
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
-    assert_eq!(gateway.store.repeat_checks.load(Ordering::Relaxed), 0);
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.status, StatusCode::CREATED);
+    assert!(gateway.store.queries.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn after_a_start_a_repeat_is_bounced_from_history() {
-    let gateway = gateway(Setup { window: HOUR, ..Default::default() });
-    gateway.stream.advance_to(4096);
-    gateway.store.position.store(4096, Ordering::Relaxed);
-    gateway.store.repeat.store(true, Ordering::Relaxed);
-
-    let id = Uuid::new_v4();
-    let reply = gateway.post(limit_order(id)).await;
-    assert_eq!(reply.status, StatusCode::CONFLICT);
-    assert_eq!(reply.body["code"], "repeat_order");
-    assert_eq!(reply.body["id"], id.to_string());
-    assert_eq!(gateway.engine.sent(), 0);
-}
-
-#[tokio::test]
-async fn after_a_start_a_new_order_goes_through() {
-    let gateway = gateway(Setup { window: HOUR, ..Default::default() });
-    gateway.stream.advance_to(4096);
-    gateway.store.position.store(8192, Ordering::Relaxed);
-
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
-    assert_eq!(gateway.store.repeat_checks.load(Ordering::Relaxed), 1);
-    assert_eq!(gateway.engine.sent(), 1);
-}
-
-#[tokio::test]
-async fn history_is_not_read_until_the_recorder_catches_up() {
-    let gateway = Arc::new(gateway(Setup { window: HOUR, ..Default::default() }));
-    gateway.stream.advance_to(4096);
-    gateway.store.position.store(1024, Ordering::Relaxed);
-
-    let request = {
-        let gateway = gateway.clone();
-        tokio::spawn(async move { gateway.post(limit_order(Uuid::new_v4())).await.status })
-    };
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(gateway.store.repeat_checks.load(Ordering::Relaxed), 0, "the recorder is behind");
-
-    gateway.store.position.store(4096, Ordering::Relaxed);
-    assert_eq!(request.await.unwrap(), StatusCode::CREATED);
-    assert_eq!(gateway.store.repeat_checks.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
-async fn history_waits_for_rows_written_ahead_of_the_position() {
-    let gateway = Arc::new(gateway(Setup { window: HOUR, ..Default::default() }));
-    gateway.stream.advance_to(4096);
-    gateway.store.position.store(4096, Ordering::Relaxed);
-    gateway.store.commits_applied.store(3, Ordering::Relaxed);
-    gateway.store.commits_made.store(5, Ordering::Relaxed);
-
-    let request = {
-        let gateway = gateway.clone();
-        tokio::spawn(async move { gateway.post(limit_order(Uuid::new_v4())).await.status })
-    };
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(gateway.store.repeat_checks.load(Ordering::Relaxed), 0, "rows aren't applied yet");
-
-    // Later commits don't move the goal, or a busy table could never catch up.
-    gateway.store.commits_made.store(9, Ordering::Relaxed);
-    gateway.store.commits_applied.store(5, Ordering::Relaxed);
-    assert_eq!(request.await.unwrap(), StatusCode::CREATED);
-    assert_eq!(gateway.store.repeat_checks.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_recorder_that_never_catches_up_sends_nothing() {
-    let gateway = gateway(Setup { window: HOUR, ..Default::default() });
-    gateway.stream.advance_to(4096);
-    gateway.store.position.store(1024, Ordering::Relaxed);
-
-    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
-    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(reply.body["code"], "recorder_behind");
-    assert_eq!(gateway.engine.sent(), 0);
-}
-
-#[tokio::test(start_paused = true)]
-async fn questdb_being_down_during_the_window_sends_nothing() {
-    let gateway = gateway(Setup { window: HOUR, ..Default::default() });
-    gateway.stream.advance_to(4096);
-    gateway.store.failing.store(true, Ordering::Relaxed);
-
-    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
-    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(gateway.engine.sent(), 0);
-}
-
-#[tokio::test]
-async fn an_unknown_stream_position_cannot_be_checked() {
-    let gateway = gateway(Setup { window: HOUR, ..Default::default() });
-    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
-    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(gateway.engine.sent(), 0);
-}
-
-#[tokio::test]
-async fn an_empty_stream_has_nothing_to_catch_up_to() {
-    let gateway = gateway(Setup { window: HOUR, ..Default::default() });
-    gateway.stream.advance_to(0);
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
-}
-
-#[tokio::test]
-async fn without_a_cluster_nothing_checks_history() {
-    let gateway = gateway(Setup { clustered: false, window: HOUR, ..Default::default() });
+async fn without_a_cluster_an_id_is_optional_and_any_uuid() {
+    let gateway = gateway(Setup { clustered: false, ..Default::default() });
     gateway.store.failing.store(true, Ordering::Relaxed);
     let mut body = limit_order(Uuid::new_v4());
+    assert_eq!(gateway.post(body.clone()).await.status, StatusCode::CREATED);
     body.as_object_mut().unwrap().remove("client_order_id");
     assert_eq!(gateway.post(body).await.status, StatusCode::CREATED);
 }
@@ -778,11 +816,151 @@ async fn one_order_is_read_for_its_own_player() {
     assert_eq!(queries[0].cl_ord_id, Some(id));
 }
 
+impl Gateway {
+    async fn status(&self, id: Uuid) -> Reply {
+        self.call(Method::GET, &format!("/api/v1/orders/{id}"), None).await
+    }
+
+    /// Every report has been read, and the recorder has caught up.
+    fn recorder_caught_up(&self) {
+        self.stream.advance_to(4096);
+        self.store.position.store(4096, Ordering::Relaxed);
+    }
+
+    fn cancels_sent(&self) -> usize {
+        let received = self.engine.received.lock().unwrap();
+        received.iter().filter(|(request, _)| matches!(request, EngineRequest::Cancel { .. })).count()
+    }
+}
+
+fn answers_marker() -> Setup {
+    Setup { outcomes: vec![OrderOutcome::NotOpen], ..Default::default() }
+}
+
 #[tokio::test]
-async fn a_missing_order_is_a_404() {
+async fn without_a_cluster_a_missing_order_is_a_404() {
+    let gateway = gateway(Setup { clustered: false, ..Default::default() });
+    assert_eq!(gateway.status(Uuid::new_v4()).await.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_fresh_id_with_no_record_is_unknown_not_a_404() {
     let gateway = gateway(Setup::default());
-    let reply = gateway.call(Method::GET, &format!("/api/v1/orders/{}", Uuid::new_v4()), None).await;
-    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    gateway.recorder_caught_up();
+    let id = Uuid::now_v7();
+    let reply = gateway.status(id).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["status"], "unknown");
+    assert_eq!(reply.body["settled"], false);
+    assert_eq!(reply.body["id"], id.to_string());
+    assert!(reply.body["message"].as_str().unwrap().contains("on hold"));
+    assert_eq!(gateway.engine.sent(), 0, "nothing needs proving yet");
+}
+
+/// The session timeout has passed, but a POST of this ID would still be accepted.
+#[tokio::test]
+async fn an_id_that_could_still_be_posted_is_unknown() {
+    let gateway = gateway(answers_marker());
+    gateway.recorder_caught_up();
+    for age in [RULES.session_timeout + Duration::from_secs(1), RULES.window, RULES.settled_after()] {
+        let reply = gateway.status(id_aged(age - Duration::from_secs(1))).await;
+        assert_eq!(reply.body["status"], "unknown", "{age:?}");
+    }
+    assert_eq!(gateway.engine.sent(), 0);
+}
+
+#[tokio::test]
+async fn an_id_past_every_bound_with_no_record_never_landed() {
+    let gateway = gateway(answers_marker());
+    gateway.recorder_caught_up();
+    let reply = gateway.status(settled_id()).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["status"], "never_landed");
+    assert_eq!(reply.body["settled"], true);
+    assert_eq!(gateway.cancels_sent(), 1, "the marker went through the log");
+}
+
+#[tokio::test]
+async fn the_marker_is_an_id_nobody_used_so_it_cancels_nothing() {
+    let gateway = gateway(answers_marker());
+    gateway.recorder_caught_up();
+    let id = settled_id();
+    gateway.status(id).await;
+    let received = gateway.engine.received.lock().unwrap();
+    let EngineRequest::Cancel { order: (account, target), .. } = received[0].0 else {
+        panic!("expected a cancel");
+    };
+    assert_eq!(account, uuid_to_u64s(gateway.player));
+    assert_ne!(target, uuid_to_u64s(id), "a status read must not cancel the order it asks about");
+}
+
+/// The first read can run ahead of the recorder, so only a read after the marker can say no.
+#[tokio::test]
+async fn an_order_that_appears_during_the_proof_is_reported() {
+    let gateway = gateway(answers_marker());
+    gateway.recorder_caught_up();
+    let id = settled_id();
+    let order = RecordedOrder { id, ..recorded(RecordedStatus::Filled, Some(100_000_000)) };
+    *gateway.store.orders.lock().unwrap() = vec![order];
+    gateway.store.missed_reads.store(1, Ordering::Relaxed);
+
+    let reply = gateway.status(id).await;
+    assert_eq!(reply.body["status"], "filled");
+}
+
+#[tokio::test]
+async fn a_cluster_that_cannot_answer_the_marker_proves_nothing() {
+    for outcome in [OrderOutcome::TimedOut, OrderOutcome::Failed("gone".to_string())] {
+        let gateway = gateway(Setup { outcomes: vec![outcome], ..Default::default() });
+        gateway.recorder_caught_up();
+        assert_eq!(gateway.status(settled_id()).await.body["status"], "unknown");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recorder_behind_the_marker_proves_nothing() {
+    let gateway = gateway(answers_marker());
+    gateway.stream.advance_to(4096);
+    gateway.store.position.store(1024, Ordering::Relaxed);
+    assert_eq!(gateway.status(settled_id()).await.body["status"], "unknown");
+}
+
+#[tokio::test(start_paused = true)]
+async fn rows_behind_their_position_prove_nothing() {
+    let gateway = gateway(answers_marker());
+    gateway.recorder_caught_up();
+    gateway.store.commits_applied.store(3, Ordering::Relaxed);
+    gateway.store.commits_made.store(5, Ordering::Relaxed);
+    assert_eq!(gateway.status(settled_id()).await.body["status"], "unknown");
+}
+
+#[tokio::test]
+async fn a_gateway_that_never_read_the_stream_proves_nothing() {
+    let gateway = gateway(answers_marker());
+    assert_eq!(gateway.status(settled_id()).await.body["status"], "unknown");
+}
+
+#[tokio::test]
+async fn questdb_being_down_is_unknown() {
+    let gateway = gateway(answers_marker());
+    gateway.recorder_caught_up();
+    gateway.store.failing.store(true, Ordering::Relaxed);
+    let reply = gateway.status(settled_id()).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body["status"], "unknown");
+    assert_eq!(gateway.engine.sent(), 0);
+}
+
+#[tokio::test]
+async fn an_id_with_no_time_in_it_is_unknown() {
+    let gateway = gateway(answers_marker());
+    gateway.recorder_caught_up();
+    assert_eq!(gateway.status(Uuid::new_v4()).await.body["status"], "unknown");
+}
+
+#[test]
+fn the_never_landed_wait_covers_a_post_at_the_end_of_the_window() {
+    assert!(RULES.settled_after() > RULES.window + RULES.session_timeout);
 }
 
 #[tokio::test]
@@ -797,7 +975,7 @@ async fn reads_fail_cleanly_when_questdb_is_down() {
 #[tokio::test]
 async fn a_reload_changes_which_markets_are_open() {
     let gateway = gateway(Setup::default());
-    let mut body = limit_order(Uuid::new_v4());
+    let mut body = limit_order(Uuid::now_v7());
     body["product_id"] = json!("GEM");
     assert_eq!(gateway.post(body.clone()).await.status, StatusCode::BAD_REQUEST);
 
@@ -809,7 +987,7 @@ async fn a_reload_changes_which_markets_are_open() {
     assert_eq!(reply.body, json!({"markets": ["GEM"]}));
     assert_eq!(gateway.post(body).await.status, StatusCode::CREATED);
 
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::BAD_REQUEST);
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -822,7 +1000,7 @@ async fn a_bad_reload_reports_why_and_keeps_trading() {
     assert_eq!(reply.body["code"], "markets_not_reloaded");
     assert!(reply.body["details"].is_string());
 
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.status, StatusCode::CREATED);
 }
 
 const HALT: &str = "/api/v1/admin/markets/item/halt";
@@ -874,7 +1052,7 @@ async fn without_a_token_admin_is_off_and_trading_is_not() {
         assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(reply.body["code"], "admin_disabled");
     }
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.status, StatusCode::CREATED);
     assert_eq!(gateway.send(Method::GET, "/healthz", None, None).await.status, StatusCode::OK);
 }
 
@@ -891,7 +1069,10 @@ async fn ready_follows_the_engine() {
     let gateway = gateway(Setup::default());
     let reply = gateway.send(Method::GET, "/readyz", None, None).await;
     assert_eq!(reply.status, StatusCode::OK);
-    assert_eq!(reply.body, json!({"ready": true, "checks": {"engine": true, "halts_known": true}}));
+    assert_eq!(
+        reply.body,
+        json!({"ready": true, "checks": {"engine": true, "halts_known": true, "order_claims": true}})
+    );
 
     gateway.link.set(false);
     let reply = gateway.send(Method::GET, "/readyz", None, None).await;
@@ -916,6 +1097,22 @@ async fn ready_shows_valkey_being_down_without_leaving_rotation() {
     assert_eq!(reply.body["ready"], true);
     assert_eq!(reply.body["checks"]["valkey"], false);
     assert_eq!(reply.body["checks"]["halts_known"], true);
+}
+
+#[tokio::test]
+async fn ready_shows_claims_being_down_without_leaving_rotation() {
+    let gateway = gateway(Setup::default());
+    gateway.claims_ready.store(false, Ordering::Relaxed);
+    let reply = gateway.send(Method::GET, "/readyz", None, None).await;
+    assert_eq!(reply.status, StatusCode::OK, "cancels must keep reaching this gateway");
+    assert_eq!(reply.body["checks"]["order_claims"], false);
+}
+
+#[tokio::test]
+async fn without_a_cluster_ready_has_no_claims() {
+    let gateway = gateway(Setup { clustered: false, ..Default::default() });
+    let reply = gateway.send(Method::GET, "/readyz", None, None).await;
+    assert!(reply.body["checks"].get("order_claims").is_none());
 }
 
 #[tokio::test]
@@ -952,7 +1149,7 @@ async fn a_halted_market_refuses_new_orders_with_a_stable_code() {
     assert_eq!(reply.body["symbol"], "ITEM");
     assert_eq!(reply.body["halted"], true);
 
-    let id = Uuid::new_v4();
+    let id = Uuid::now_v7();
     let reply = gateway.post(limit_order(id)).await;
     assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(reply.body["code"], "market_halted");
@@ -961,7 +1158,7 @@ async fn a_halted_market_refuses_new_orders_with_a_stable_code() {
 
     let reply = gateway.admin(Method::POST, RESUME).await;
     assert_eq!(reply.body["halted"], false);
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.status, StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -975,7 +1172,7 @@ async fn a_halt_does_not_touch_other_markets() {
     gateway.admin(Method::POST, "/api/v1/admin/markets/reload").await;
     gateway.admin(Method::POST, HALT).await;
 
-    let mut body = limit_order(Uuid::new_v4());
+    let mut body = limit_order(Uuid::now_v7());
     body["product_id"] = json!("GEM");
     assert_eq!(gateway.post(body).await.status, StatusCode::CREATED);
 }
@@ -1010,7 +1207,7 @@ async fn cancels_work_on_a_gateway_that_never_read_the_halt_list() {
     });
     gateway.halts.refresh().await;
 
-    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
+    let reply = gateway.post(limit_order(Uuid::now_v7())).await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(reply.body["code"], "halt_state_unknown");
     assert_eq!(gateway.engine.sent(), 0);
@@ -1035,7 +1232,7 @@ async fn a_halt_on_one_gateway_reaches_another() {
 
     assert_eq!(first.admin(Method::POST, HALT).await.status, StatusCode::OK);
     second.halts.refresh().await;
-    let reply = second.post(limit_order(Uuid::new_v4())).await;
+    let reply = second.post(limit_order(Uuid::now_v7())).await;
     assert_eq!(reply.body["code"], "market_halted");
     assert_eq!(second.engine.sent(), 0);
 }
@@ -1062,7 +1259,7 @@ async fn a_halt_valkey_never_heard_is_reported_and_in_force_here() {
     let reply = gateway.admin(Method::POST, HALT).await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(reply.body["code"], "halt_not_shared");
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.body["code"], "market_halted");
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.body["code"], "market_halted");
 }
 
 #[tokio::test]
@@ -1076,7 +1273,7 @@ async fn a_resume_valkey_never_heard_keeps_the_market_halted() {
     let reply = gateway.admin(Method::POST, RESUME).await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(reply.body["code"], "market_still_halted");
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.body["code"], "market_halted");
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.body["code"], "market_halted");
 }
 
 #[tokio::test]
@@ -1096,7 +1293,7 @@ async fn a_reload_does_not_lift_a_halt() {
     let gateway = gateway(Setup::default());
     gateway.admin(Method::POST, HALT).await;
     gateway.admin(Method::POST, "/api/v1/admin/markets/reload").await;
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.body["code"], "market_halted");
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.body["code"], "market_halted");
 }
 
 /// Lands a halt during the rate limit check, which sits between the order's two halt checks.
@@ -1104,7 +1301,7 @@ struct HaltingLimiter(Arc<Halts>);
 
 #[async_trait]
 impl RateLimiter for HaltingLimiter {
-    async fn check(&self, _player: Uuid) -> Result<Decision, String> {
+    async fn check(&self, _player: Uuid, _claim: Option<Claim>) -> Result<Decision, String> {
         self.0.halt("ITEM").await?;
         Ok(Decision::Allowed)
     }
@@ -1118,7 +1315,7 @@ async fn a_halt_landing_during_the_checks_still_stops_the_order() {
         halts: Some(halts),
         ..Default::default()
     });
-    let reply = gateway.post(limit_order(Uuid::new_v4())).await;
+    let reply = gateway.post(limit_order(Uuid::now_v7())).await;
     assert_eq!(reply.body["code"], "market_halted");
     assert_eq!(gateway.engine.sent(), 0);
 }
@@ -1127,7 +1324,7 @@ struct CountingLimiter(AtomicUsize);
 
 #[async_trait]
 impl RateLimiter for CountingLimiter {
-    async fn check(&self, _player: Uuid) -> Result<Decision, String> {
+    async fn check(&self, _player: Uuid, _claim: Option<Claim>) -> Result<Decision, String> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(Decision::Allowed)
     }
@@ -1138,7 +1335,7 @@ async fn a_refused_order_does_not_spend_the_limit() {
     let limiter = Arc::new(CountingLimiter(AtomicUsize::new(0)));
     let gateway = gateway(Setup { limiter: limiter.clone(), ..Default::default() });
     gateway.admin(Method::POST, HALT).await;
-    gateway.post(limit_order(Uuid::new_v4())).await;
+    gateway.post(limit_order(Uuid::now_v7())).await;
     assert_eq!(limiter.0.load(Ordering::Relaxed), 0);
 }
 
@@ -1187,7 +1384,7 @@ async fn market_cancel_all_does_not_halt() {
     gateway.stream.advance_to(0);
     gateway.admin(Method::POST, CANCEL_ALL).await;
     assert!(!gateway.halts.is_halted("ITEM"));
-    assert_eq!(gateway.post(limit_order(Uuid::new_v4())).await.status, StatusCode::CREATED);
+    assert_eq!(gateway.post(limit_order(Uuid::now_v7())).await.status, StatusCode::CREATED);
 }
 
 #[tokio::test]
@@ -1237,13 +1434,13 @@ async fn metrics_count_orders_by_what_happened() {
         outcomes: vec![OrderOutcome::Accepted, OrderOutcome::Rejected],
         ..Default::default()
     });
-    gateway.post(limit_order(Uuid::new_v4())).await;
-    gateway.post(limit_order(Uuid::new_v4())).await;
-    let mut bad = limit_order(Uuid::new_v4());
+    gateway.post(limit_order(Uuid::now_v7())).await;
+    gateway.post(limit_order(Uuid::now_v7())).await;
+    let mut bad = limit_order(Uuid::now_v7());
     bad["price"] = json!("1.01");
     gateway.post(bad).await;
     gateway.admin(Method::POST, HALT).await;
-    gateway.post(limit_order(Uuid::new_v4())).await;
+    gateway.post(limit_order(Uuid::now_v7())).await;
 
     let reply = gateway.send(Method::GET, "/metrics", None, None).await;
     assert_eq!(reply.status, StatusCode::OK);
@@ -1253,19 +1450,6 @@ async fn metrics_count_orders_by_what_happened() {
     assert!(reply.text.contains("{reason=\"invalid\"} 1\n"), "{}", reply.text);
     assert!(reply.text.contains("mmx_gateway_halted_rejects_total 1\n"), "{}", reply.text);
     assert!(reply.text.contains("mmx_gateway_orders_in_flight 0\n"), "{}", reply.text);
-}
-
-#[test]
-fn memory_covers_a_window_only_once_it_has_been_reading_for_that_long() {
-    let stream = ReportStream::default();
-    assert!(stream.covers(Duration::ZERO));
-    assert!(!stream.covers(HOUR));
-
-    std::thread::sleep(Duration::from_millis(20));
-    assert!(stream.covers(Duration::from_millis(10)));
-
-    stream.covered_since(std::time::Instant::now());
-    assert!(!stream.covers(Duration::from_millis(10)), "losing the stream starts again");
 }
 
 #[test]

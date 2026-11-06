@@ -11,7 +11,7 @@ enum Reason {
     Invalid,
     RateLimited,
     EngineRejected,
-    RepeatOrder,
+    DuplicateOrder,
     OutcomeUnknown,
     Unavailable,
     Internal,
@@ -21,7 +21,7 @@ const REASONS: [(Reason, &str); 7] = [
     (Reason::Invalid, "invalid"),
     (Reason::RateLimited, "rate_limited"),
     (Reason::EngineRejected, "engine_rejected"),
-    (Reason::RepeatOrder, "repeat_order"),
+    (Reason::DuplicateOrder, "duplicate_order"),
     (Reason::OutcomeUnknown, "outcome_unknown"),
     (Reason::Unavailable, "unavailable"),
     (Reason::Internal, "internal"),
@@ -32,12 +32,18 @@ fn reason(error: &AppError) -> Reason {
         AppError::InvalidSide
         | AppError::InvalidOrderType
         | AppError::ValidationError(_)
-        | AppError::JsonDeserializationError(_) => Reason::Invalid,
+        | AppError::JsonDeserializationError(_)
+        | AppError::InvalidOrderId(_)
+        | AppError::StaleOrderId(_)
+        | AppError::FutureOrderId(_) => Reason::Invalid,
         AppError::RateLimited { .. } => Reason::RateLimited,
         AppError::OrderRejected(_) => Reason::EngineRejected,
-        AppError::RepeatOrder(_) => Reason::RepeatOrder,
+        AppError::DuplicateOrder(_) => Reason::DuplicateOrder,
         AppError::OrderOutcomeUnknown(_) => Reason::OutcomeUnknown,
-        AppError::RecorderBehind | AppError::HaltStateUnknown => Reason::Unavailable,
+        AppError::RecorderBehind
+        | AppError::HaltStateUnknown
+        | AppError::ClaimUnavailable(_)
+        | AppError::ClaimsRecovering { .. } => Reason::Unavailable,
         _ => Reason::Internal,
     }
 }

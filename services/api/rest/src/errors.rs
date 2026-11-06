@@ -19,8 +19,19 @@ pub enum AppError {
     Unauthenticated(String),
     /// The engine refused the order and it can't execute, so any escrow can be released.
     OrderRejected(Uuid),
-    /// This client order ID already reached the engine, so the order must not be sent again.
-    RepeatOrder(Uuid),
+    /// Another request claimed this client order ID. This one placed nothing, but that says nothing
+    /// about what became of the first, so any escrow stays held until its status is known.
+    DuplicateOrder(Uuid),
+    /// Not a UUIDv7. Nothing was sent.
+    InvalidOrderId(Uuid),
+    /// Older than the window, so it could be a replay. Nothing was sent.
+    StaleOrderId(Uuid),
+    /// Dated further ahead than clocks can differ. Nothing was sent.
+    FutureOrderId(Uuid),
+    /// The claim couldn't be confirmed, so the order wasn't sent.
+    ClaimUnavailable(Uuid),
+    /// The claim store lost its data, so new orders wait until no lost claim can matter.
+    ClaimsRecovering { id: Uuid, retry_after_ms: u64 },
     OrderOutcomeUnknown(Uuid),
     RateLimited { retry_after_ms: u64 },
     /// The recorder hasn't caught up, so a check that relies on it can't be trusted yet.
@@ -79,7 +90,9 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let retry_after = match &self {
             // Retry-After is in whole seconds, so round up.
-            AppError::RateLimited { retry_after_ms } => Some(retry_after_ms.div_ceil(1000).max(1)),
+            AppError::RateLimited { retry_after_ms } | AppError::ClaimsRecovering { retry_after_ms, .. } => {
+                Some(retry_after_ms.div_ceil(1000).max(1))
+            }
             _ => None,
         };
 
@@ -102,14 +115,39 @@ impl IntoResponse for AppError {
                     .details("It will not execute.")
                     .id(id)
             }
-            AppError::RepeatOrder(id) => {
-                body(StatusCode::CONFLICT, "repeat_order", "This client order ID has already been used.")
-                    .details("The original order reached the engine. This request placed nothing.")
+            AppError::DuplicateOrder(id) => {
+                body(StatusCode::CONFLICT, "duplicate_order", "This client order ID has already been used.")
+                    .details("This request placed nothing new. Keep any funds on hold and ask for this order's status to learn what became of the first request.")
+                    .id(id)
+            }
+            AppError::InvalidOrderId(id) => {
+                body(StatusCode::BAD_REQUEST, "invalid_client_order_id", "client_order_id must be a UUIDv7.")
+                    .details("Nothing was sent to the engine.")
+                    .id(id)
+            }
+            AppError::StaleOrderId(id) => {
+                body(StatusCode::BAD_REQUEST, "stale_client_order_id", "This client order ID is too old to accept.")
+                    .details("Nothing was sent to the engine. To place an order, make a new client_order_id.")
+                    .id(id)
+            }
+            AppError::FutureOrderId(id) => {
+                body(StatusCode::BAD_REQUEST, "future_client_order_id", "This client order ID is dated in the future.")
+                    .details("Nothing was sent to the engine. Check this clock, then make a new client_order_id.")
+                    .id(id)
+            }
+            AppError::ClaimUnavailable(id) => {
+                body(StatusCode::SERVICE_UNAVAILABLE, "claim_unavailable", "New orders are refused because a duplicate can't be ruled out right now.")
+                    .details("Nothing was sent to the engine. Cancels still work. To try again, make a new client_order_id.")
+                    .id(id)
+            }
+            AppError::ClaimsRecovering { id, .. } => {
+                body(StatusCode::SERVICE_UNAVAILABLE, "claims_recovering", "New orders are paused while the claim store recovers.")
+                    .details("Nothing was sent to the engine. Cancels still work. To try again, wait for Retry-After and make a new client_order_id.")
                     .id(id)
             }
             AppError::OrderOutcomeUnknown(id) => {
-                body(StatusCode::SERVICE_UNAVAILABLE, "outcome_unknown", "The order's outcome isn't known yet.")
-                    .details("Retry with the same client_order_id.")
+                body(StatusCode::SERVICE_UNAVAILABLE, "outcome_unknown", "The outcome isn't known yet.")
+                    .details("Do not send this again. Keep any funds on hold and ask for this order's status.")
                     .id(id)
             }
             AppError::RateLimited { .. } => {

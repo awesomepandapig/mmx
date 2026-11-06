@@ -5,6 +5,7 @@ use super::errors::AppError;
 use super::identity::Player;
 use super::markets::Markets;
 use super::order::{SymbolType, UuidType, uuid_to_u64s};
+use super::order_id::OrderIdRules;
 
 use sbe::{ord_type_enum::OrdTypeEnum, side_enum::SideEnum};
 
@@ -15,7 +16,8 @@ use uuid::Uuid;
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CreateOrder {
-    /// Chosen by the game server, so a retry can't create a second order.
+    /// Chosen by the game server, and how it finds the order later. Required in cluster mode, where
+    /// it must be a fresh UUIDv7. Callers never retry, and a replay of this ID places nothing.
     pub client_order_id: Option<Uuid>,
     pub product_id: String,
     pub side: String,
@@ -43,14 +45,17 @@ pub fn validate_order(
     payload: &CreateOrder,
     player: Player,
     markets: &Markets,
-    require_client_order_id: bool,
+    id_rules: Option<&OrderIdRules>,
+    now_ms: u64,
 ) -> Result<ValidOrder, AppError> {
-    let cl_ord_id = match payload.client_order_id {
-        Some(id) => uuid_to_u64s(id),
-        None if require_client_order_id => {
-            return Err(validation_error("client_order_id is required."));
+    let cl_ord_id = match (payload.client_order_id, id_rules) {
+        (Some(id), Some(rules)) => {
+            rules.check(id, now_ms)?;
+            uuid_to_u64s(id)
         }
-        None => uuid_to_u64s(Uuid::new_v4()),
+        (Some(id), None) => uuid_to_u64s(id),
+        (None, Some(_)) => return Err(validation_error("client_order_id is required.")),
+        (None, None) => uuid_to_u64s(Uuid::new_v4()),
     };
 
     let symbol = super::markets::normalize_symbol(&payload.product_id).map_err(validation_error)?;
@@ -127,14 +132,23 @@ pub fn validate_order(
 mod tests {
     use super::*;
 
+    use std::time::{Duration, SystemTime};
+
     const MARKETS: &str = r#"
 markets:
   - {symbol: ITEM, tick_size: "0.05", min_size: "1", max_size: "100"}
 "#;
 
+    const RULES: OrderIdRules =
+        OrderIdRules { window: Duration::from_secs(60), session_timeout: Duration::from_secs(30) };
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
     fn limit(price: &str, size: &str) -> CreateOrder {
         CreateOrder {
-            client_order_id: Some(Uuid::new_v4()),
+            client_order_id: Some(Uuid::now_v7()),
             product_id: "item".to_string(),
             side: "buy".to_string(),
             r#type: "limit".to_string(),
@@ -145,7 +159,8 @@ markets:
 
     fn check(order: &CreateOrder) -> Result<ValidOrder, String> {
         let markets = Markets::parse(MARKETS).unwrap();
-        validate_order(order, Player(Uuid::nil()), &markets, true).map_err(|err| format!("{err:?}"))
+        validate_order(order, Player(Uuid::nil()), &markets, Some(&RULES), now_ms())
+            .map_err(|err| format!("{err:?}"))
     }
 
     #[test]
@@ -165,7 +180,7 @@ markets:
     fn the_account_is_the_player() {
         let player = Player(Uuid::new_v4());
         let markets = Markets::parse(MARKETS).unwrap();
-        let order = validate_order(&limit("1", "1"), player, &markets, true).unwrap();
+        let order = validate_order(&limit("1", "1"), player, &markets, Some(&RULES), now_ms()).unwrap();
         assert_eq!(order.account, uuid_to_u64s(player.0));
     }
 
@@ -223,6 +238,16 @@ markets:
         assert!(check(&order).unwrap_err().contains("client_order_id"));
 
         let markets = Markets::parse(MARKETS).unwrap();
-        assert!(validate_order(&order, Player(Uuid::nil()), &markets, false).is_ok());
+        assert!(validate_order(&order, Player(Uuid::nil()), &markets, None, now_ms()).is_ok());
+    }
+
+    #[test]
+    fn only_cluster_mode_insists_on_a_fresh_uuid_v7() {
+        let mut order = limit("1", "1");
+        order.client_order_id = Some(Uuid::new_v4());
+        assert!(check(&order).unwrap_err().contains("InvalidOrderId"));
+
+        let markets = Markets::parse(MARKETS).unwrap();
+        assert!(validate_order(&order, Player(Uuid::nil()), &markets, None, now_ms()).is_ok());
     }
 }
