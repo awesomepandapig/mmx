@@ -17,15 +17,22 @@ rm -rf "$context"
 mkdir -p "$context"
 git ls-files -z --cached --others --exclude-standard | rsync -a --from0 --files-from=- ./ "$context/"
 
+# BuildKit sets this under Bake, but `container build` doesn't, and the toolchain stage needs it.
+case "$(uname -m)" in
+    arm64 | aarch64) arch=arm64 ;;
+    *) arch=amd64 ;;
+esac
+
 build() {
     image=$1
     shift
     echo "building mmx/$image:$tag"
-    container build --file "$context/deploy/docker/Dockerfile" --tag "mmx/$image:$tag" "$@" "$context"
+    container build --file "$context/deploy/docker/Dockerfile" --tag "mmx/$image:$tag" \
+        --build-arg "TARGETARCH=$arch" "$@" "$context"
 }
 
 if [ "$#" -eq 0 ]; then
-    set -- node matching-engine api websocket market-data trade-reporter web
+    set -- node matching-engine api mmx outbox websocket market-data trade-reporter web
 fi
 
 for image in "$@"; do

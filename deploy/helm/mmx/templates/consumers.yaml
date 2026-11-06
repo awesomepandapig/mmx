@@ -7,6 +7,25 @@
 {{- $name := printf "%s-%s" (include "mmx.fullname" $root) $component -}}
 {{- $labels := dict "root" $root "component" $component -}}
 {{- $persistence := $consumer.persistence | default dict }}
+{{- if $persistence.size }}
+---
+# A StatefulSet needs this, and the console reads the outbox's status through it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  {{- if eq $component "outbox" }}
+  ports:
+    - name: status
+      port: 8092
+  {{- end }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: {{ if $persistence.size }}StatefulSet{{ else }}Deployment{{ end }}
@@ -49,6 +68,21 @@ spec:
               value: "1002"
             - name: RUST_LOG
               value: {{ $consumer.rustLog | default "info" | quote }}
+            {{- if eq $component "outbox" }}
+            # Read at start, so a change needs a restart. It waits for these on a new install.
+            - name: WEBHOOK_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "mmx.configName" $root }}
+                  key: WEBHOOK_URL
+                  optional: true
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "mmx.controlSecretName" $root }}
+                  key: WEBHOOK_SECRET
+                  optional: true
+            {{- end }}
             {{- range $key, $value := $consumer.env }}
             - name: {{ $key }}
               value: {{ $value | quote }}

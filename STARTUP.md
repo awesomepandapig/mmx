@@ -16,7 +16,7 @@ services haven't been run there. Steps marked untested haven't been tried.
 | CMake | 4.4.5 (3.30 or newer required) | `rusteron` and the Aeron driver |
 | Clang | Apple clang 17 | `rusteron` bindings and the Aeron driver |
 | Aeron | 1.54.0 (must match `rusteron-client`) | Media driver |
-| Node / npm | 23.11.0 / 10.9.2 | `auth`, `web`, `docs` |
+| Node / npm | 23.11.0 / 10.9.2 | `auth`, `web`, `docs`, `console` |
 | Python | 3, standard library only | `tools/scripts/sbx.py` |
 | Java | OpenJDK 23 | Cluster nodes |
 | Apple `container` | 1.6.1 | Infrastructure on macOS |
@@ -89,8 +89,12 @@ for `tools/scripts/sbx.py`.
 cd ~/Projects/sbx
 cargo build --workspace --release
 cargo build -p matching-engine --profile dist --features silent   # cluster mode only
-for app in auth web docs; do (cd "$app" && npm ci); done
+for app in auth web docs console; do (cd "$app" && npm ci); done
+(cd console && npm run build)                                     # embedded in `mmx`, so before cargo
+cargo build -p mmx --release
 ```
+
+Without a `console/dist`, `mmx` still builds, and `mmx serve` says the console wasn't built.
 
 Cluster mode also needs Aeron's Java nodes. Download them to `.run/`, or set `AERON_JAR`:
 
@@ -197,9 +201,10 @@ tools/scripts/sbx.py down                  # add --all to remove the infrastruct
 | What | Where |
 |---|---|
 | Client Aeron driver | `AERON_DIR=/Volumes/DevShm/cluster-client` |
-| Gateway | <http://localhost:8000>, with markets from `tools/local/markets.yaml` |
+| Console | <http://127.0.0.1:8093>, served by `mmx serve` |
+| Gateway | <http://localhost:8000>, with markets from `.run/mmx/markets.yaml` |
 | Websocket | `ws://127.0.0.1:8090` |
-| Outbox | Settings in `tools/local/outbox.env`, journal in `.run/outbox`, status on <http://127.0.0.1:8092/position> |
+| Outbox | Settings in `tools/local/outbox.env`, then `.run/mmx/outbox.env` if the console saved any, journal in `.run/outbox`, status on <http://127.0.0.1:8092/position> |
 | QuestDB | `sbx-cluster-questdb`, console on <http://localhost:9100> |
 | Valkey | `sbx-valkey` on port 6379 |
 | NATS | `sbx-nats` on port 4222, shared with standalone mode |
@@ -213,6 +218,32 @@ and `CREATE TABLE IF NOT EXISTS` leaves them as they are. `sbx-questdb` is untou
 The webhook URL has nothing listening on it except during `e2e`. That's safe: the outbox holds every
 event and retries, backing off to 30 seconds. So the first `e2e` delivery can take that long, and it
 also receives whatever built up since the last run.
+
+### The console demo
+
+Create a market in the console, send it orders from a small Python client, and watch them arrive.
+
+```sh
+tools/scripts/sbx.py up --cluster         # prints the console's address and first password
+target/release/mmx webhook listen --port 8095 --secret local-development-secret   # optional game
+```
+
+1. Open <http://127.0.0.1:8093>, sign in with the first password and choose a real one. The first
+   password is only printed on the first start. `MMX_ADMIN_TOKEN=dev target/release/mmx auth
+   reset-password` issues another.
+2. Under Markets, choose New market, and create `IRON` with a tick size of `0.01`.
+3. Open Activity, then in another terminal trade between two players:
+
+   ```sh
+   tools/demo/mmx_client.py --symbol IRON trade
+   ```
+
+`MMX_ADMIN_TOKEN` is `dev` here unless you set another. Console edits go to `.run/mmx`, so they don't
+touch `tools/local`, which only provides the first copy. `rm -rf .run/mmx` starts the console from
+scratch, including its password. `tools/scripts/sbx.py restart outbox` applies a saved webhook.
+
+`console/` has `npm run dev` on port 5190, which proxies the API. Set `MMX_URL` to use a server other
+than `http://127.0.0.1:8093`.
 
 To send orders by hand, name a player and a unique `client_order_id`. Both are UUIDs:
 

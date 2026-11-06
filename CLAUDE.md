@@ -24,7 +24,7 @@ Run `tools/scripts/sbx.py verify` after changing `matching-engine` or `market-da
 
 Day to day, use `cargo test` and a short `verify`. Only run `tools/scripts/bench.py` when asked: it takes minutes, and it isn't part of the normal development loop. Its digest proves the engine's output didn't change, which helps for risky engine refactors. Baselines only compare fairly on the machine that made them, at the same tape and `--max-orders`. Other work on the machine skews throughput.
 
-`auth`, `web` and `docs` are separate npm projects with no root workspace. `web` and `docs` have `npm run dev`, `build`, `lint`, `fmt` and `typecheck`. `auth` has `dev`, `build`, `lint`, `fmt` and `start`. `auth`'s `build` also runs `fmt`, which rewrites files.
+`auth`, `web`, `docs` and `console` are separate npm projects with no root workspace. `web`, `docs` and `console` have `npm run dev`, `build`, `lint`, `fmt` and `typecheck`. `auth` has `dev`, `build`, `lint`, `fmt` and `start`. `auth`'s `build` also runs `fmt`, which rewrites files.
 
 ## Architecture
 
@@ -34,6 +34,7 @@ matching-engine --(aeron MDC, stream 1002: ExecutionReport)--> market-data, trad
 market-data --(NATS subjects "l2.<symbol>", "ticker.<symbol>", "candles.<symbol>")--> websocket --> browser
 outbox --(signed webhooks)--> game
 trade-reporter --> QuestDB (tables are created on first write)
+mmx serve --(admin API, console)--> gateways, outbox, QuestDB; settings in files or one ConfigMap and Secret
 observer --(OTLP)--> collector
 auth (better-auth + Express) --> Postgres; not connected to api yet
 ```
@@ -62,4 +63,5 @@ auth (better-auth + Express) --> Postgres; not connected to api yet
 - See "What doesn't work yet" in `STARTUP.md` for known gaps.
 - `tracing`'s `max_level_*` features are ignored in release builds; use `release_max_level_*`.
 - `tests/` is in `.gitignore`, so new top-level test directories won't show up in git without `-f`.
+- `mmx` embeds `console/dist` when it compiles, so rebuild the console first, then `mmx`.
 - Port 8080 is used by another project on the owner's Mac. `tools/scripts/sbx.py` uses 8090 there.

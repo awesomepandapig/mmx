@@ -2,7 +2,8 @@
 {{- $fullname := include "mmx.fullname" . -}}
 {{- $instance := dict "app.kubernetes.io/name" "mmx" "app.kubernetes.io/instance" .Release.Name -}}
 {{- $nodes := dict "root" . "component" "node" -}}
-{{- $gateways := dict "root" . "component" "gateway" }}
+{{- $gateways := dict "root" . "component" "gateway" -}}
+{{- $console := dict "root" . "component" "console" }}
 # Only game servers reach gateways. Aeron replies on ephemeral UDP ports, so UDP is allowed by peer
 # instead of by port.
 apiVersion: networking.k8s.io/v1
@@ -22,6 +23,9 @@ spec:
           port: 8000
       from:
         {{- toYaml .Values.networkPolicy.gameServers | nindent 8 }}
+        - podSelector:
+            matchLabels:
+              {{- include "mmx.selectorLabels" $console | nindent 14 }}
         {{- if and .Values.demo.enabled .Values.ui.enabled }}
         - podSelector:
             matchLabels:
@@ -90,6 +94,14 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "mmx.selectorLabels" $nodes | nindent 14 }}
+    # The outbox's status, which `mmx serve` reads. It has no auth, so nothing else may.
+    - ports:
+        - protocol: TCP
+          port: 8092
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "mmx.selectorLabels" $console | nindent 14 }}
 ---
 # NATS, QuestDB and Valkey only serve this release.
 apiVersion: networking.k8s.io/v1

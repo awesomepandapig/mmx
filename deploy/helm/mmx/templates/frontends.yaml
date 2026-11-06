@@ -157,16 +157,23 @@ spec:
 {{- end }}
 {{- if .Values.demo.enabled }}
 {{- $labels := dict "root" . "component" "demo" }}
+{{- $demoName := printf "%s-demo" $fullname }}
+{{- $demo := lookup "v1" "Secret" .Release.Namespace $demoName }}
 ---
+# Generated once and kept across upgrades. Read it with kubectl: there's no default.
 apiVersion: v1
 kind: Secret
 metadata:
-  name: {{ $fullname }}-demo
+  name: {{ $demoName }}
   labels:
     {{- include "mmx.labels" $labels | nindent 4 }}
-stringData:
-  DEMO_USERNAME: {{ .Values.demo.credentials.username | quote }}
-  DEMO_PASSWORD: {{ .Values.demo.credentials.password | quote }}
+data:
+{{- if $demo }}
+  {{- toYaml $demo.data | nindent 2 }}
+{{- else }}
+  DEMO_USERNAME: {{ "demo" | b64enc | quote }}
+  DEMO_PASSWORD: {{ randAlphaNum 32 | b64enc | quote }}
+{{- end }}
 {{- if .Values.demo.bots.enabled }}
 {{- $bots := .Values.demo.bots }}
 ---
@@ -207,15 +214,4 @@ spec:
           resources:
             {{- include "mmx.resources" (dict "resources" $bots.resources "guaranteed" false) | nindent 12 }}
 {{- end }}
-{{- end }}
-{{- if .Values.secrets.values }}
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ include "mmx.secretName" . }}
-  labels:
-    {{- include "mmx.labels" (dict "root" . "component" "secrets") | nindent 4 }}
-stringData:
-  {{- toYaml .Values.secrets.values | nindent 2 }}
 {{- end }}

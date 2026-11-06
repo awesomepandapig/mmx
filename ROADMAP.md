@@ -151,8 +151,10 @@ Owns the new `deploy/`.
 - [x] Per-market halt, so operators can stop trading in one market at once, such as during a dupe
 - [x] Per-market cancel-all, across every player
 - [x] `mmx` CLI: status, health, markets and config
-- [ ] Console: auth setup, API keys and a YAML market editor backed by the Kubernetes API
-- [ ] Seed the markets ConfigMap only when it's missing, so `helm upgrade` can't overwrite console edits
+- [x] Console: first-run setup, sessions and OIDC login, and a YAML market editor backed by the Kubernetes API
+- [x] Seed the markets ConfigMap only when it's missing, so `helm upgrade` can't overwrite console edits
+- [x] `mmx` in the chart, with RBAC limited to one ConfigMap and one Secret by name
+- [ ] Console API keys
 
 ### 8. Demo and public face
 

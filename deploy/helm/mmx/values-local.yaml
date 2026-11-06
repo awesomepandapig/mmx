@@ -73,6 +73,18 @@ consumers:
     resources:
       cpu: 250m
       memory: 256Mi
+  outbox:
+    persistence:
+      size: 1Gi
+    resources:
+      cpu: 250m
+      memory: 256Mi
+
+console:
+  replicas: 1
+  resources:
+    cpu: 100m
+    memory: 128Mi
 
 websocket:
   replicas: 1
