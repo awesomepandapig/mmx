@@ -175,6 +175,7 @@ export function Webhooks() {
               canEdit && (
                 <Button
                   tone={current?.secret_hint ? "danger" : "primary"}
+                  disabled={!current}
                   onClick={() => setConfirming(true)}
                 >
                   {current?.secret_hint ? "Replace secret" : "Generate secret"}

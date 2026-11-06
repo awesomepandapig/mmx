@@ -86,6 +86,7 @@ export function useTape(filter: TapeFilter, paused: boolean) {
 
   const handlers = useMemo(
     () => ({
+      ready: () => {},
       order: (row: OrderRow) => push({ ...row, kind: "order" }),
       trade: (row: TradeRow) => push({ ...row, kind: "trade" }),
       sample: ({ seen, sent }: { seen: number; sent: number }) => {

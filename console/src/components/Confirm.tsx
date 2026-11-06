@@ -44,6 +44,8 @@ export function Confirm({
 
   const signIn = !!stepUp && (refused || needsSignIn(session));
   const viaProvider = session?.method === "oidc";
+  // Coming back from the provider means doing this again, so nothing is asked for before that.
+  const leaving = signIn && viaProvider;
   const blocked = (word !== undefined && typed.toUpperCase() !== word) || (signIn && !password);
 
   async function submit(event: FormEvent) {
@@ -69,7 +71,7 @@ export function Confirm({
   return (
     <Modal open title={title} description={body} onClose={onClose}>
       <form onSubmit={(event) => void submit(event)} className="space-y-4">
-        {word !== undefined && (
+        {word !== undefined && !leaving && (
           <Field
             label={`Type ${word} to confirm`}
             autoComplete="off"
@@ -78,7 +80,7 @@ export function Confirm({
             onChange={(event) => setTyped(event.target.value)}
           />
         )}
-        {signIn && !viaProvider && (
+        {signIn && !leaving && (
           <Field
             label="Your password"
             type="password"
@@ -88,7 +90,7 @@ export function Confirm({
             onChange={(event) => setPassword(event.target.value)}
           />
         )}
-        {signIn && viaProvider && (
+        {leaving && (
           <Notice title={`Sign in again with ${session?.oidc?.label ?? "your provider"}`}>
             Then repeat this.
           </Notice>
@@ -96,7 +98,7 @@ export function Confirm({
         {failure && <Notice state="bad">{failure}</Notice>}
         <div className="flex justify-end gap-2">
           <Button onClick={onClose}>Cancel</Button>
-          {signIn && viaProvider ? (
+          {leaving ? (
             <a href={back} className={buttonClass("primary")}>
               Continue
             </a>

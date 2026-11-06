@@ -399,7 +399,7 @@ pub fn sse(
         },
     )
     .take_until(sleep(STREAM_LIFETIME));
-    Sse::new(events).keep_alive(KeepAlive::default())
+    Sse::new(crate::events::ready().chain(events)).keep_alive(KeepAlive::default())
 }
 
 #[cfg(test)]

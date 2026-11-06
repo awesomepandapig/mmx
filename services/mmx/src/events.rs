@@ -360,7 +360,13 @@ pub fn sse(
         },
     )
     .take_until(sleep(STREAM_LIFETIME));
-    Sse::new(events).keep_alive(KeepAlive::default())
+    Sse::new(ready().chain(events)).keep_alive(KeepAlive::default())
+}
+
+/// Sent first. A quiet filter can go a long time without a row, and until something is written the
+/// browser can't tell this stream is open.
+pub fn ready() -> impl Stream<Item = Result<Event, Infallible>> {
+    stream::once(async { Ok(Event::default().event("ready").data("{}")) })
 }
 
 #[cfg(test)]

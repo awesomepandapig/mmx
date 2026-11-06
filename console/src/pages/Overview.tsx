@@ -84,7 +84,11 @@ export function Overview() {
   const counts = markets.data?.counts;
   const delivery = webhooks.data ? webhookWords[webhooks.data.state] : null;
   const rate = summary.data?.reports_per_minute ?? [];
-  const latest = rate.length ? rate[rate.length - 1].reports : null;
+  // The newest bucket is the minute still running, so the one before it is the last whole one.
+  const lastMinute = Math.floor(Date.now() / 60000) - 1;
+  const latest = rate.find(
+    (point) => Math.floor(new Date(point.time).getTime() / 60000) === lastMinute,
+  );
 
   return (
     <Page>
@@ -119,7 +123,7 @@ export function Overview() {
         <Tile
           label="Reports, last minute"
           to="/activity"
-          value={summary.data ? count(latest ?? 0) : summary.error ? "-" : null}
+          value={summary.data ? count(latest?.reports ?? 0) : summary.error ? "-" : null}
         />
         <Tile
           label="Webhook backlog"
@@ -158,6 +162,8 @@ export function Overview() {
           <SectionTitle className="p-4 pb-2">Busiest markets, past hour</SectionTitle>
           {summary.loading ? (
             <SkeletonRows rows={4} />
+          ) : summary.error && !summary.data ? (
+            <ErrorState title="Can't read the tape" />
           ) : summary.data?.busiest.length ? (
             <ul className="min-h-0 flex-1 overflow-y-auto">
               {summary.data.busiest.map((market) => (
@@ -182,6 +188,8 @@ export function Overview() {
         <SectionTitle className="px-4 pb-1 pt-3">Services</SectionTitle>
         {status.loading ? (
           <SkeletonRows rows={5} />
+        ) : !status.data ? (
+          <ErrorState title="Can't read services" onRetry={() => void status.refresh()} />
         ) : (
           <TableFrame>
             <table className="w-full min-w-[620px] text-left text-sm">

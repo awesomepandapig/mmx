@@ -263,11 +263,6 @@ function Gateways({ market }: { market: Market }) {
   );
 }
 
-function logMessage(row: TapeRow) {
-  const price = row.price ?? "market";
-  return `${row.size ?? "-"} @ ${price}  player ${short(row.player)}  order ${short(row.client_order_id)}`;
-}
-
 function LogLine({
   row,
   selected,
@@ -287,7 +282,7 @@ function LogLine({
       onClick={onOpen}
       aria-pressed={selected}
       className={cn(
-        "tabular grid h-full w-full grid-cols-[62px_58px_34px_1fr_auto] items-center gap-2 border-t border-hairline px-4 text-left font-code text-[12.5px] hover:bg-raised sm:grid-cols-[92px_62px_34px_1fr_auto]",
+        "tabular grid h-full w-full whitespace-pre grid-cols-[62px_58px_34px_1fr_auto] items-center gap-2 border-t border-hairline px-4 text-left font-code text-[12.5px] hover:bg-raised sm:grid-cols-[92px_62px_34px_1fr_auto]",
         selected && "bg-raised",
       )}
     >
@@ -296,7 +291,13 @@ function LogLine({
       </time>
       <b className={cn("font-medium", eventClass(event))}>{event}</b>
       <SideText side={row.side} />
-      <span className="min-w-0 truncate">{logMessage(row)}</span>
+      <span className="min-w-0 truncate">
+        {row.size ?? "-"} @ {row.price ?? "market"}
+        <span className="hidden sm:inline">
+          {"  "}player {short(row.player)}
+          {"  "}order {short(row.client_order_id)}
+        </span>
+      </span>
       <em className={cn("not-italic", reason ? "text-bad" : "text-faint")}>{result}</em>
     </button>
   );
@@ -498,6 +499,7 @@ function Live({
       },
       ticker: (ticker: { price?: string }) => setLast(ticker.price ?? null),
       candle: () => {},
+      ready: () => {},
       source_failed: ({ error }: { error: string }) => setFailed(error),
     },
     () => void load(),

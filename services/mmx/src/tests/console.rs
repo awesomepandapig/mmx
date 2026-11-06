@@ -1731,6 +1731,68 @@ async fn sessions_of_each_role_are_refused_past_their_role_by_cookie_too() {
 }
 
 #[tokio::test]
+async fn the_market_list_searches_and_pages_on_the_server() {
+    let mut text = "markets:\n".to_string();
+    for index in 0..3000 {
+        text.push_str(&format!("  - symbol: M{index:04}\n    tick_size: \"1\"\n"));
+    }
+    text.push_str("  - symbol: XM120\n    tick_size: \"1\"\n");
+    let world = world(&[FakeGateway::new(&temp_markets(&text))]).await;
+
+    let started = std::time::Instant::now();
+    let (code, body) = world.get("/markets?limit=50&offset=100").await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(body["markets"].as_array().unwrap().len(), 50);
+    assert_eq!(body["markets"][0]["symbol"], "M0100");
+    assert_eq!(body["total"], 3001);
+    assert_eq!(body["counts"]["open"], 3001);
+
+    let (_, body) = world.get("/markets?q=m120&limit=3").await;
+    assert_eq!(body["total"], 11, "M120, M1200 to M1209 and XM120");
+    assert_eq!(
+        body["markets"][0]["symbol"], "M1200",
+        "starts with it, ahead of contains it"
+    );
+
+    let (_, body) = world.get("/markets?state=halted&limit=3").await;
+    assert_eq!(body["total"], 0);
+    assert_eq!(
+        body["counts"]["all"], 3001,
+        "counts ignore the state filter"
+    );
+
+    let (_, body) = world.get("/markets?limit=1&sort=symbol&dir=desc").await;
+    assert_eq!(body["markets"][0]["symbol"], "XM120");
+
+    assert_eq!(world.get("/markets?state=odd").await.0, 400);
+    assert_eq!(world.get("/markets?limit=501").await.0, 400);
+    let (_, whole) = world.get("/markets").await;
+    assert_eq!(
+        whole["markets"].as_array().unwrap().len(),
+        3001,
+        "the CLI's whole list"
+    );
+}
+
+#[tokio::test]
+async fn streams_are_bounded() {
+    let world = plain_world().await;
+    let held: Vec<_> = (0..server::MAX_STREAMS)
+        .map(|_| server::stream_seat(&world.state).unwrap())
+        .collect();
+    let (code, body) = world.get("/events").await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(body["code"], "too_many_streams");
+    drop(held);
+    assert!(server::stream_seat(&world.state).is_ok());
+}
+
+#[tokio::test]
 async fn testing_a_provider_reports_what_was_found() {
     let login = with_provider().await;
     let mut admin = login.admin;

@@ -566,6 +566,9 @@ async fn list_markets(
     }
     if query.sort.as_deref() == Some("state") {
         views.sort_by(|left, right| state_of(left).cmp(state_of(right)));
+    } else if !needle.is_empty() {
+        // What someone typed the start of comes first, then what merely contains it.
+        views.sort_by_key(|view| !view.symbol.starts_with(&needle));
     }
     if query.dir.as_deref() == Some("desc") {
         views.reverse();

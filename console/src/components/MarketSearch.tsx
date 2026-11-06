@@ -167,7 +167,7 @@ export function MarketSearch({
           ))}
           {results && total > results.length && (
             <p className="border-t border-hairline px-3 py-1.5 text-xs text-faint">
-              {total.toLocaleString()} match. Keep typing to narrow it down.
+              {results.length} of {total.toLocaleString()}
             </p>
           )}
         </div>
