@@ -50,7 +50,7 @@ def call(gateway, player, method, path, body=None):
         f"{gateway}{path}",
         method=method,
         data=None if body is None else json.dumps(body).encode(),
-        headers={"x-player-id": player, "content-type": "application/json"},
+        headers={"x-player-id": str(player), "content-type": "application/json"},
     )
     try:
         with urllib.request.urlopen(request, timeout=TIMEOUT_SECS) as response:

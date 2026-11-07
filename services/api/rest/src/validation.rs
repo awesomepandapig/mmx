@@ -9,7 +9,8 @@ use super::order_id::OrderIdRules;
 
 use sbe::{ord_type_enum::OrdTypeEnum, side_enum::SideEnum};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
+use std::fmt;
 
 use uuid::Uuid;
 
@@ -22,8 +23,61 @@ pub struct CreateOrder {
     pub symbol: String,
     pub side: String,
     pub r#type: String,
+    #[serde(deserialize_with = "decimal_string")]
     pub size: String,
+    #[serde(default, deserialize_with = "optional_decimal_string")]
     pub price: Option<String>,
+}
+
+/// Keep decimals as text rather than rounding JSON numbers through a floating-point value.
+struct DecimalString(String);
+const DECIMAL_STRING_REQUIRED: &str =
+    "must be a decimal string, for example \"1\"; wrap numbers in quotes to preserve precision";
+
+impl<'de> Deserialize<'de> for DecimalString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DecimalVisitor;
+
+        impl<'de> de::Visitor<'de> for DecimalVisitor {
+            type Value = DecimalString;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a decimal string, for example \"1\" (wrap numbers in quotes)")
+            }
+
+            fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(DecimalString(value.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                Ok(DecimalString(value))
+            }
+
+            fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Err(E::custom(DECIMAL_STRING_REQUIRED))
+            }
+
+            fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Err(E::custom(DECIMAL_STRING_REQUIRED))
+            }
+
+            fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Err(E::custom(DECIMAL_STRING_REQUIRED))
+            }
+        }
+
+        deserializer.deserialize_any(DecimalVisitor)
+    }
+}
+
+fn decimal_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    DecimalString::deserialize(deserializer).map(|value| value.0)
+}
+
+fn optional_decimal_string<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<DecimalString>::deserialize(deserializer).map(|value| value.map(|value| value.0))
 }
 
 #[derive(Debug)]

@@ -227,12 +227,32 @@ impl IntoResponse for AppError {
 // This allows `?` to be used on `Json` extractors if the handler returns `Result<_, AppError>`
 impl From<JsonRejection> for AppError {
     fn from(rejection: JsonRejection) -> Self {
-        // You can customize the message further based on the type of JsonRejection
-        // For example, distinguishing between JsonSyntaxError and JsonDataError
-        AppError::JsonDeserializationError(format!(
-            "Request payload deserialization error: {}",
-            rejection.body_text()
-        ))
+        // Axum wraps the useful field path and Serde error in several framework messages.
+        // Keep the innermost context before the JSON error: it includes the field path.
+        let mut message = rejection.body_text();
+        if matches!(
+            &rejection,
+            JsonRejection::JsonDataError(_) | JsonRejection::JsonSyntaxError(_)
+        ) {
+            let mut source = std::error::Error::source(&rejection);
+            while let Some(error) = source {
+                if error.is::<serde_json::Error>() {
+                    break;
+                }
+                message = error.to_string();
+                source = error.source();
+            }
+        }
+        match rejection {
+            JsonRejection::MissingJsonContentType(_) => {
+                message = "Content-Type must be application/json.".to_string();
+            }
+            JsonRejection::JsonSyntaxError(_) => {
+                message = format!("Request body must be valid JSON: {message}");
+            }
+            _ => {}
+        }
+        AppError::JsonDeserializationError(message)
     }
 }
 

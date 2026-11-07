@@ -472,6 +472,63 @@ async fn a_player_is_required() {
 }
 
 #[tokio::test]
+async fn invalid_json_explains_syntax_and_content_type_without_framework_wrappers() {
+    let gateway = gateway(Setup::default());
+    for (content_type, text, expected) in [
+        (None, "{}", "Content-Type must be application/json."),
+        (
+            Some("application/json"),
+            "{",
+            "Request body must be valid JSON:",
+        ),
+    ] {
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/orders")
+            .header(PLAYER_HEADER, gateway.player.to_string());
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let reply = gateway
+            .app
+            .clone()
+            .oneshot(request.body(Body::from(text)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let bytes = reply.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "invalid_body");
+        assert!(
+            body["message"].as_str().unwrap().starts_with(expected),
+            "{body}"
+        );
+    }
+    assert_eq!(gateway.engine.sent(), 0);
+}
+
+#[tokio::test]
+async fn numeric_order_amounts_explain_the_decimal_string_contract() {
+    let gateway = gateway(Setup::default());
+    for field in ["size", "price"] {
+        for number in [json!(1), json!(-1), json!(1.25), json!(u64::MAX)] {
+            let mut body = limit_order(Uuid::now_v7());
+            body[field] = number;
+            let reply = gateway.post(body).await;
+            assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(reply.body["code"], "invalid_body");
+            let message = reply.body["message"].as_str().unwrap();
+            assert!(message.starts_with(&format!("{field}: ")), "{message}");
+            assert!(message.contains("must be a decimal string"), "{message}");
+            assert!(message.contains("\"1\""), "{message}");
+            assert!(message.contains("wrap numbers in quotes"), "{message}");
+            assert!(!message.contains("deserialization"), "{message}");
+        }
+    }
+    assert_eq!(gateway.engine.sent(), 0);
+}
+
+#[tokio::test]
 async fn bad_requests_never_reach_the_engine() {
     let gateway = gateway(Setup::default());
     let good = limit_order(Uuid::now_v7());
