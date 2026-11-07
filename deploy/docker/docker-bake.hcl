@@ -3,8 +3,7 @@
 //   docker buildx bake -f deploy/docker/docker-bake.hcl                  all images, both architectures
 //   PLATFORMS=linux/amd64 docker buildx bake -f deploy/docker/docker-bake.hcl core --load
 //
-// To add a Rust service, add it to the `service` matrix and the `core` group. `outbox` only needs its
-// line once it's in the workspace, because every image in the matrix must exist to build.
+// To add a Rust service, add it to the `service` matrix and the `core` group.
 
 variable "REGISTRY" {
   default = "ghcr.io/awesomepandapig/mmx"
@@ -35,10 +34,6 @@ variable "VITE_DOMAIN" {
 }
 
 variable "VITE_API_URL" {
-  default = null
-}
-
-variable "VITE_AUTH_URL" {
   default = null
 }
 
@@ -142,7 +137,6 @@ target "web" {
     APP           = "web"
     VITE_DOMAIN   = VITE_DOMAIN
     VITE_API_URL  = VITE_API_URL
-    VITE_AUTH_URL = VITE_AUTH_URL
     VITE_WS_URL   = VITE_WS_URL
     VITE_DOCS_URL = VITE_DOCS_URL
   }
@@ -160,13 +154,4 @@ target "docs" {
     VITE_WS_URL  = VITE_WS_URL
   }
   tags = ["${REGISTRY}/docs:${TAG}"]
-}
-
-target "auth" {
-  inherits = ["_common"]
-  target   = "auth"
-  args = {
-    APP = "auth"
-  }
-  tags = ["${REGISTRY}/auth:${TAG}"]
 }

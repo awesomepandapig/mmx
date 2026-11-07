@@ -206,7 +206,6 @@ FROM npm-deps AS remix-build
 ARG APP
 ARG VITE_DOMAIN
 ARG VITE_API_URL
-ARG VITE_AUTH_URL
 ARG VITE_WS_URL
 ARG VITE_DOCS_URL
 COPY ${APP}/ ./
@@ -222,20 +221,6 @@ COPY --from=remix-build /app/build ./build
 USER 10001:10001
 EXPOSE 3000
 CMD ["node_modules/.bin/remix-serve", "./build/server/index.js"]
-
-# `auth`'s npm build also runs its formatter, so this calls the compiler directly.
-FROM npm-deps AS auth-build
-COPY auth/ ./
-RUN npx tsc && npx tsc-alias && npm prune --omit=dev
-
-FROM ${NODE_IMAGE} AS auth
-ENV NODE_ENV=production
-WORKDIR /app
-COPY --from=auth-build /app/package.json ./
-COPY --from=auth-build /app/node_modules ./node_modules
-COPY --from=auth-build /app/dist ./dist
-USER 10001:10001
-CMD ["node", "dist/main.js"]
 
 # Vocs produces a static site, including Markdown and llms.txt exports.
 FROM npm-deps AS docs-build

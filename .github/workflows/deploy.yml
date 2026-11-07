@@ -220,7 +220,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Merge architectures
         run: |
-          for image in node matching-engine api mmx websocket market-data trade-reporter outbox observer tools web docs auth; do
+          for image in node matching-engine api mmx websocket market-data trade-reporter outbox observer tools web docs; do
             tags="-t $REGISTRY/$image:$SHA"
             if [ "$REF_TYPE" = tag ]; then
               tags="$tags -t $REGISTRY/$image:${REF_NAME#v}"
