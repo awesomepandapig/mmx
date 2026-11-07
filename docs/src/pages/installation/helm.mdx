@@ -68,9 +68,29 @@ mmx health
 mmx status
 ```
 
-## Sign in
+## Sign in & credentials
 
-Read the first-run console password:
+### Option A: Pre-seed admin password (Recommended for production)
+
+To prevent initial credentials from being logged to container stdout (and indexed by log aggregators), provide a Kubernetes Secret holding the password:
+
+```sh
+kubectl create secret generic mmx-admin-password \
+  --namespace mmx \
+  --from-literal=password='<your-secure-password>'
+```
+
+Pass the secret when installing with Helm:
+```sh
+helm upgrade --install mmx oci://ghcr.io/awesomepandapig/mmx/charts/mmx \
+  --version "$MMX_VERSION" --namespace mmx \
+  --set console.adminPasswordSecret.name=mmx-admin-password \
+  --set console.adminPasswordSecret.key=password
+```
+
+### Option B: Automatic generation (Evaluation)
+
+When `console.adminPasswordSecret.name` is left empty, MMX generates a temporary password on first boot and logs it once:
 
 ```sh
 kubectl logs --namespace mmx \
@@ -78,7 +98,7 @@ kubectl logs --namespace mmx \
   --prefix=true --tail=200 | grep 'Console: first-run admin password:'
 ```
 
-Find `Console: first-run admin password:` and open your console service. Choose a new password when prompted.
+Open the console service on port **8093** and sign in.
 
 :::note[Password recovery]
 **`mmx auth reset-password` requires `MMX_ADMIN_TOKEN`.** It prints a replacement temporary password and revokes console sessions. Keep the token in your operator secret manager.

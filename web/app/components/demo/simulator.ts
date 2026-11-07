@@ -250,7 +250,7 @@ export class Simulator {
     const summary = `${side} ${qty} ${m.sym}${type === "limit" ? ` @ ${money(price ?? 0)}` : " market"}`;
     const body = {
       client_order_id: crypto.randomUUID(),
-      product_id: m.sym,
+      symbol: m.sym,
       side,
       type,
       size: String(qty),
@@ -705,7 +705,7 @@ export class Simulator {
       body: {
         channel: "l2_data",
         sequence_num: this.orderSeq,
-        events: [{ type: "update", product_id: m.sym, updates }],
+        events: [{ type: "update", symbol: m.sym, updates }],
       },
     };
   }

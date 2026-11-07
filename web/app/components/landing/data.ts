@@ -229,7 +229,7 @@ export const SNIPPETS = {
     code: `// ${SERVER_ONLY}
 var body = JsonUtility.ToJson(new Order {
   client_order_id = hold.Id,
-  product_id = "IRON",
+  symbol = "IRON",
   side = "buy",
   type = "limit",
   size = "100",
@@ -250,7 +250,7 @@ Request->SetHeader(TEXT("x-player-id"), Player->Id);
 Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 Request->SetContentAsString(FString::Printf(TEXT(R"({
   "client_order_id": "%s",
-  "product_id": "IRON",
+  "symbol": "IRON",
   "side": "buy",
   "type": "limit",
   "size": "100",
@@ -263,7 +263,7 @@ Request->ProcessRequest();`,
     code: `# ${SERVER_ONLY}
 var body = JSON.stringify({
   "client_order_id": hold.id,
-  "product_id": "IRON",
+  "symbol": "IRON",
   "side": "buy",
   "type": "limit",
   "size": "100",

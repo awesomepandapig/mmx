@@ -14,17 +14,13 @@ __pycache__/
 # Deprecated services
 auth/
 
-# Local agent workspaces, worktrees, investigations, and scratch folders
+# Local agent workspaces, worktrees, investigations, notes, and scratch folders
 .claude/
 .local/
+notes/
 reports/
 research_notes/
 reviews/
-ARCHITECTURE_PRINCIPLES.md
-PRODUCTION_READINESS_PLAN.md
-RESILIENCE_CONTRACT.md
-STATE_MACHINES.md
-WORKTREE_REVIEW.md
 
 # Dependencies and build outputs
 **/node_modules/
