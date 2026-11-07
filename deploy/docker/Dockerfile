@@ -103,6 +103,8 @@ RUN --mount=type=cache,id=mmx-cargo-index-${TARGETARCH},target=/usr/local/cargo/
 RUN mkdir /out && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} /out/ \;
 
 FROM sources-release AS test
+# Official Rust images omit Clippy; install it only in the validation stage.
+RUN rustup component add clippy
 RUN cargo fmt --all -- --check
 ARG TARGETARCH
 ARG CARGO_INCREMENTAL=1
