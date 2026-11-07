@@ -60,3 +60,17 @@ release signatures.
 The destination is `oci://ghcr.io/awesomepandapig/mmx/charts/mmx`; Helm appends the chart name when
 pushing to `oci://ghcr.io/awesomepandapig/mmx/charts`. This is an OCI package, so consumers use its
 OCI URL directly rather than `helm repo add`. See [Helm OCI registries](https://helm.sh/docs/topics/registries/).
+
+### First workflow publication
+
+GitHub restricts release creation and publication when the target commit changes
+`.github/workflows/` relative to the default branch. The job's `GITHUB_TOKEN` cannot receive the
+required workflow-write permission. Merge matching workflow changes into the default branch before
+normal workflow dispatch, or bootstrap the first release using a maintainer's authenticated GitHub CLI
+with the OAuth `workflow` scope. Reuse the successful run's artifacts and verify their checksums and
+anonymous registry access; rebuilding them does not fix an authorization error. See
+[GitHub release API permissions](https://docs.github.com/en/rest/releases/releases#create-a-release).
+
+`release.yml` owns versioned image tags and chart publication. The general `deploy.yml` workflow
+validates pull requests and publishes commit-addressed images on `main`; it must not retag release
+images from an unversioned rebuild.

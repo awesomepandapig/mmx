@@ -1,9 +1,10 @@
 name: deploy
 
+# Versioned image tags and OCI charts belong to release.yml.
+
 on:
   push:
     branches: ["main"]
-    tags: ["v*"]
   pull_request:
     branches: ["main"]
 
@@ -209,8 +210,6 @@ jobs:
     env:
       REGISTRY: ghcr.io/${{ github.repository_owner }}/mmx
       SHA: ${{ github.sha }}
-      REF_TYPE: ${{ github.ref_type }}
-      REF_NAME: ${{ github.ref_name }}
     steps:
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
@@ -221,10 +220,6 @@ jobs:
       - name: Merge architectures
         run: |
           for image in node matching-engine api mmx websocket market-data trade-reporter outbox observer tools web docs; do
-            tags="-t $REGISTRY/$image:$SHA"
-            if [ "$REF_TYPE" = tag ]; then
-              tags="$tags -t $REGISTRY/$image:${REF_NAME#v}"
-            fi
-            docker buildx imagetools create $tags \
+            docker buildx imagetools create --tag "$REGISTRY/$image:$SHA" \
               "$REGISTRY/$image:$SHA-amd64" "$REGISTRY/$image:$SHA-arm64"
           done
