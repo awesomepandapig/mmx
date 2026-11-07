@@ -166,7 +166,7 @@ export function RowDetail({
       className="flex min-h-0 w-full flex-none flex-col overflow-hidden border-l border-line bg-surface lg:w-[380px]"
     >
       <div className="flex h-9 flex-none items-center justify-between gap-2 border-b border-line px-3">
-        <h2 className="truncate text-[13px] font-semibold">
+        <h2 className="truncate text-[15px] font-semibold">
           <span className="font-code">{row.symbol}</span> {eventOf(row)}
         </h2>
         <Button tone="quiet" onClick={onClose}>
@@ -193,7 +193,7 @@ export function RowDetail({
             Open {row.symbol}
           </RouterLink>
         </div>
-        <pre className="mt-3 overflow-x-auto bg-deep p-2.5 font-code text-[12px] leading-[18px]">
+        <pre className="mt-3 overflow-x-auto bg-deep p-2.5 font-code text-[14px] leading-[18px]">
           {json}
         </pre>
         <div className="mt-1.5 flex justify-end">

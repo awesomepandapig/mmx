@@ -28,7 +28,7 @@ function Stage({
       <p className="tabular">
         <Word tone={tone}>{value}</Word>
       </p>
-      <p className="tabular truncate text-[12px] text-faint">{note ?? " "}</p>
+      <p className="tabular truncate text-[14px] text-faint">{note ?? " "}</p>
     </div>
   );
 }

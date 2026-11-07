@@ -75,7 +75,7 @@
   }
 
   body {
-    @apply min-h-dvh font-body text-[13px] leading-[18px];
+    @apply min-h-dvh font-body text-[15px] leading-[22px];
   }
 
   :focus-visible {
@@ -104,7 +104,7 @@
 
 /* The label over a number, in every strip and fact list. */
 .label {
-  @apply text-[11px] font-medium leading-4 text-faint;
+  @apply text-[12px] font-medium leading-4 text-faint;
 }
 
 /* A column's divider, which is also what you drag. */

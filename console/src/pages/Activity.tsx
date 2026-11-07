@@ -112,7 +112,7 @@ export function Activity() {
         </Notice>
       )}
       <div className="flex flex-none flex-wrap items-center gap-2 border-b border-line bg-surface px-3 py-1.5">
-        <h1 className="text-[15px] font-semibold">Activity</h1>
+        <h1 className="text-[17px] font-semibold">Activity</h1>
         <Segmented
           label="Show"
           value={view}
@@ -173,7 +173,7 @@ export function Activity() {
           </Button>
         )}
         {(badPlayer || badOrder) && (
-          <p className="text-[12px] text-bad">
+          <p className="text-[14px] text-bad">
             {badPlayer ? "A player is a full UUID." : "An order is a UUID or a number."}
           </p>
         )}
@@ -233,7 +233,7 @@ export function Activity() {
                   >
                     Older
                   </Button>
-                  <span className="text-[12px] text-faint">Page {cursors.length + 1}</span>
+                  <span className="text-[14px] text-faint">Page {cursors.length + 1}</span>
                 </>
               )}
             </div>

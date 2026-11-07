@@ -172,7 +172,7 @@ export function Webhooks() {
             canEdit && (
               <Button
                 tone={current?.secret_hint ? "caution" : "primary"}
-                className="h-[22px] px-1.5 text-[12px]"
+                className="h-[22px] px-1.5 text-[14px]"
                 disabled={!current}
                 onClick={() => setConfirming(true)}
               >
@@ -217,7 +217,7 @@ export function Webhooks() {
         onClose={() => setSecret(null)}
       >
         <div className="space-y-3">
-          <p className="break-all bg-deep p-2 font-code text-[12px]" data-testid="secret">
+          <p className="break-all bg-deep p-2 font-code text-[14px]" data-testid="secret">
             {secret}
           </p>
           <div className="flex justify-end gap-2">

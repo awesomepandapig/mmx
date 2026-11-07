@@ -56,7 +56,7 @@ function Nav() {
           className={({ isActive }) => {
             const active = isActive || page.also?.includes(pathname);
             return cn(
-              "flex items-center whitespace-nowrap border-b-2 px-2.5 text-[13px] font-medium",
+              "flex items-center whitespace-nowrap border-b-2 px-2.5 text-[15px] font-medium",
               active ? "border-accent text-ink" : "border-transparent text-muted hover:text-ink",
             );
           }}
@@ -75,7 +75,7 @@ function Clock() {
     return () => clearInterval(timer);
   }, []);
   return (
-    <time className="tabular hidden whitespace-nowrap font-code text-[12px] text-muted sm:block">
+    <time className="tabular hidden whitespace-nowrap font-code text-[14px] text-muted sm:block">
       {utcClock(now)} UTC
     </time>
   );
@@ -111,7 +111,7 @@ function Account({ session }: { session: Session | null }) {
         <DropdownMenu.Content
           align="end"
           sideOffset={4}
-          className="z-50 w-44 border border-line bg-surface py-1 text-[13px] text-ink shadow-xl"
+          className="z-50 w-44 border border-line bg-surface py-1 text-[15px] text-ink shadow-xl"
         >
           <DropdownMenu.Item className={item} onSelect={toggle}>
             {dark ? "Light theme" : "Dark theme"}
@@ -119,7 +119,7 @@ function Account({ session }: { session: Session | null }) {
           <DropdownMenu.Item className={item} onSelect={() => void signOut()}>
             Sign out
           </DropdownMenu.Item>
-          {failure && <p className="px-3 py-1 text-[12px] text-bad">{failure}</p>}
+          {failure && <p className="px-3 py-1 text-[14px] text-bad">{failure}</p>}
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>

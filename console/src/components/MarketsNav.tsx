@@ -18,7 +18,7 @@ export function MarketsNav() {
           to={tab.to}
           className={({ isActive }) =>
             cn(
-              "flex items-center border-b-2 px-1.5 text-[12px] font-medium",
+              "flex items-center border-b-2 px-1.5 text-[14px] font-medium",
               isActive ? "border-accent text-ink" : "border-transparent text-muted hover:text-ink",
             )
           }

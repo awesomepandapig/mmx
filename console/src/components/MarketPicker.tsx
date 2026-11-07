@@ -69,14 +69,14 @@ function Row({
         active && "bg-raised",
       )}
     >
-      <span className="font-code text-[12px] font-medium">{market.symbol}</span>
-      <span className="tabular text-right font-code text-[12px] text-muted">
+      <span className="font-code text-[14px] font-medium">{market.symbol}</span>
+      <span className="tabular text-right font-code text-[14px] text-muted">
         {market.last ?? "-"}
       </span>
-      <span className="tabular text-right font-code text-[12px] text-faint">
+      <span className="tabular text-right font-code text-[14px] text-faint">
         {market.volume_24h ?? "-"}
       </span>
-      <span className="w-[76px] truncate text-right text-[12px]">
+      <span className="w-[76px] truncate text-right text-[14px]">
         {state.word !== "Open" && <Word tone={state.tone}>{state.word}</Word>}
       </span>
     </div>
@@ -220,7 +220,7 @@ export function MarketPicker({
           aria-label="Switch market"
           className="flex h-8 min-w-[132px] flex-none items-center justify-between gap-3 rounded-[3px] border border-line bg-canvas pl-2.5 pr-2 hover:border-faint"
         >
-          <span className="font-code text-[15px] font-semibold">{value}</span>
+          <span className="font-code text-[17px] font-semibold">{value}</span>
           <svg aria-hidden viewBox="0 0 10 6" className="h-1.5 w-2.5 stroke-faint">
             <path d="m1 1 4 4 4-4" fill="none" strokeWidth="1.5" />
           </svg>
@@ -251,11 +251,11 @@ export function MarketPicker({
               value={text}
               onChange={(event) => setText(event.target.value)}
               onKeyDown={onKey}
-              className="h-9 w-full bg-transparent pl-8 pr-3 text-[13px] placeholder:text-faint focus:outline-none"
+              className="h-9 w-full bg-transparent pl-8 pr-3 text-[15px] placeholder:text-faint focus:outline-none"
             />
           </div>
           {!needle && (
-            <div className="flex items-center gap-3 border-b border-hairline px-3 text-[12px]">
+            <div className="flex items-center gap-3 border-b border-hairline px-3 text-[14px]">
               {(
                 [
                   ["volume", "Busiest"],
@@ -320,7 +320,7 @@ export function MarketPicker({
               <p className="px-3 py-2 text-muted">No market matches {text.trim()}</p>
             )}
             {total !== null && rows.length >= MOST && rows.length < total && (
-              <p className="px-3 py-1.5 text-[12px] text-faint">
+              <p className="px-3 py-1.5 text-[14px] text-faint">
                 First {MOST} of {total.toLocaleString()}. Search to narrow.
               </p>
             )}

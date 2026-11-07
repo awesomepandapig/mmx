@@ -4,6 +4,7 @@
   "sideEffects": false,
   "type": "module",
   "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
     "dev": "vite",
     "build": "tsc && vite build",
     "lint": "eslint --ignore-path .gitignore --cache --cache-location ./node_modules/.cache/eslint .",

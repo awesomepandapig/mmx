@@ -231,7 +231,7 @@ function SingleSignOn({ data, onSaved }: { data: SettingsData; onSaved: () => vo
       <SectionTitle
         actions={
           managed ? (
-            <span className="text-[12px] text-muted">Set by the deployment</span>
+            <span className="text-[14px] text-muted">Set by the deployment</span>
           ) : (
             <Switch label="Single sign-on" checked={enabled} onChange={setEnabled} />
           )
@@ -242,7 +242,7 @@ function SingleSignOn({ data, onSaved }: { data: SettingsData; onSaved: () => vo
 
       {saved.redirect_uri && (
         <div className="mt-3">
-          <p className="text-[13px] font-medium">Redirect URI to register with your provider</p>
+          <p className="text-[15px] font-medium">Redirect URI to register with your provider</p>
           <div className="mt-1 flex flex-wrap items-center gap-2">
             <Code>{saved.redirect_uri}</Code>
             <CopyButton text={saved.redirect_uri} />
@@ -316,7 +316,7 @@ function SingleSignOn({ data, onSaved }: { data: SettingsData; onSaved: () => vo
           value={viewer}
           onChange={(event) => setViewer(event.target.value)}
         />
-        <p className="self-end text-[13px] text-faint">
+        <p className="self-end text-[15px] text-faint">
           One group per line, by exact name. Anyone else is refused.
         </p>
         <div className="space-y-2 sm:col-span-2">
@@ -382,13 +382,13 @@ export function Settings() {
                   ["Version", data.version],
                   [
                     "Settings",
-                    <span key="c" className="font-code text-[13px]">
+                    <span key="c" className="font-code text-[15px]">
                       {data.store.config}
                     </span>,
                   ],
                   [
                     "Secrets",
-                    <span key="s" className="font-code text-[13px]">
+                    <span key="s" className="font-code text-[15px]">
                       {data.store.secrets}
                     </span>,
                   ],

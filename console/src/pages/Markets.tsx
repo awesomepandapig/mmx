@@ -275,7 +275,7 @@ export function AllMarkets() {
           !canAct || (!row.original.enabled && !row.original.halted) ? null : (
             <Button
               tone={row.original.halted ? "plain" : "caution"}
-              className="h-[22px] px-1.5 text-[12px]"
+              className="h-[22px] px-1.5 text-[14px]"
               onClick={(event) => {
                 event.stopPropagation();
                 setDialog({ kind: row.original.halted ? "resume" : "halt", market: row.original });
@@ -542,7 +542,7 @@ function YamlEditor({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2 p-2">
-      <div className="flex min-h-[320px] flex-1 overflow-hidden border border-line bg-deep font-code text-[12px] leading-5 focus-within:border-accent">
+      <div className="flex min-h-[320px] flex-1 overflow-hidden border border-line bg-deep font-code text-[14px] leading-5 focus-within:border-accent">
         <pre
           ref={gutter}
           aria-hidden
@@ -581,7 +581,7 @@ function YamlEditor({
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="min-w-0 break-all font-code text-[12px] text-faint">{file.location}</p>
+        <p className="min-w-0 break-all font-code text-[14px] text-faint">{file.location}</p>
         {!readOnly && (
           <div className="flex gap-2">
             <Button disabled={!dirty} onClick={() => setText(file.yaml)}>

@@ -1,7 +1,7 @@
 import * as Dialog from "@radix-ui/react-dialog";
 import * as RadixSwitch from "@radix-ui/react-switch";
 import clsx from "clsx";
-import { forwardRef, useId, useState } from "react";
+import { forwardRef, useEffect, useId, useRef, useState } from "react";
 import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
@@ -11,6 +11,7 @@ import type {
 } from "react";
 import { twMerge } from "tailwind-merge";
 import type { Tone as TextTone } from "../lib/exchange";
+import { copyText } from "../lib/clipboard";
 
 export function cn(...parts: Parameters<typeof clsx>) {
   return twMerge(clsx(...parts));
@@ -33,7 +34,7 @@ const tones: Record<Tone, string> = {
 
 export const buttonClass = (tone: Tone = "plain") =>
   cn(
-    "inline-flex h-7 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[3px] px-2.5 text-[13px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-40",
+    "inline-flex h-7 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-[3px] px-2.5 text-[15px] font-medium transition-colors disabled:pointer-events-none disabled:opacity-40",
     tones[tone],
   );
 
@@ -70,8 +71,8 @@ export function Panel({
   return (
     <section className={cn("flex min-h-0 min-w-0 flex-col bg-surface", className)}>
       <header className="flex h-8 flex-none items-center justify-between gap-3 border-b border-hairline px-3">
-        <h2 className="truncate text-[12px] font-semibold">{title}</h2>
-        {aside && <div className="flex items-center gap-2 text-[12px] text-faint">{aside}</div>}
+        <h2 className="truncate text-[14px] font-semibold">{title}</h2>
+        {aside && <div className="flex items-center gap-2 text-[14px] text-faint">{aside}</div>}
       </header>
       <div className={cn("min-h-0 flex-1", bodyClassName)}>{children}</div>
     </section>
@@ -94,8 +95,8 @@ export function PageHeader({
   return (
     <header className="mb-3 flex flex-wrap items-center justify-between gap-3">
       <div className="flex min-w-0 items-baseline gap-3">
-        <h1 className="text-[15px] font-semibold">{title}</h1>
-        {detail && <div className="text-[13px] text-muted">{detail}</div>}
+        <h1 className="text-[17px] font-semibold">{title}</h1>
+        {detail && <div className="text-[15px] text-muted">{detail}</div>}
       </div>
       {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
     </header>
@@ -113,7 +114,7 @@ export function SectionTitle({
 }) {
   return (
     <div className={cn("flex items-center justify-between gap-3", className)}>
-      <h2 className="text-[13px] font-semibold">{children}</h2>
+      <h2 className="text-[15px] font-semibold">{children}</h2>
       {actions}
     </div>
   );
@@ -159,7 +160,7 @@ export function Metric({
       <div className={cn("tabular truncate text-[20px] font-medium leading-7", wordTone[tone])}>
         {value ?? <Skeleton className="my-1 h-5 w-16" />}
       </div>
-      <p className="tabular truncate text-[12px] leading-4 text-muted">{note ?? " "}</p>
+      <p className="tabular truncate text-[14px] leading-4 text-muted">{note ?? " "}</p>
     </div>
   );
 }
@@ -212,7 +213,7 @@ export function Notice({
 }
 
 export const inputClass =
-  "h-7 w-full rounded-[3px] border border-line bg-canvas px-2 text-[13px] text-ink placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-60";
+  "h-7 w-full rounded-[3px] border border-line bg-canvas px-2 text-[15px] text-ink placeholder:text-faint focus:border-accent focus:outline-none disabled:opacity-60";
 
 export function Field({
   label,
@@ -227,7 +228,7 @@ export function Field({
         {label}
       </label>
       <input id={id} {...props} className={inputClass} />
-      {hint && <p className="mt-0.5 text-[12px] text-faint">{hint}</p>}
+      {hint && <p className="mt-0.5 text-[14px] text-faint">{hint}</p>}
     </div>
   );
 }
@@ -247,9 +248,9 @@ export function TextArea({
       <textarea
         id={id}
         {...props}
-        className={cn(inputClass, "h-auto py-1 font-code text-[12px] leading-5")}
+        className={cn(inputClass, "h-auto py-1 font-code text-[14px] leading-5")}
       />
-      {hint && <p className="mt-0.5 text-[12px] text-faint">{hint}</p>}
+      {hint && <p className="mt-0.5 text-[14px] text-faint">{hint}</p>}
     </div>
   );
 }
@@ -299,7 +300,7 @@ export function Code({ children, className }: { children: ReactNode; className?:
   return (
     <code
       className={cn(
-        "break-all rounded-[3px] bg-raised px-1 py-0.5 font-code text-[12px]",
+        "break-all rounded-[3px] bg-raised px-1 py-0.5 font-code text-[14px]",
         className,
       )}
     >
@@ -310,17 +311,31 @@ export function Code({ children, className }: { children: ReactNode; className?:
 
 export function CopyButton({ text, label = "Copy" }: { text: string; label?: string }) {
   const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout>>();
+  useEffect(() => () => clearTimeout(timer.current), []);
   return (
-    <Button
-      onClick={() => {
-        void navigator.clipboard.writeText(text).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        });
-      }}
-    >
-      {copied ? "Copied" : label}
-    </Button>
+    <span className="inline-flex flex-wrap items-center gap-2">
+      <Button
+        onClick={() => {
+          setCopied(false);
+          setFailed(false);
+          clearTimeout(timer.current);
+          void copyText(text).then(
+            () => {
+              setCopied(true);
+              timer.current = setTimeout(() => setCopied(false), 1500);
+            },
+            () => setFailed(true),
+          );
+        }}
+      >
+        {copied ? "Copied" : label}
+      </Button>
+      <span role="status" className="text-[14px] text-bad">
+        {failed ? "Copy failed. Select the text and copy it manually." : copied ? "Copied." : ""}
+      </span>
+    </span>
   );
 }
 
@@ -345,7 +360,7 @@ export function Modal({
           aria-describedby={undefined}
           className="fixed left-1/2 top-1/2 z-50 max-h-[90dvh] w-[calc(100vw-2rem)] max-w-md -translate-x-1/2 -translate-y-1/2 overflow-y-auto border border-line bg-surface p-4 text-ink focus:outline-none"
         >
-          <Dialog.Title className="text-[15px] font-semibold">{title}</Dialog.Title>
+          <Dialog.Title className="text-[17px] font-semibold">{title}</Dialog.Title>
           {description && (
             <Dialog.Description asChild>
               <div className="mt-1 text-muted">{description}</div>
@@ -385,7 +400,7 @@ export function Segmented<T extends string>({
           aria-pressed={value === option.value}
           onClick={() => onChange(option.value)}
           className={cn(
-            "tabular h-[26px] whitespace-nowrap border-l border-line px-2 text-[12px] font-medium first:border-l-0",
+            "tabular h-[26px] whitespace-nowrap border-l border-line px-2 text-[14px] font-medium first:border-l-0",
             value === option.value ? "bg-raised text-ink" : "text-muted hover:text-ink",
           )}
         >
@@ -427,7 +442,7 @@ export function EmptyState({
   return (
     <div className="flex flex-col items-center px-4 py-8 text-center">
       <p className="font-medium text-muted">{title}</p>
-      {children && <p className="mt-0.5 max-w-md text-[12px] text-faint">{children}</p>}
+      {children && <p className="mt-0.5 max-w-md text-[14px] text-faint">{children}</p>}
       {action && <div className="mt-3">{action}</div>}
     </div>
   );
@@ -445,7 +460,7 @@ export function ErrorState({
   return (
     <div role="alert" className="flex flex-col items-center px-4 py-8 text-center">
       <p className="font-semibold text-bad">{title}</p>
-      {detail && <p className="mt-0.5 max-w-xl break-words text-[12px] text-muted">{detail}</p>}
+      {detail && <p className="mt-0.5 max-w-xl break-words text-[14px] text-muted">{detail}</p>}
       {onRetry && (
         <Button className="mt-3" onClick={onRetry}>
           Try again
@@ -470,14 +485,14 @@ export function Pager({
 }) {
   const last = Math.min(offset + limit, total);
   return (
-    <div className="flex items-center gap-2 text-[12px] text-muted">
+    <div className="flex items-center gap-2 text-[14px] text-muted">
       <span className="tabular whitespace-nowrap">
         {total === 0 ? "0" : `${(offset + 1).toLocaleString()}-${last.toLocaleString()}`} of{" "}
         {total.toLocaleString()}
       </span>
       <Select
         label="Rows per page"
-        className="h-[26px] text-[12px]"
+        className="h-[26px] text-[14px]"
         value={limit}
         onChange={(event) => onLimit(Number(event.target.value))}
       >

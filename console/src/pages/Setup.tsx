@@ -37,7 +37,7 @@ export function Setup() {
 
   return (
     <AuthPage>
-      <h1 className="text-[15px] font-semibold">Choose a password</h1>
+      <h1 className="text-[17px] font-semibold">Choose a password</h1>
       <form onSubmit={(event) => void submit(event)} className="mt-4 space-y-3">
         {failure && <Notice state="bad">{failure}</Notice>}
         <Field

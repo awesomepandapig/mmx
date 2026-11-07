@@ -9,7 +9,7 @@ import { Word } from "./ui";
  */
 export function SampleNote({ link, sample }: { link: Link; sample: Sample }) {
   const sampled = sample.seen > sample.sent * 1.05 && sample.seen > 0;
-  const text = "tabular whitespace-nowrap text-[12px]";
+  const text = "tabular whitespace-nowrap text-[14px]";
   if (link === "connecting")
     return (
       <Word tone="muted" className={text}>

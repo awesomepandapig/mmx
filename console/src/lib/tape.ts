@@ -4,6 +4,8 @@ import type { OrderRow, TapeRow, TradeRow } from "./api";
 import { useStream } from "./hooks";
 import type { Link } from "./hooks";
 import { useSession } from "./session";
+import { mergeTapeRows, rowKey } from "./tapeRows";
+export { rowKey } from "./tapeRows";
 
 /** Rows held in the browser. Past this the oldest go. */
 const KEEP = 2000;
@@ -27,10 +29,6 @@ export interface Sample {
   sent: number;
 }
 
-export function rowKey(row: TapeRow) {
-  return `${row.kind}-${row.exec_id}`;
-}
-
 /**
  * Follows the sampled tape. Rows wait in a buffer between redraws and only the newest `KEEP` stay,
  * so neither a busy market nor a long-open tab can slow the page down.
@@ -40,7 +38,7 @@ export function useTape(filter: TapeFilter, paused: boolean) {
   const [rows, setRows] = useState<TapeRow[]>([]);
   const [sample, setSample] = useState<Sample>({ seen: 0, sent: 0 });
   const [sources, setSources] = useState<Record<string, string>>({});
-  const pending = useRef<TapeRow[]>([]);
+  const pending = useRef(new Map<string, TapeRow>());
   const samples = useRef<{ at: number; seen: number; sent: number }[]>([]);
   const held = useRef(paused);
   held.current = paused;
@@ -52,7 +50,7 @@ export function useTape(filter: TapeFilter, paused: boolean) {
 
   useEffect(() => {
     setRows([]);
-    pending.current = [];
+    pending.current.clear();
     samples.current = [];
     setSample({ seen: 0, sent: 0 });
   }, [query]);
@@ -65,23 +63,22 @@ export function useTape(filter: TapeFilter, paused: boolean) {
         samples.current.reduce((sum, entry) => sum + entry[name], 0) / (WINDOW_MS / 1000);
       setSample({ seen: add("seen"), sent: add("sent") });
 
-      if (pending.current.length === 0 || held.current) return;
-      const fresh = pending.current.reverse();
-      pending.current = [];
+      if (pending.current.size === 0 || held.current) return;
+      const fresh = [...pending.current.values()].reverse();
+      pending.current.clear();
       // Orders and trades arrive table by table, so the merged list is put back in time order.
-      setRows((current) =>
-        [...fresh, ...current]
-          .sort((left, right) => (left.time < right.time ? 1 : left.time > right.time ? -1 : 0))
-          .slice(0, KEEP),
-      );
+      setRows((current) => mergeTapeRows(fresh, current, KEEP));
     }, FLUSH_MS);
     return () => clearInterval(timer);
   }, []);
 
   const push = useCallback((row: TapeRow) => {
     if (held.current) return;
-    pending.current.push(row);
-    if (pending.current.length > KEEP) pending.current.splice(0, pending.current.length - KEEP);
+    pending.current.set(rowKey(row), row);
+    if (pending.current.size > KEEP) {
+      const oldest = pending.current.keys().next().value;
+      if (oldest !== undefined) pending.current.delete(oldest);
+    }
   }, []);
 
   const handlers = useMemo(

@@ -208,7 +208,7 @@ export function TimeChart({
         )}
         {nearest && (
           <div
-            className="tabular pointer-events-none absolute top-1 z-10 whitespace-nowrap border border-line bg-surface px-2 py-1 text-[12px] shadow-lg"
+            className="tabular pointer-events-none absolute top-1 z-10 whitespace-nowrap border border-line bg-surface px-2 py-1 text-[14px] shadow-lg"
             style={
               x(nearest.time) > width / 2
                 ? { right: width - x(nearest.time) + 8 }
@@ -229,7 +229,7 @@ export function TimeChart({
         )}
       </div>
       {legend && series.length > 1 && (
-        <ul className="tabular flex flex-none flex-wrap gap-x-4 px-3 pb-1.5 pt-0.5 text-[12px] text-muted">
+        <ul className="tabular flex flex-none flex-wrap gap-x-4 px-3 pb-1.5 pt-0.5 text-[14px] text-muted">
           {series.map((line) => (
             <li key={line.key} className="flex items-center gap-1.5">
               <i aria-hidden className={cn("h-0.5 w-3", line.fill)} />

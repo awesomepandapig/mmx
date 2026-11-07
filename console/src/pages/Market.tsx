@@ -54,7 +54,7 @@ function Stat({ label, value }: { label: string; value: string | null | undefine
   return (
     <div className="min-w-[56px] flex-none">
       <p className="label whitespace-nowrap">{label}</p>
-      <p className="tabular whitespace-nowrap font-code text-[12px]">{value ?? "-"}</p>
+      <p className="tabular whitespace-nowrap font-code text-[14px]">{value ?? "-"}</p>
     </div>
   );
 }
@@ -75,7 +75,7 @@ function BookRow({
   return (
     <div
       style={{ height: BOOK_ROW }}
-      className="relative grid grid-cols-[1fr_1fr_1fr] items-center gap-1 px-3 font-code text-[12px]"
+      className="relative grid grid-cols-[1fr_1fr_1fr] items-center gap-1 px-3 font-code text-[14px]"
     >
       <i
         className={cn(
@@ -139,7 +139,7 @@ function OrderBook({
       bodyClassName="flex flex-col"
     >
       {frame?.coverage === "partial" && (
-        <p className="px-3 py-1 text-[12px] text-warn">Levels changed since opening only.</p>
+        <p className="px-3 py-1 text-[14px] text-warn">Levels changed since opening only.</p>
       )}
       <div
         ref={box}
@@ -174,7 +174,7 @@ function OrderBook({
                 />
               ))}
             </div>
-            <div className="flex h-[26px] flex-none items-center justify-between border-y border-line bg-raised px-3 text-[12px]">
+            <div className="flex h-[26px] flex-none items-center justify-between border-y border-line bg-raised px-3 text-[14px]">
               <span className="text-faint">Spread</span>
               <span className="font-code">{spread ?? "-"}</span>
             </div>
@@ -270,7 +270,7 @@ function PriceChart({
 
 function Details({ market }: { market: Market }) {
   const disagree = market.gateways.filter((gateway) => !gateway.in_sync || !gateway.reachable);
-  const code = (text?: string) => <span className="font-code text-[12px]">{text ?? "-"}</span>;
+  const code = (text?: string) => <span className="font-code text-[14px]">{text ?? "-"}</span>;
   return (
     <>
       <Panel title="Limits" className="flex-none" bodyClassName="p-3">
@@ -295,7 +295,7 @@ function Details({ market }: { market: Market }) {
         <ul>
           {market.gateways.map((gateway) => (
             <li key={gateway.gateway} className="border-b border-hairline px-3 py-1">
-              <p className="break-all font-code text-[12px] text-muted">{gateway.gateway}</p>
+              <p className="break-all font-code text-[14px] text-muted">{gateway.gateway}</p>
               {!gateway.reachable ? (
                 <Word tone="bad">Unreachable</Word>
               ) : !gateway.in_sync ? (
@@ -335,7 +335,7 @@ function EventPanel({ symbol }: { symbol: string }) {
   return (
     <div className="flex min-h-[300px] min-w-0 flex-col lg:min-h-0">
       {Object.entries(tape.sources).map(([source, error]) => (
-        <p key={source} className="break-words bg-surface px-3 py-1 text-[12px] text-bad">
+        <p key={source} className="break-words bg-surface px-3 py-1 text-[14px] text-bad">
           {source}: {error}
         </p>
       ))}
@@ -420,7 +420,7 @@ function MoreActions({
         <DropdownMenu.Content
           align="end"
           sideOffset={4}
-          className="z-50 w-44 border border-line bg-surface py-1 text-[13px] text-ink shadow-xl"
+          className="z-50 w-44 border border-line bg-surface py-1 text-[15px] text-ink shadow-xl"
         >
           <DropdownMenu.Item className={item} onSelect={() => onDialog({ kind: "edit", market })}>
             Edit limits
@@ -476,7 +476,7 @@ function Header({
           startOpen={startOpen}
           onPick={(symbol) => navigate(`/markets/${symbol}`)}
         />
-        <Word tone={state.tone} className="whitespace-nowrap text-[13px]">
+        <Word tone={state.tone} className="whitespace-nowrap text-[15px]">
           {state.word}
         </Word>
       </div>

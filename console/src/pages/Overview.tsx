@@ -95,7 +95,7 @@ function EventLog({ log }: { log: ActivityLog | null }) {
           className="grid grid-cols-[64px_minmax(0,1fr)] gap-2 border-b border-hairline px-3 py-1"
           title={utc(entry.time)}
         >
-          <time className="tabular font-code text-[12px] text-faint">{utcClock(entry.time)}</time>
+          <time className="tabular font-code text-[14px] text-faint">{utcClock(entry.time)}</time>
           <p className="min-w-0 break-words">
             <span className="text-muted">{entry.subject}</span>{" "}
             <Word tone={logTone[entry.level]}>{entry.message}</Word>
@@ -113,8 +113,8 @@ function Busiest({ summary }: { summary: ActivitySummary | null }) {
   if (top.length === 0) return <p className="px-3 py-2 text-muted">No orders in this window.</p>;
   const most = Math.max(...top.map((market) => market.counts.orders), 1);
   return (
-    <table className="tabular w-full table-fixed text-right text-[12px]">
-      <thead className="text-[11px] text-faint">
+    <table className="tabular w-full table-fixed text-right text-[14px]">
+      <thead className="text-[12px] text-faint">
         <tr>
           <th className="w-[76px] px-3 py-1 text-left font-medium">Market</th>
           <th className="px-1 font-medium">Orders</th>

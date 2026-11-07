@@ -83,7 +83,7 @@ export function Login() {
 
   return (
     <AuthPage>
-      <h1 className="text-[15px] font-semibold">Sign in</h1>
+      <h1 className="text-[17px] font-semibold">Sign in</h1>
       <div className="mt-4 space-y-3">
         {failure && <Notice state="bad">{failure}</Notice>}
         {session.oidc && (

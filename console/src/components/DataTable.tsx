@@ -92,7 +92,7 @@ export function DataTable<T>({
   empty = "Nothing here",
   emptyDetail,
   className,
-  rowHeight = 28,
+  rowHeight = 36,
 }: {
   id: string;
   columns: ColumnDef<T, never>[];
@@ -226,7 +226,7 @@ export function DataTable<T>({
     <section data-table={id} className={cn("flex min-h-0 min-w-0 flex-col bg-surface", className)}>
       {hasBar && (
         <div className="flex min-h-[36px] flex-none flex-wrap items-center gap-2 border-b border-hairline px-3 py-1">
-          {title !== undefined && <h2 className="text-[12px] font-semibold">{title}</h2>}
+          {title !== undefined && <h2 className="text-[14px] font-semibold">{title}</h2>}
           {toolbar}
           <div className="ml-auto flex items-center gap-2">
             {footer}
@@ -300,7 +300,7 @@ export function DataTable<T>({
                       event.preventDefault();
                       move(event.dataTransfer.getData("text/mmx-column"), header.column.id);
                     }}
-                    className="relative h-7 select-none border-b border-line bg-raised p-0 text-left text-[11px] font-semibold text-muted"
+                    className="relative h-8 select-none border-b border-line bg-raised p-0 text-left text-[12px] font-semibold text-muted"
                   >
                     <button
                       type="button"
@@ -374,7 +374,7 @@ export function DataTable<T>({
                       className={cn(
                         "overflow-hidden text-ellipsis whitespace-nowrap border-b border-hairline px-2",
                         meta?.align === "right" && "tabular text-right",
-                        meta?.mono && "tabular font-code text-[12px]",
+                        meta?.mono && "tabular font-code text-[14px]",
                       )}
                     >
                       <span className="inline-block">
@@ -435,14 +435,14 @@ function ColumnChooser({
       <Popover.Trigger asChild>
         <Button tone="quiet" className="h-[26px] px-1.5" aria-label="Columns">
           <GearIcon />
-          <span className="text-[12px]">Columns</span>
+          <span className="text-[14px]">Columns</span>
         </Button>
       </Popover.Trigger>
       <Popover.Portal>
         <Popover.Content
           align="end"
           sideOffset={4}
-          className="z-50 max-h-[70dvh] w-56 overflow-y-auto border border-line bg-surface py-1 text-[13px] text-ink shadow-xl"
+          className="z-50 max-h-[70dvh] w-56 overflow-y-auto border border-line bg-surface py-1 text-[15px] text-ink shadow-xl"
         >
           <ul>
             {columns.map((column, index) => (
@@ -479,7 +479,7 @@ function ColumnChooser({
             ))}
           </ul>
           <div className="mt-1 border-t border-hairline px-2 pt-1">
-            <button type="button" className="text-[12px] text-accent" onClick={onReset}>
+            <button type="button" className="text-[14px] text-accent" onClick={onReset}>
               Reset widths, order and columns
             </button>
           </div>
