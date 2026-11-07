@@ -59,7 +59,7 @@ def place(index, sent):
     player = str(uuid.uuid4())
     started = time.time()
     while True:
-        body = {"client_order_id": uuid7(), "product_id": "ITEM", "side": "buy" if index % 2 else "sell",
+        body = {"client_order_id": uuid7(), "symbol": "ITEM", "side": "buy" if index % 2 else "sell",
                 "type": "limit", "size": "1", "price": str(90 + index % 21)}
         status, code = post(body, player)
         sent.append(1)
@@ -91,7 +91,7 @@ def main():
             assert time.time() < deadline, "api never started"
             time.sleep(0.2)
 
-        assert post({"product_id": "ITEM", "side": "buy", "type": "limit", "size": "1", "price": "1"})[0] == 400, \
+        assert post({"symbol": "ITEM", "side": "buy", "type": "limit", "size": "1", "price": "1"})[0] == 400, \
             "a missing client_order_id must be refused"
 
         deadline = time.time() + HOLD_WAIT

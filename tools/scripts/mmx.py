@@ -355,7 +355,7 @@ def up_cluster(fresh):
                  Path(os.environ.get("ENGINE", BIN / "matching-engine")),
                  Path(os.environ.get("AERON_JAR", RUN / "aeron-all-1.54.0.jar"))):
         if not path.exists():
-            sys.exit(f"missing {path}, see STARTUP.md")
+            sys.exit(f"missing {path}, see docs/src/pages/installation/source.mdx")
 
     start_infrastructure(CLUSTER_INFRASTRUCTURE)
     RUN.mkdir(parents=True, exist_ok=True)
@@ -367,7 +367,7 @@ def up_cluster(fresh):
     while (free_gb := shutil.disk_usage(SHARED_MEMORY).free / 2**30) < CLUSTER_SHARED_MEMORY_GB:
         if time.time() > deadline:
             sys.exit(f"{SHARED_MEMORY} has {free_gb:.1f} GB free and a cluster needs "
-                     f"{CLUSTER_SHARED_MEMORY_GB} GB, see STARTUP.md")
+                     f"{CLUSTER_SHARED_MEMORY_GB} GB, see docs/src/pages/installation/source.mdx")
         time.sleep(0.2)
 
     outbox = outbox_settings()
@@ -431,7 +431,7 @@ def cmd_restart(args):
 def cmd_install(_):
     for executable in ("cargo", "npm", "java", "cmake", "clang"):
         if not shutil.which(executable):
-            sys.exit(f"missing {executable}; install the prerequisites in STARTUP.md first")
+            sys.exit(f"missing {executable}; install the prerequisites in docs/src/pages/installation/source.mdx first")
     RUN.mkdir(parents=True, exist_ok=True)
     jar = Path(os.environ.get("AERON_JAR", RUN / "aeron-all-1.54.0.jar"))
     if not jar.exists():

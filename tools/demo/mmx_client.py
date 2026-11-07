@@ -75,7 +75,7 @@ def place(gateway, player, symbol, side, size, price=None):
     order_id = str(uuid7())
     order = {
         "client_order_id": order_id,
-        "product_id": symbol,
+        "symbol": symbol,
         "side": side,
         "type": "market" if price is None else "limit",
         "size": size,

@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'SemVer without v (for example 0.1.0-rc.1)'
+        description: 'SemVer without v (first release: 0.1.0-rc.1)'
         required: true
         type: string
 
@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: mmx-release-${{ inputs.version }}
+  group: mmx-release-${{ inputs.version || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -83,6 +83,8 @@ jobs:
           node-version: 24
       - name: Stamp the CLI version before building images
         run: node deploy/release/version-cli.mjs "$VERSION"
+      - name: Cache native dependencies
+        run: docker buildx bake -f deploy/docker/docker-bake.hcl deps --progress=plain
       - name: Test native services before publishing
         run: docker buildx bake -f deploy/docker/docker-bake.hcl test --progress=plain
       - name: Build and push native core images
@@ -244,15 +246,35 @@ jobs:
           merge-multiple: true
           path: release
       - uses: azure/setup-helm@v4
-      - name: Publish chart and GitHub release assets
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Publish chart
         run: |
           printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           helm push "release/mmx-$VERSION.tgz" "oci://$REGISTRY/charts"
+      - name: Stage draft release assets
+        run: |
           cd release
           sha256sum mmx-*.tar.gz "mmx-$VERSION.tgz" compose.yaml image-digests.json image-digests.tsv install.sh quickstart.yaml > SHA256SUMS
           printf 'Published images and chart are locked in image-digests.json.\n\nHelm chart: oci://%s/charts/mmx --version %s\n' "$REGISTRY" "$VERSION" > release-notes.md
           if [ "${VERSION#*-}" != "$VERSION" ]; then prerelease=--prerelease; else prerelease=; fi
-          gh release create "v$VERSION" --target "$GITHUB_SHA" --title "MMX $VERSION" \
-            --notes-file release-notes.md $prerelease \
-            mmx-*.tar.gz "mmx-$VERSION.tgz" SHA256SUMS compose.yaml \
-            image-digests.json image-digests.tsv install.sh quickstart.yaml
+          if gh release view "v$VERSION" --json isDraft --jq .isDraft 2>/dev/null | grep -qx true; then
+            gh release upload "v$VERSION" --clobber \
+              mmx-*.tar.gz "mmx-$VERSION.tgz" SHA256SUMS compose.yaml \
+              image-digests.json image-digests.tsv install.sh quickstart.yaml
+          else
+            gh release create "v$VERSION" --draft --target "$GITHUB_SHA" --title "MMX $VERSION" \
+              --notes-file release-notes.md $prerelease \
+              mmx-*.tar.gz "mmx-$VERSION.tgz" SHA256SUMS compose.yaml \
+              image-digests.json image-digests.tsv install.sh quickstart.yaml
+          fi
+      - name: Verify anonymous installation access
+        run: |
+          node deploy/release/verify-public.mjs release/image-digests.json
+          anonymous=$(mktemp -d)
+          HELM_REGISTRY_CONFIG="$anonymous/helm.json" DOCKER_CONFIG="$anonymous/docker" \
+            helm pull "oci://$REGISTRY/charts/mmx" --version "$VERSION" --destination "$anonymous"
+          helm template mmx "$anonymous/mmx-$VERSION.tgz" > /tmp/mmx-public-release.yaml
+      - name: Publish publicly installable release
+        run: gh release edit "v$VERSION" --draft=false

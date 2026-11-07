@@ -15,12 +15,12 @@ struct CandleUpdate {
     low: String,
     close: String,
     volume: String,
-    product_id: String,
+    symbol: String,
 }
 
 fn format_candle(candle: &Candle) -> Result<Update, serde_json::Error> {
-    let product_id = symbol_name(&candle.symbol);
-    let subject = format!("candles.{product_id}");
+    let symbol = symbol_name(&candle.symbol);
+    let subject = format!("candles.{symbol}");
     let payload = serde_json::to_string(&CandleUpdate {
         start: candle.start.to_string(),
         open: format_decimal(candle.open),
@@ -28,7 +28,7 @@ fn format_candle(candle: &Candle) -> Result<Update, serde_json::Error> {
         low: format_decimal(candle.low),
         close: format_decimal(candle.close),
         volume: format_decimal(candle.volume),
-        product_id,
+        symbol,
     })?;
     Ok(Update { subject, payload })
 }
@@ -81,7 +81,7 @@ mod tests {
         assert_eq!(update.subject, "candles.ITEM");
         assert_eq!(
             update.payload,
-            r#"{"start":"1745100300","open":"545","high":"549.5","low":"511","close":"544","volume":"1234","product_id":"ITEM"}"#
+            r#"{"start":"1745100300","open":"545","high":"549.5","low":"511","close":"544","volume":"1234","symbol":"ITEM"}"#
         );
     }
 

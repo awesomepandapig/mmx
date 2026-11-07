@@ -7,7 +7,7 @@
     "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
     "cpu": "Apple M4",
     "os": "macOS-26.3.1-arm64-arm-64bit",
-    "engine": "/Users/theaw/Projects/sbx/target/dist/matching-engine",
+    "engine": "/Users/theaw/Projects/mmx/target/dist/matching-engine",
     "load_before": 2.86,
     "date": "2026-11-04T15:10:53+00:00"
   },

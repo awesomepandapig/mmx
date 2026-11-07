@@ -9,7 +9,7 @@ struct RawRequest {
     kind: String,
     channel: String,
     #[serde(default)]
-    product_ids: Vec<String>,
+    symbols: Vec<String>,
     jwt: Option<String>,
     player_id: Option<String>,
 }
@@ -34,7 +34,7 @@ pub enum Channel {
 pub struct Request {
     pub action: Action,
     pub channel: Channel,
-    pub product_ids: Vec<String>,
+    pub symbols: Vec<String>,
     /// The token that identifies a player when subscribing to `user`.
     pub jwt: Option<String>,
     /// Which player to drop when unsubscribing from `user`. It can only remove this socket's own
@@ -42,7 +42,7 @@ pub struct Request {
     pub player_id: Option<String>,
 }
 
-/// Product and player IDs are NATS subject tokens and are written into JSON unescaped, so they
+/// Symbols and player IDs are NATS subject tokens and are written into JSON unescaped, so they
 /// can't contain `.`, `*`, `>` or quotes.
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
@@ -70,18 +70,18 @@ pub fn parse_request(text: &str) -> Result<Request, &'static str> {
         _ => return Err("unknown channel"),
     };
 
-    if !raw.product_ids.iter().all(|id| valid_id(id)) {
-        return Err("invalid product_id");
+    if !raw.symbols.iter().all(|id| valid_id(id)) {
+        return Err("invalid symbol");
     }
-    let needs_products = !matches!(channel, Channel::Heartbeats | Channel::User);
-    if needs_products && raw.product_ids.is_empty() {
-        return Err("product_ids required");
+    let needs_symbols = !matches!(channel, Channel::Heartbeats | Channel::User);
+    if needs_symbols && raw.symbols.is_empty() {
+        return Err("symbols required");
     }
 
     Ok(Request {
         action,
         channel,
-        product_ids: raw.product_ids,
+        symbols: raw.symbols,
         jwt: raw.jwt,
         player_id: raw.player_id,
     })

@@ -1,0 +1,8 @@
+# MMX
+
+MMX is an open-source, self-hosted trading engine for game economies and virtual commodities. It matches orders; the game server owns player accounts, asset reservations, and settlement.
+
+- [Documentation](https://docs.mmx.exchange/llms.txt): installation, architecture, API references, and integration guides. Append .md to documentation page URLs for Markdown.
+- [Getting started](https://docs.mmx.exchange/getting-started.md)
+- [Source](https://github.com/awesomepandapig/mmx)
+- [Interactive demo](https://mmx.exchange/demo): a browser simulation, not a live exchange.

@@ -59,6 +59,18 @@ Group names match exactly; membership in several groups grants the highest role.
 4. Repeat for the other follower.
 5. Finally, restart the leader node. The remaining two voters will elect a new leader without service interruption.
 
+## Symbol field migration
+
+REST order requests, queries, responses, and market events use `symbol`. WebSocket
+subscriptions use `symbols`. Update game servers and clients together when upgrading from an older
+market-identifier contract; the gateway does not accept the previous field names.
+
+Older ticker checkpoints cannot be read after the field rename. With `TAPE_ARCHIVES` configured,
+market-data ignores the incompatible checkpoint and rebuilds ticker state from the retained tape.
+Allow time for replay before relying on ticker values, and retain the archive throughout the upgrade.
+Live-only consumers cannot reconstruct history; configure archive replay before this upgrade if
+historical ticker state is required. The SBE wire schema and authoritative tape are unchanged.
+
 ## QuestDB single-writer & storage fencing
 
 :::warning[Recorder ownership]

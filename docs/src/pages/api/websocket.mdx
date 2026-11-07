@@ -5,10 +5,10 @@ The WebSocket service streams market data; orders are submitted over REST, not W
 ## Subscribe
 
 ```json
-{ "type": "subscribe", "channel": "ticker", "product_ids": ["IRON", "COAL"] }
+{ "type": "subscribe", "channel": "ticker", "symbols": ["IRON", "COAL"] }
 ```
 
-Send `"type": "unsubscribe"` to stop. `product_ids` is required on every channel except `heartbeats` and `user`. After each change, the service sends your current subscriptions.
+Send `"type": "unsubscribe"` to stop. `symbols` is required on every channel except `heartbeats` and `user`. After each change, the service sends your current subscriptions.
 
 | Channel | Sends |
 | --- | --- |

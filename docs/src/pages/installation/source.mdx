@@ -29,4 +29,27 @@ credentials under `deploy/config` and `deploy/.env`; data lives in Docker volume
 Continue with [Getting started](/getting-started). Use `mmx local down` to stop the deployment while
 preserving its data. Rebuild changed services with `mmx local up --build`.
 
-For native service development without containers, see the repository's `STARTUP.md`.
+## Native service development
+
+To build and test all Rust services on the host, install Rust 1.99.1 with rustfmt and Clippy,
+CMake 3.30 or newer, Clang/libclang, JDK 21 or newer, Aeron 1.54.0, and Node 24 LTS.
+The Aeron version must match `rusteron-client`.
+
+Build the embedded console before compiling the operator CLI:
+
+```sh
+npm --prefix console ci
+npm --prefix console run build
+cargo build --workspace --release --locked
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-features --all-targets --locked
+cargo fmt --all -- --check
+```
+
+The repository's `tools/` directory contains load generators, invariant checks, profiling,
+and local development helpers. Production operations use the `mmx` CLI. Run crash tests
+against disposable state; `tools/scripts/mmx.py verify --orders 20000` restarts the engine.
+
+The landing page and documentation are independent npm packages. Run `npm ci` followed by
+`npm run dev` in `web/` or `docs/`. See the repository's
+[deployment guide](https://github.com/awesomepandapig/mmx/blob/main/deploy/vercel.md) for Vercel setup.

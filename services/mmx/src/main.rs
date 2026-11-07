@@ -766,7 +766,7 @@ async fn run_order(cli: &Cli, player: Option<Uuid>, command: &OrderCommand) -> R
         } => {
             let order = NewOrder {
                 client_order_id: client_order_id.unwrap_or_else(Uuid::now_v7),
-                product_id: symbol.clone(),
+                symbol: symbol.clone(),
                 side: side.clone(),
                 r#type: if price.is_some() { "limit" } else { "market" }.to_string(),
                 size: size.clone(),

@@ -19,7 +19,7 @@ pub struct CreateOrder {
     /// Chosen by the game server, and how it finds the order later. Required in cluster mode, where
     /// it must be a fresh UUIDv7. Callers never retry, and a replay of this ID places nothing.
     pub client_order_id: Option<Uuid>,
-    pub product_id: String,
+    pub symbol: String,
     pub side: String,
     pub r#type: String,
     pub size: String,
@@ -58,7 +58,7 @@ pub fn validate_order(
         (None, None) => uuid_to_u64s(Uuid::new_v4()),
     };
 
-    let symbol = super::markets::normalize_symbol(&payload.product_id).map_err(validation_error)?;
+    let symbol = super::markets::normalize_symbol(&payload.symbol).map_err(validation_error)?;
     let market = markets
         .get(&symbol)
         .ok_or_else(|| validation_error(format!("Market '{symbol}' is not enabled.")))?;
@@ -156,7 +156,7 @@ markets:
     fn limit(price: &str, size: &str) -> CreateOrder {
         CreateOrder {
             client_order_id: Some(Uuid::now_v7()),
-            product_id: "item".to_string(),
+            symbol: "item".to_string(),
             side: "buy".to_string(),
             r#type: "limit".to_string(),
             size: size.to_string(),
@@ -228,7 +228,7 @@ markets:
     #[test]
     fn a_market_must_be_enabled() {
         let mut order = limit("1", "1");
-        order.product_id = "OTHER".to_string();
+        order.symbol = "OTHER".to_string();
         assert!(check(&order).unwrap_err().contains("not enabled"));
     }
 

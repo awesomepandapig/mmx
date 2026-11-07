@@ -1,0 +1,144 @@
+# Game server SDK design
+
+This is a proposed SDK contract. No installable MMX SDK is shipped yet. The first target is a
+server-side TypeScript package, followed by engine adapters for Godot, Unity, and Unreal. Package
+names and language priority remain open decisions.
+
+The SDK should handle HTTP, token refresh, exact decimal values, order reconciliation, signed
+webhooks, and reconnects. Your game database remains responsible for accounts, reservations,
+settlement, and fees. MMX remains responsible for matching and execution reports.
+
+## Start with the deployed contract
+
+Today the REST gateway trusts a game server that authenticates its players and sets `x-player-id`.
+It does **not** validate player JWTs. Keep it on a private network behind that trusted server.
+Console OIDC sessions and private WebSocket JWTs are separate credentials, with different audiences.
+An SDK must not imply that attaching a bearer token makes today's gateway safe to expose publicly.
+
+Gateway JWT/OIDC validation, durable admission orchestration, immutable idempotency responses, and
+private order-event publishing are prerequisites for the corresponding future SDK features. See
+[authentication](/guides/authentication), [REST](/api/rest), and [feature status](/status).
+
+## Package boundaries
+
+| Component | Responsibility |
+| --- | --- |
+| Transport client | Orders, cancels, queries, timeouts, typed errors, decimal strings, request correlation |
+| Credentials adapter | Obtain a token from the game's identity provider; coalesce refreshes and refresh before expiry |
+| Durable order coordinator | Persist immutable intent, reservation identity, submission state, and reconciliation work |
+| Webhook verifier | Verify raw-body HMAC, timestamp tolerance, and supported event shape before processing |
+| Ledger adapter | Execute dedupe, settlement, fee accounting, and hold release in the game's database transaction |
+| Market stream client | Subscriptions, heartbeats, reconnect jitter, stale-state flags, and explicit gap recovery |
+| Engine adapter | Map game types to symbols and decimals; keep credentials and ledger operations on the server |
+
+Keep HTTP types usable without the coordinator. A game with an existing durable ledger should
+implement a small adapter rather than run an SDK-owned second database. Browser and game-client
+builds must exclude signing secrets and server credentials.
+
+## Proposed server API
+
+The following illustrates the interface only; it is not a working installation example:
+
+```ts
+const mmx = createMmxServer({
+  baseUrl: config.mmxUrl,
+  credentials: gameIdentityProvider,
+  operations: durableOperationStore,
+  ledger: gameLedger,
+});
+
+const result = await mmx.orders.place({
+  operationId: persistedOperationId,
+  accountId: player.accountId,
+  symbol: "IRON",
+  side: "buy",
+  type: "limit",
+  size: "100",
+  price: "9.50",
+});
+
+// Accepted, rejected, or unresolved; a timeout is an unresolved outcome.
+await mmx.operations.reconcile(result.operationId);
+```
+
+Do not accept JavaScript `number` for amounts. Validate decimal strings to eight places and use
+integer mantissas or an exact decimal library internally. Preserve large IDs and nanosecond times
+without rounding. UUIDv7 operation IDs must meet the gateway's admission window when first submitted.
+Tokens come from the configured identity provider; the SDK must not mint gateway credentials or
+reuse the operator admin token for trading. Refresh on authentication expiry is bounded and does
+not by itself authorize repeating an economic operation.
+
+## Durable state and retries
+
+Persist an account-scoped operation ID and an immutable fingerprint of the order **before** network
+submission. Record reservation changes and submission transitions durably. A repeated operation with
+a different payload is a conflict, including across process restarts and multiple game-server instances.
+
+```text
+created -> reserving -> reserved -> submitting -> accepted -> terminal
+                                    |
+                                    +-> unresolved -> reconcile -> accepted / never_landed
+```
+
+A durable reservation receipt must precede submission. On a crash between reservation and recording
+its result, recover by the same reservation key rather than creating another hold. Once submission
+might have occurred, retain the hold until authoritative reconciliation or terminal settlement.
+Fence queued workers and delayed submissions before interpreting non-execution as permission to
+release. A local timeout, missing derived-history row, or `409 duplicate_order` proves neither outcome.
+
+For the current gateway, reuse the original `client_order_id` only where its existing contract permits
+it; never generate a new ID to retry an unresolved order. Poll its reconciliation endpoint with bounded
+exponential backoff and jitter. Treat `unknown` as unresolved. Retain reservations until the gateway
+returns `never_landed` or settlement establishes the outcome. Do not advertise exactly-once HTTP
+execution: durable replayable idempotency remains gateway work.
+
+The durable store adapter needs compare-and-set transitions, account/operation uniqueness, immutable
+intent storage, leasing with fencing for workers, and a query for overdue reconciliation. A worker
+must resume outstanding operations after restart. Cancellation is a separate operation; sending a
+cancel or receiving a cancel rejection does not itself close the original hold.
+
+## Webhook settlement
+
+Verify `X-MMX-Signature` over the timestamp and **raw body bytes** using constant-time comparison,
+then enforce an allowed clock skew. Reject invalid signatures before parsing events. Support bounded
+body sizes and secret rotation. Persist each `fill_id` and the associated ledger mutation in the same
+transaction, and acknowledge `2xx` only after commit. Duplicate deliveries return success after
+confirming the original transaction committed.
+
+Use `terminal`, `release_qty`, and the original reservation state to settle each event. A buy reservation
+requires currency accounting for executed cost, price improvement, and fees; `release_qty` is an asset
+quantity, not a currency refund. Terminal fills can carry zero release quantity and still require
+releasing excess reserved currency. A cancel rejection names a separate cancel operation and must
+not release the resting order's assets. Market buys require an explicit spending bound and authority
+before submission; do not enable them through an SDK helper until that contract exists.
+
+Fee rules are game-owned, versioned with each reservation, and applied within settlement transactions.
+The SDK must not silently introduce a fee policy. Preserve dedupe identities for the retained execution
+history so replay after an outbox rebuild cannot settle a trade twice. See [fill webhooks](/guides/webhooks).
+
+## Streams and reconnects
+
+Expose connection status and the last update time separately from cached values. Reconnect using
+capped exponential backoff with full jitter, and restore only active subscriptions. Do not treat
+WebSocket events as settlement authority. Private order feeds are not yet published.
+
+An order-book cache must wait for a supported atomic snapshot/delta protocol and sequence-gap
+recovery before claiming synchronization. Until that exists, surface stale or incomplete state to the
+caller instead of presenting a reconnect as a complete order book.
+
+## Delivery stages and acceptance checks
+
+1. Publish typed REST transport, exact decimals, UUIDv7 support, typed errors, and a webhook verifier
+   against recorded contract fixtures. Document today's private gateway trust boundary.
+2. Add transactional ledger/store adapters and restartable reconciliation. Prove crash recovery before
+   and after reservation, submission, settlement commit, and webhook acknowledgement.
+3. Add gateway token providers once JWT/OIDC admission is implemented. Test refresh stampedes,
+   expiry, revoked credentials, account mismatch, and refusal on missing authority.
+4. Add stream synchronization once snapshot/gap recovery and private publishing are available.
+   Test reconnect storms, stale data, and lost messages.
+5. Add one real game-server sample, then engine adapters. Verify duplicate webhook delivery,
+   partial fills, cancel races, lost HTTP replies, worker fencing, and ledger rollback end to end.
+
+Before implementation, choose the first server language and storage adapter, token issuer and account
+mapping, market-buy spending policy, and supported fee model. These decisions should not be hidden
+inside a convenience wrapper.

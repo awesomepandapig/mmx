@@ -10,7 +10,7 @@ const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 
 #[derive(Serialize, Debug, Clone)]
 pub struct Ticker {
-    product_id: String,
+    symbol: String,
     price: String,
     volume_24_h: String,
     low_24_h: String,
@@ -28,7 +28,7 @@ pub struct Ticker {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TickerState {
-    product_id: String,
+    symbol: String,
     start_24_hr_ts: u64,
     volume_24_h: i64,
     low_24_h: i64,
@@ -40,9 +40,9 @@ pub struct TickerState {
 }
 
 impl TickerState {
-    pub fn new(product_id: String) -> Self {
+    pub fn new(symbol: String) -> Self {
         Self {
-            product_id,
+            symbol,
             start_24_hr_ts: 0,
             volume_24_h: 0,
             low_24_h: i64::MAX,
@@ -131,7 +131,7 @@ impl TickerState {
         };
 
         Ticker {
-            product_id: self.product_id.clone(),
+            symbol: self.symbol.clone(),
             price: format_decimal(self.last_price),
             volume_24_h: format_decimal(self.volume_24_h),
             low_24_h: format_decimal(low_24h),

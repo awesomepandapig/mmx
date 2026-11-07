@@ -23,7 +23,7 @@ pub const CANCEL_MESSAGE_SIZE: usize =
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub struct Order {
     pub id: String,
-    pub product_id: String,
+    pub symbol: String,
     pub side: String,
     pub r#type: String,
     pub created_at: String,
@@ -76,7 +76,7 @@ impl Order {
     pub fn accepted(order: &ValidOrder, timestamp_ns: u64) -> Self {
         Order {
             id: u64s_to_uuid(order.cl_ord_id).to_string(),
-            product_id: String::from_utf8_lossy(&order.symbol)
+            symbol: String::from_utf8_lossy(&order.symbol)
                 .trim_end_matches('\0')
                 .to_string(),
             side: side_name(order.side),
@@ -109,7 +109,7 @@ impl Order {
         let filled = order.filled_mantissa;
         Order {
             id: order.id.to_string(),
-            product_id: order.symbol,
+            symbol: order.symbol,
             side: side_name(order.side),
             // The engine only leaves the price null on market orders.
             r#type: if order.price_mantissa.is_some() {

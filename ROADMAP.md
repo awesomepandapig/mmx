@@ -13,7 +13,7 @@ game server -> gateway -> engine (Aeron Cluster) -> tape (Aeron Archive)
                                                      |-> market-data -> NATS -> websocket
 ```
 
-These decisions are settled:
+These are target architecture decisions; the unchecked prerequisites below remain required:
 
 - **The engine only matches.** It has no IO, HTTP or business/risk validation. Its protocol boundary
   validates complete message envelopes before applying effects. It trusts authorized ingress and
@@ -33,9 +33,10 @@ These decisions are settled:
 - **Failover** uses the term marker in the report stream to tell which in-flight orders landed.
 - **Data only flows one way.** Consumers derive state from the tape and never feed it back. Archive is
   the source of truth, and it holds the snapshots.
-- **Execution notifications follow durability.** Archive sync level 1 is the default, so a commit is
-  on a quorum's disks and a total power loss can't undo what the game has seen. The outbox also syncs
-  to disk before sending a webhook. Sync 0 is an opt-in for operators who accept that window.
+- **Execution notifications must follow durability.** Archive sync level 1 is the chart default,
+  and the outbox syncs its local journal before sending a webhook. Archive sync alone does not prove
+  quorum disk durability or power-loss safety; those claims require end-to-end evidence. Sync 0 is an
+  opt-in for operators who accept a larger loss window.
 - **Admission/risk integration is general.** The game-focused default validates at the gateway,
   durably records admission intent, asks the game ledger to reserve assets, and waits for durable
   confirmation before submitting to matching. Other providers must establish equivalent configured
@@ -61,15 +62,17 @@ These decisions are settled:
   Up to a minute or so to reach gateways is acceptable, because markets change rarely.
 - **Snapshots are rare,** because failures are assumed to be rare. Restarts may take minutes, and a
   live pause must pass for a real exchange.
-- **Generic language only.** No Minecraft, Hypixel or SkyBlock references in new code. Use player, game
-  and item.
+- **Generic language only.** Use player, game, symbol and item without naming a specific game.
 
 ## Sections
 
-Each section owns its listed paths, so sections can be built in parallel. Sections marked **wave 1** are
-in progress.
+Checked items are implemented in the repository; this is not a claim that all production recovery
+scenarios have passed. Remaining work is tracked in the linked GitHub issues. Design decisions above
+describe the target behavior where an unchecked item still supplies a missing prerequisite.
 
-### 1. Gateway (wave 1)
+### 1. Gateway
+
+Tracking: [#11](https://github.com/awesomepandapig/mmx/issues/11).
 
 Owns `services/api/rest`.
 
@@ -87,24 +90,28 @@ Owns `services/api/rest`.
 - [ ] JWT validation on by default, including game-server-only deployments
 - [ ] Optional OIDC, with token introspection, mapping users to accounts
 - [ ] Direct public player access with validated account/risk authority; administrator can disable it
-- [x] Atomic claim in Valkey with UUIDv7 IDs, so a repeated ID can never execute twice, on any gateway
+- [ ] Durable account-scoped idempotency: immutable intent, replayable results and worker fencing
+- [ ] Durable reservation-before-submission orchestration and safe reconciliation of unknown outcomes
+- [x] Atomic UUIDv7 claims across gateways within the admission window; durable immutable-intent retry responses remain open
 
-### 2. WebSocket (wave 1)
+### 2. WebSocket
+
+Tracking: [#12](https://github.com/awesomepandapig/mmx/issues/12); existing UI work: [#7](https://github.com/awesomepandapig/mmx/issues/7).
 
 Owns `services/api/websocket`.
 
-- [x] Subscriptions by channel and product
+- [x] Subscriptions by channel and symbol
 - [x] Heartbeats
 - [x] Close sockets after 60 seconds with no message
 - [x] Cache tickers, refreshed every second
 - [ ] Private per-player order feed: websocket reads `orders.*`, but nothing publishes it yet
 - [x] Handle failures without panicking
 
-### 3. Market data and recording (wave 1)
+### 3. Market data and recording
 
 Owns `services/market-data` and `services/trade-reporter`.
 
-- [ ] Stop `level2` silently dropping updates
+- [x] Retain `level2` updates on a full queue and retry network publish failures (`crates/tape/src/feed.rs`); permanent publish errors are logged
 - [x] Candles service, emitting once per second
 - [x] Record orders, trades and candles in QuestDB, including filled orders
 - [x] Rebuild QuestDB from the tape
@@ -112,7 +119,9 @@ Owns `services/market-data` and `services/trade-reporter`.
 - [x] Keep listening instead of crashing, with no panics on the data path
 - [x] Share `messages.rs` instead of duplicating it
 
-### 4. Outbox and webhooks (wave 1)
+### 4. Outbox and webhooks
+
+Tracking: [#13](https://github.com/awesomepandapig/mmx/issues/13).
 
 Owns the new `services/outbox`.
 
@@ -125,7 +134,9 @@ Owns the new `services/outbox`.
 - [ ] Pause after repeated failures on one batch and alert the operator, so a batch that crashes the game can't crashloop it
 - [ ] Optional maximum delivery rate
 
-### 5. Engine durability (wave 1)
+### 5. Engine durability
+
+Tracking: snapshots [#14](https://github.com/awesomepandapig/mmx/issues/14), recovery [#15](https://github.com/awesomepandapig/mmx/issues/15), explicit outcomes [#16](https://github.com/awesomepandapig/mmx/issues/16).
 
 Owns `crates/cluster` and `services/matching-engine`.
 
@@ -140,12 +151,12 @@ Owns `crates/cluster` and `services/matching-engine`.
 - [x] Report a repeat of a resting order as a duplicate, even on a full book
 - [x] Keep held Archive connections alive and reconnect before a snapshot if one has dropped. Unread pings filled a 64 KB term in about 17 minutes, so every timed snapshot panicked every node
 - [ ] Recovery plan for an order that panics every node, since replay hits the same panic
-- [ ] Reject a message split across frames instead of panicking; only `mmx-cluster-bench --batch` above about 13 sends one
+- [x] Assemble committed-log fragments and reject malformed or truncated batches before applying effects (`crates/cluster/src/log.rs`, `services/matching-engine/src/framing.rs`)
 - [ ] Give a full book its own reject reason and an operator alert
 - [ ] Give self-trade cancels their own reason
 - [ ] Clear stale TODOs in `publisher.rs`, `types.rs`, `config.rs` and `handler.rs`
 
-### 6. Packaging (wave 1)
+### 6. Packaging
 
 Owns the new `deploy/`.
 
@@ -156,6 +167,8 @@ Owns the new `deploy/`.
 - [x] CI: build, test and chart install
 
 ### 7. Control plane
+
+Tracking: snapshots [#17](https://github.com/awesomepandapig/mmx/issues/17), credentials [#18](https://github.com/awesomepandapig/mmx/issues/18).
 
 - [x] Admin API, used by both the CLI and console
 - [x] Per-market halt, so operators can stop trading in one market at once, such as during a dupe
@@ -171,16 +184,21 @@ Owns the new `deploy/`.
 
 ### 8. Demo and public face
 
-- [ ] Rename MMX to MMX, and remove game-specific references
-- [ ] Retire the `auth` service
-- [ ] Demo trading UI, with credentials from the environment or generated at startup
-- [ ] Finish `OrderDrawer.tsx`: live status, order updates and error handling
-- [ ] Validate the symbol on the trade page
-- [ ] Demo load bots
-- [ ] Merge the landing page, using zero cookies
-- [ ] Rewrite the docs site, and run the release 1 agent test
+Tracking: live orders [#12](https://github.com/awesomepandapig/mmx/issues/12), release validation [#19](https://github.com/awesomepandapig/mmx/issues/19).
+
+- [x] Complete the MMX naming audit and remove references to specific games
+- [x] Retire the `auth` service from tracked builds, deployment and local source
+- [x] Browser-only simulated trading demo at `/demo`, with no backend credentials (`web/app/components/demo`)
+- [ ] Live account order UI: status, private order updates, cancellation and errors; the legacy `OrderDrawer.tsx` route is retired
+- [x] Retire the unvalidated legacy trade route; the demo selects from its simulated market catalog
+- [ ] Optional live demo load bots; the browser simulation is not a gateway load test
+- [x] Landing page at `/` uses no cookie/session APIs (`web/app/routes/_index`)
+- [x] Rewrite the docs site with installation, API and operations guides (`docs/src/pages`)
+- [ ] Run the release 1 agent installation/integration test against a published release
 
 ### 9. Engine SDKs
+
+Tracking: [#20](https://github.com/awesomepandapig/mmx/issues/20).
 
 The pitch: you don't build an exchange, and you don't do much work at all. Deploying MMX is simple,
 and you plug in an SDK and trade from day one. Each SDK knows the API contract, so a game calls
@@ -191,12 +209,15 @@ the raw APIs or an SDK.
 - [ ] Unity SDK
 - [ ] Unreal SDK
 - [ ] Fee config in the SDKs and escrow helpers, so games can apply fees cleanly. MMX only reports trades, and fees stay in the game database
-- [ ] Add SDKs to the docs beside the raw APIs
+- [x] Document the proposed server SDK contract beside raw APIs ([design](docs/src/pages/guides/sdk.mdx))
+- [ ] Publish installable SDKs with tested usage docs beside the raw APIs
 - [ ] Show the SDK sample on the landing page, replacing the raw API samples
 - [ ] End-to-end docs sample in a real game engine, such as Godot
 - [ ] Demo video for the landing page hero and the docs
 
 ### Cross-cutting
+
+Tracking: service hardening [#21](https://github.com/awesomepandapig/mmx/issues/21), Aeron [#22](https://github.com/awesomepandapig/mmx/issues/22).
 
 - [ ] Remove every `.expect`, `unwrap` and panic on a runtime path outside the matching engine, with an explicit handler for each invariant. Services never panic unless it's truly unrecoverable. The engine may panic on a real safety violation, because stopping is safer than continuing
 - [ ] Consistent logging, traces, config and startup across services
@@ -207,10 +228,12 @@ the raw APIs or an SDK.
 
 ### Default deployment (plan)
 
+Tracking: scaling [#23](https://github.com/awesomepandapig/mmx/issues/23), streams [#24](https://github.com/awesomepandapig/mmx/issues/24).
+
 3x the core, and everything else replays from the tape. About 7 binaries, scaling only what's under load.
 
 - [ ] Cluster fixed at 3, gateways and websockets at 2 or more with autoscaling on by default
-- [ ] `market-data`, `trade-reporter`, `outbox` and QuestDB at 1, recovering from the tape
+- [x] One replica for each tape consumer and QuestDB by default; consumers resume from persisted checkpoints (`deploy/helm/mmx/templates/consumers.yaml`, `infrastructure.yaml`)
 - [ ] NATS at 3 in production and 1 locally, with no JetStream
 - [ ] Valkey at 3 plain shards chosen by player hash in the gateway, with no replicas, so a claim can't be lost in a failover. Halts and overrides need one fixed home
 - [ ] Sizing presets (small, medium, launch) as a single value, with claim memory pre-sized
@@ -222,12 +245,17 @@ the raw APIs or an SDK.
 
 ### Direct lane (plan)
 
+Tracking: [#25](https://github.com/awesomepandapig/mmx/issues/25).
+
 - [ ] Authenticated SBE sessions into the cluster for trusted partners, with per-session sequence numbers, skipping REST gateways and Valkey
 
 ### From the infra review (plan)
 
-- [ ] Cluster page: members, leader, log position, snapshot age, every consumer's lag, and failed checks named on screen
-- [ ] Stale data never looks live: "as of" times, and a market reads "cannot trade" when the engine is down
+Tracking: control plane [#26](https://github.com/awesomepandapig/mmx/issues/26), chart [#27](https://github.com/awesomepandapig/mmx/issues/27), operations [#28](https://github.com/awesomepandapig/mmx/issues/28).
+
+- [x] Cluster page: members, leader, stream positions, consumer lag and named failed checks (`console/src/pages/Cluster.tsx`, `components/Health.tsx`)
+- [ ] Report cluster snapshot age in the console and status API
+- [x] Mark cached book/prices with "as of" times and show "Cannot trade" when engine readiness fails (`console/src/pages/Market.tsx`, `lib/exchange.tsx`)
 - [ ] Finer permissions: separate create, update, halt and cancel-all, so developers can add markets without deleting them
 - [ ] A separate gateway credential, since the admin token in gateway pods makes a gateway compromise a console admin
 - [ ] Refuse to delete a market with open orders, add a global halt with reasons, and make halts survive Valkey loss
@@ -236,10 +264,14 @@ the raw APIs or an SDK.
 - [ ] GitOps-safe chart: no `lookup` state, an external control Secret, an unmanaged config mode, and secrets that fit Vault
 - [ ] Metrics on every service, alert rules, dashboards, traces and JSON logs
 - [ ] Durable audit log, market revision history with rollback, named service accounts and expiring API tokens
-- [ ] Gateway `/readyz` as the default probe, probes on consumers, and backup, restore and upgrade docs
-- [ ] Tagged, signed releases with an OCI chart
+- [x] Gateway `/readyz` is the default Helm readiness probe (`deploy/helm/mmx/values.yaml`)
+- [ ] Consumer application probes and verified backup, restore and upgrade procedures
+- [x] Configure versioned OCI chart, image digests, CLI assets and checksums in `.github/workflows/release.yml`
+- [ ] Publish and verify a release; add cryptographic release/chart signatures
 
 ## Later
+
+Tracking: [#29](https://github.com/awesomepandapig/mmx/issues/29).
 
 - Reduce the symbols per engine, with a routing table in the gateway
 - Dedicated single-symbol engines

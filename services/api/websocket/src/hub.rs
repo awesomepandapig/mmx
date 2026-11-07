@@ -182,7 +182,7 @@ impl Hub {
         match subject.split_once('.') {
             Some(("l2", product)) if valid_id(product) => {
                 let events = format!(
-                    r#"[{{"type":"update","product_id":"{}","updates":[{}]}}]"#,
+                    r#"[{{"type":"update","symbol":"{}","updates":[{}]}}]"#,
                     product, body
                 );
                 self.publish_market(Topic::Level2(product.to_string()), "l2_data", events);
@@ -194,7 +194,7 @@ impl Hub {
             }
             Some(("candles", product)) if valid_id(product) => {
                 let events = format!(
-                    r#"[{{"type":"update","product_id":"{}","candles":[{}]}}]"#,
+                    r#"[{{"type":"update","symbol":"{}","candles":[{}]}}]"#,
                     product, body
                 );
                 self.publish_market(Topic::Candles(product.to_string()), "candles", events);
@@ -210,7 +210,7 @@ impl Hub {
 
     fn publish_order(&self, player: &str, product: &str, body: &str) {
         let events = format!(
-            r#"[{{"type":"update","player_id":"{}","product_id":"{}","updates":[{}]}}]"#,
+            r#"[{{"type":"update","player_id":"{}","symbol":"{}","updates":[{}]}}]"#,
             player, product, body
         );
         self.deliver(

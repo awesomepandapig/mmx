@@ -181,7 +181,7 @@ class WebSocketWatch(threading.Thread):
             pass
         self.sock.settimeout(None)
         for channel in ("heartbeats", "level2", "ticker", "candles"):
-            self.send({"type": "subscribe", "channel": channel, "product_ids": [symbol]})
+            self.send({"type": "subscribe", "channel": channel, "symbols": [symbol]})
 
     def send(self, message):
         text = json.dumps(message).encode()
@@ -228,7 +228,7 @@ def call(method, path, player, body=None, gateway=GATEWAY):
 
 
 def order_body(side, size, order_id=None):
-    return {"client_order_id": order_id or uuid7(), "product_id": SYMBOL, "side": side,
+    return {"client_order_id": order_id or uuid7(), "symbol": SYMBOL, "side": side,
             "type": "limit", "size": size, "price": PRICE}
 
 
@@ -252,7 +252,7 @@ def recorded(order_id, player, wanted):
     """Reads an order back through QuestDB until `wanted` holds."""
     def attempt():
         status, order = call("GET", f"/orders/{order_id}", player)
-        return order if status == 200 and "product_id" in order and wanted(order) else None
+        return order if status == 200 and "symbol" in order and wanted(order) else None
     return wait_for(attempt, QUERY_WAIT, f"GET to show order {order_id} as expected")
 
 
@@ -300,7 +300,7 @@ def check_trade(game):
     require(maker["status"] == "open" and maker["size"] == "10", f"wrong order: {maker}")
     taker = recorded(taker_id, TAKER, lambda order: order["status"] == "filled")
     require(taker["filled_size"] == "4", f"wrong order: {taker}")
-    status, listed = call("GET", f"/orders?product_id={SYMBOL}&status=open", MAKER)
+    status, listed = call("GET", f"/orders?symbol={SYMBOL}&status=open", MAKER)
     require(status == 200 and maker_id in [order["id"] for order in listed],
             f"GET orders didn't list the open order: {status} {listed}")
     passed("GET shows both orders through QuestDB")
@@ -613,7 +613,7 @@ def stream_orders(orders, slowest):
 def settle(order_id, player):
     """How an order ended. A missing order is only final once the recorder has passed it."""
     status, order = call("GET", f"/orders/{order_id}", player)
-    return order["status"] if status == 200 and "product_id" in order else None
+    return order["status"] if status == 200 and "symbol" in order else None
 
 
 def check_failover(game, nats, websocket, target):

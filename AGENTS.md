@@ -40,8 +40,6 @@ MMX is an open-source, deterministic, price-time priority trading engine designe
   - `kind/`: Local Kubernetes cluster quickstart.
   - `vercel.md`: Vercel project deployment specifications for `web` and `docs`.
 
-- **`auth/`** (Deprecated): Legacy authentication service, replaced by game server bearer delegation and `mmx` OIDC console auth. Untracked and excluded from builds.
-
 ---
 
 ## 2. Architecture & Data Flow

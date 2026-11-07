@@ -13,7 +13,9 @@ export default function Hero() {
           Don&apos;t build an exchange to ship a game.
         </h1>
         <p className="mt-4 text-xl text-mmx-mute">
-          MMX is the trading engine behind your in-game market.
+          MMX is an open-source, self-hosted trading engine for game economies.
+          Match orders and stream market data while your game controls player
+          assets and settlement.
         </p>
         <div className="mt-8 flex flex-wrap items-center gap-2">
           <AgentField />

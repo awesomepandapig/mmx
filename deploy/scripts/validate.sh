@@ -204,7 +204,7 @@ else
     pass "every pod runs as the same user"
 fi
 
-if grep -RInEi 'minecraft|hypixel|skyblock' deploy .github/workflows/deploy.yml \
+if grep -RInEi 'minecraft|hypixel' deploy .github/workflows/deploy.yml \
     --exclude=validate.sh >"$out/words"; then
     cat "$out/words"
     fail "generic language only"

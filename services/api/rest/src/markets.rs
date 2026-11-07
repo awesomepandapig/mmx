@@ -52,12 +52,12 @@ pub fn normalize_symbol(symbol: &str) -> Result<String, String> {
     let normalized = symbol.to_uppercase();
     if normalized.is_empty() || normalized.len() > SYMBOL_LENGTH {
         return Err(format!(
-            "Product ID '{symbol}' is invalid. It must be between 1 and {SYMBOL_LENGTH} characters."
+            "Symbol '{symbol}' is invalid. It must be between 1 and {SYMBOL_LENGTH} characters."
         ));
     }
     if !normalized.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(format!(
-            "Product ID '{symbol}' is invalid. It must be alphanumeric."
+            "Symbol '{symbol}' is invalid. It must be alphanumeric."
         ));
     }
     Ok(normalized)

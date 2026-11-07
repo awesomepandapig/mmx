@@ -267,7 +267,7 @@ pub async fn cancel_order(
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CancelAllParams {
-    product_id: Option<String>,
+    symbol: Option<String>,
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -290,11 +290,7 @@ pub async fn cancel_all_orders(
     params: Result<Query<CancelAllParams>, QueryRejection>,
 ) -> Result<Json<CancelAllResult>, AppError> {
     let Query(params) = params?;
-    let symbol = params
-        .product_id
-        .as_deref()
-        .map(normalize_symbol)
-        .transpose();
+    let symbol = params.symbol.as_deref().map(normalize_symbol).transpose();
     let symbol = symbol.map_err(AppError::ValidationError)?;
 
     if let Some(stream) = &state.report_stream {
@@ -343,7 +339,7 @@ pub enum StatusFilter {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct ListParams {
-    product_id: Option<String>,
+    symbol: Option<String>,
     #[serde(default)]
     status: StatusFilter,
     limit: Option<usize>,
@@ -356,11 +352,7 @@ pub async fn list_orders(
     params: Result<Query<ListParams>, QueryRejection>,
 ) -> Result<Json<Vec<Order>>, AppError> {
     let Query(params) = params?;
-    let symbol = params
-        .product_id
-        .as_deref()
-        .map(normalize_symbol)
-        .transpose();
+    let symbol = params.symbol.as_deref().map(normalize_symbol).transpose();
     let symbol = symbol.map_err(AppError::ValidationError)?;
     let limit = params.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     if limit == 0 || limit > MAX_LIST_LIMIT {

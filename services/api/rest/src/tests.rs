@@ -345,7 +345,7 @@ impl Gateway {
 
 fn limit_order(id: Uuid) -> Value {
     json!({
-        "client_order_id": id, "product_id": "item", "side": "buy", "type": "limit",
+        "client_order_id": id, "symbol": "item", "side": "buy", "type": "limit",
         "size": "2.5", "price": "1.05",
     })
 }
@@ -391,7 +391,7 @@ async fn an_accepted_order_returns_strings_and_omits_nulls() {
 
     assert_eq!(reply.status, StatusCode::CREATED);
     assert_eq!(reply.body["id"], id.to_string());
-    assert_eq!(reply.body["product_id"], "ITEM");
+    assert_eq!(reply.body["symbol"], "ITEM");
     assert_eq!(reply.body["price"], "1.05");
     assert_eq!(reply.body["size"], "2.5");
     assert_eq!(reply.body["executed_value"], "0");
@@ -412,7 +412,7 @@ async fn an_accepted_order_returns_strings_and_omits_nulls() {
 async fn a_market_order_has_no_price_field() {
     let gateway = gateway(Setup::default());
     let body = json!({
-        "client_order_id": Uuid::now_v7(), "product_id": "ITEM", "side": "sell", "type": "market", "size": "1",
+        "client_order_id": Uuid::now_v7(), "symbol": "ITEM", "side": "sell", "type": "market", "size": "1",
     });
     let reply = gateway.post(body).await;
     assert_eq!(reply.status, StatusCode::CREATED);
@@ -483,8 +483,8 @@ async fn bad_requests_never_reach_the_engine() {
 
     for (body, status) in [
         (with("price", json!("1.01")), StatusCode::BAD_REQUEST), // Off the tick
-        (with("product_id", json!("OTHER")), StatusCode::BAD_REQUEST), // Not enabled
-        (with("product_id", json!("A-B")), StatusCode::BAD_REQUEST),
+        (with("symbol", json!("OTHER")), StatusCode::BAD_REQUEST), // Not enabled
+        (with("symbol", json!("A-B")), StatusCode::BAD_REQUEST),
         (with("size", json!("0.5")), StatusCode::BAD_REQUEST), // Below min_size
         (with("size", json!("101")), StatusCode::BAD_REQUEST), // Above max_size
         (with("side", json!("hold")), StatusCode::BAD_REQUEST),
@@ -902,7 +902,7 @@ async fn cancel_all_cancels_each_open_order_and_reports_each_result() {
     *gateway.store.orders.lock().unwrap() = orders;
 
     let reply = gateway
-        .call(Method::DELETE, "/api/v1/orders?product_id=item", None)
+        .call(Method::DELETE, "/api/v1/orders?symbol=item", None)
         .await;
 
     assert_eq!(reply.status, StatusCode::OK);
@@ -942,7 +942,7 @@ async fn orders_are_listed_with_strings_and_no_nulls() {
     let reply = gateway
         .call(
             Method::GET,
-            "/api/v1/orders?status=open&product_id=item&limit=5",
+            "/api/v1/orders?status=open&symbol=item&limit=5",
             None,
         )
         .await;
@@ -987,7 +987,7 @@ async fn bad_list_parameters_are_refused() {
         "limit=x",
         "status=mystery",
         "surprise=1",
-        "product_id=a'b",
+        "symbol=a'b",
     ] {
         let reply = gateway
             .call(Method::GET, &format!("/api/v1/orders?{query}"), None)
@@ -1214,7 +1214,7 @@ async fn reads_fail_cleanly_when_questdb_is_down() {
 async fn a_reload_changes_which_markets_are_open() {
     let gateway = gateway(Setup::default());
     let mut body = limit_order(Uuid::now_v7());
-    body["product_id"] = json!("GEM");
+    body["symbol"] = json!("GEM");
     assert_eq!(
         gateway.post(body.clone()).await.status,
         StatusCode::BAD_REQUEST
@@ -1484,7 +1484,7 @@ async fn a_halt_does_not_touch_other_markets() {
     gateway.admin(Method::POST, HALT).await;
 
     let mut body = limit_order(Uuid::now_v7());
-    body["product_id"] = json!("GEM");
+    body["symbol"] = json!("GEM");
     assert_eq!(gateway.post(body).await.status, StatusCode::CREATED);
 }
 

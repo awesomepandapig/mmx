@@ -135,14 +135,14 @@ async fn assert_silent(client: &mut Client) {
 
 /// Subscribes and waits for the acknowledgement, which means routing is in place.
 async fn subscribe(client: &mut Client, channel: &str, products: &[&str]) {
-    let request = json!({ "type": "subscribe", "channel": channel, "product_ids": products });
+    let request = json!({ "type": "subscribe", "channel": channel, "symbols": products });
     send(client, request).await;
     assert_eq!(recv(client).await["channel"], "subscriptions");
 }
 
 async fn subscribe_player(client: &mut Client, token: &str, products: &[&str]) -> Value {
     let request =
-        json!({ "type": "subscribe", "channel": "user", "product_ids": products, "jwt": token });
+        json!({ "type": "subscribe", "channel": "user", "symbols": products, "jwt": token });
     send(client, request).await;
     recv(client).await
 }
@@ -189,11 +189,11 @@ fn defaults_match_the_roadmap() {
 #[test]
 fn parses_the_web_client_shape() {
     let request =
-        parse_request(r#"{"type":"subscribe","product_ids":["ABC","XYZ"],"channel":"level2"}"#)
+        parse_request(r#"{"type":"subscribe","symbols":["ABC","XYZ"],"channel":"level2"}"#)
             .unwrap();
     assert_eq!(request.action, Action::Subscribe);
     assert_eq!(request.channel, Channel::Level2);
-    assert_eq!(request.product_ids, ["ABC", "XYZ"]);
+    assert_eq!(request.symbols, ["ABC", "XYZ"]);
 }
 
 #[test]
@@ -205,11 +205,11 @@ fn rejects_bad_requests() {
         ("null", "invalid message"),
         (r#"{"type":"subscribe"}"#, "invalid message"),
         (
-            r#"{"type":"subscribe","channel":"level2","product_ids":"ABC"}"#,
+            r#"{"type":"subscribe","channel":"level2","symbols":"ABC"}"#,
             "invalid message",
         ),
         (
-            r#"{"type":"subscribe","channel":"level2","product_ids":[1]}"#,
+            r#"{"type":"subscribe","channel":"level2","symbols":[1]}"#,
             "invalid message",
         ),
         (
@@ -222,23 +222,23 @@ fn rejects_bad_requests() {
         ),
         (
             r#"{"type":"subscribe","channel":"level2"}"#,
-            "product_ids required",
+            "symbols required",
         ),
         (
-            r#"{"type":"subscribe","channel":"level2","product_ids":[]}"#,
-            "product_ids required",
+            r#"{"type":"subscribe","channel":"level2","symbols":[]}"#,
+            "symbols required",
         ),
         (
-            r#"{"type":"subscribe","channel":"level2","product_ids":["A.B"]}"#,
-            "invalid product_id",
+            r#"{"type":"subscribe","channel":"level2","symbols":["A.B"]}"#,
+            "invalid symbol",
         ),
         (
-            r#"{"type":"subscribe","channel":"level2","product_ids":["*"]}"#,
-            "invalid product_id",
+            r#"{"type":"subscribe","channel":"level2","symbols":["*"]}"#,
+            "invalid symbol",
         ),
         (
-            r#"{"type":"subscribe","channel":"level2","product_ids":["a\"b"]}"#,
-            "invalid product_id",
+            r#"{"type":"subscribe","channel":"level2","symbols":["a\"b"]}"#,
+            "invalid symbol",
         ),
     ] {
         assert_eq!(parse_request(text).unwrap_err(), reason, "{text}");
@@ -334,7 +334,7 @@ async fn sends_only_the_channels_and_products_requested() {
         frame["events"],
         json!([{
             "type": "update",
-            "product_id": "ABC",
+            "symbol": "ABC",
             "updates": [{ "side": "buy", "price_level": "1" }],
         }])
     );
@@ -351,7 +351,7 @@ async fn acknowledges_subscriptions_and_stops_after_unsubscribing() {
 
     send(
         &mut client,
-        json!({ "type": "subscribe", "channel": "level2", "product_ids": ["ABC", "XYZ"] }),
+        json!({ "type": "subscribe", "channel": "level2", "symbols": ["ABC", "XYZ"] }),
     )
     .await;
     let ack = recv(&mut client).await;
@@ -369,7 +369,7 @@ async fn acknowledges_subscriptions_and_stops_after_unsubscribing() {
 
     send(
         &mut client,
-        json!({ "type": "unsubscribe", "channel": "level2", "product_ids": ["ABC"] }),
+        json!({ "type": "unsubscribe", "channel": "level2", "symbols": ["ABC"] }),
     )
     .await;
     let ack = recv(&mut client).await;
@@ -381,7 +381,7 @@ async fn acknowledges_subscriptions_and_stops_after_unsubscribing() {
     server.publish("l2.ABC", "{}");
     assert_silent(&mut client).await;
     server.publish("l2.XYZ", "{}");
-    assert_eq!(recv(&mut client).await["events"][0]["product_id"], "XYZ");
+    assert_eq!(recv(&mut client).await["events"][0]["symbol"], "XYZ");
 }
 
 #[tokio::test]
@@ -505,7 +505,7 @@ async fn abandoned_sockets_leave_no_routes_behind() {
 #[tokio::test]
 async fn caches_tickers_until_the_next_refresh() {
     let server = Server::start(quiet_config()).await;
-    server.publish("ticker.ABC", r#"{"product_id":"ABC","price":"1"}"#);
+    server.publish("ticker.ABC", r#"{"symbol":"ABC","price":"1"}"#);
     wait_for(|| {
         server.hub.tickers.refresh();
         !server
@@ -517,7 +517,7 @@ async fn caches_tickers_until_the_next_refresh() {
     .await;
 
     // A newer ticker isn't visible until the cache refreshes.
-    server.publish("ticker.ABC", r#"{"product_id":"ABC","price":"2"}"#);
+    server.publish("ticker.ABC", r#"{"symbol":"ABC","price":"2"}"#);
     sleep(QUIET).await;
 
     let mut client = server.connect().await;
@@ -565,7 +565,7 @@ async fn the_ticker_channel_streams_every_update() {
     subscribe(&mut client, "ticker", &["ABC"]).await;
 
     for price in ["1", "2"] {
-        let ticker = json!({ "product_id": "ABC", "price": price }).to_string();
+        let ticker = json!({ "symbol": "ABC", "price": price }).to_string();
         server.publish("ticker.ABC", &ticker);
         let frame = recv(&mut client).await;
         assert_eq!(frame["channel"], "ticker");
@@ -593,17 +593,17 @@ async fn ticker_batch_sends_the_cache_on_its_interval() {
 
     // Three updates to one product arrive as a single entry, and other products stay out.
     for price in ["1", "2", "3"] {
-        let ticker = json!({ "product_id": "ABC", "price": price }).to_string();
+        let ticker = json!({ "symbol": "ABC", "price": price }).to_string();
         server.publish("ticker.ABC", &ticker);
     }
-    server.publish("ticker.OTHER", r#"{"product_id":"OTHER"}"#);
+    server.publish("ticker.OTHER", r#"{"symbol":"OTHER"}"#);
 
     let frame = recv(&mut client).await;
     assert_eq!(frame["channel"], "ticker_batch");
     assert_eq!(frame["events"][0]["type"], "update");
     assert_eq!(
         frame["events"][0]["tickers"],
-        json!([{ "product_id": "ABC", "price": "3" }])
+        json!([{ "symbol": "ABC", "price": "3" }])
     );
 }
 
@@ -734,7 +734,7 @@ async fn caps_subscriptions_per_socket() {
 
     send(
         &mut client,
-        json!({ "type": "subscribe", "channel": "level2", "product_ids": ["A", "B", "C"] }),
+        json!({ "type": "subscribe", "channel": "level2", "symbols": ["A", "B", "C"] }),
     )
     .await;
     assert_eq!(recv(&mut client).await["message"], "too many subscriptions");
@@ -810,7 +810,7 @@ async fn players_only_see_their_own_orders() {
         json!([{
             "type": "update",
             "player_id": "alice",
-            "product_id": "ABC",
+            "symbol": "ABC",
             "updates": [{ "id": "order-1", "status": "done" }],
         }])
     );
@@ -1104,7 +1104,7 @@ async fn shares_one_nats_connection_between_sockets() {
     for client in &mut clients {
         let frame = recv(client).await;
         assert_eq!(frame["channel"], "l2_data");
-        assert_eq!(frame["events"][0]["product_id"], "ABC");
+        assert_eq!(frame["events"][0]["symbol"], "ABC");
     }
 
     // Sockets don't open connections of their own.

@@ -135,7 +135,9 @@ pub fn spawn_order_publisher(
             loop {
                 link.set(publication.is_connected());
                 // Waking up now and then keeps the link current while no orders arrive.
-                let order = match runtime.block_on(timeout(LINK_CHECK_INTERVAL, pending.recv())) {
+                let order = match runtime
+                    .block_on(async { timeout(LINK_CHECK_INTERVAL, pending.recv()).await })
+                {
                     Ok(Some(order)) => order,
                     Ok(None) => return,
                     Err(_) => continue,

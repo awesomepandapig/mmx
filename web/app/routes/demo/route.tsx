@@ -2,6 +2,7 @@ import type { LinksFunction, MetaFunction } from "@remix-run/node";
 import Demo from "~/components/demo/Demo";
 import Footer from "~/components/landing/Footer";
 import Navbar from "~/components/landing/Navbar";
+import { pageMeta } from "~/lib/seo";
 
 export const links: LinksFunction = () => [
   {
@@ -10,14 +11,12 @@ export const links: LinksFunction = () => [
   },
 ];
 
-export const meta: MetaFunction = () => [
-  { title: "MMX demo: place an order and watch your server run it" },
-  {
-    name: "description",
-    content:
-      "Trade in a sample game and watch each order go from your game server to the fill webhook.",
-  },
-];
+export const meta: MetaFunction = () =>
+  pageMeta(
+    "MMX - Trading Demo",
+    "Explore a simulated game market: place orders and follow matching, market data, and fill webhooks in the browser.",
+    "/demo",
+  );
 
 export default function DemoRoute() {
   return (

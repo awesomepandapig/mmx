@@ -7,12 +7,13 @@ Run the exchange with Docker Compose and published GHCR images. Install Docker w
 Install the native CLI on Linux (amd64 or arm64) or macOS (Apple silicon):
 
 ```sh
-curl -fsSLO https://github.com/awesomepandapig/sbx/releases/latest/download/install.sh
-sh install.sh 0.1.0
+export MMX_VERSION=0.1.0-rc.1
+curl -fsSLO "https://github.com/awesomepandapig/mmx/releases/download/v$MMX_VERSION/install.sh"
+sh install.sh "$MMX_VERSION"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-The installer verifies the release checksum. Alternatively, download the `mmx` binary for your platform from the [release assets](https://github.com/awesomepandapig/sbx/releases) and put it on your `PATH`.
+The installer verifies the release checksum. Alternatively, download the `mmx` binary for your platform from the [release assets](https://github.com/awesomepandapig/mmx/releases) and put it on your `PATH`.
 
 Start the exchange:
 

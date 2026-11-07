@@ -7,6 +7,7 @@ import Hero from "~/components/landing/Hero";
 import Lifecycle from "~/components/landing/Lifecycle";
 import Navbar from "~/components/landing/Navbar";
 import Throughput from "~/components/landing/ThroughputCard";
+import { pageMeta } from "~/lib/seo";
 
 // Loaded here so the trading pages keep their own type.
 export const links: LinksFunction = () => [
@@ -17,10 +18,26 @@ export const links: LinksFunction = () => [
 ];
 
 export const meta: MetaFunction = () => [
-  { title: "MMX: don't build an exchange to ship a game" },
+  ...pageMeta(
+    "MMX - Trading Engine for Game Economies",
+    "Open-source, self-hosted order matching for game economies. Add limit orders, market data, and signed fill webhooks while your game controls assets and settlement.",
+  ),
   {
-    name: "description",
-    content: "MMX is the trading engine behind your in-game market.",
+    "script:ld+json": {
+      "@context": "https://schema.org",
+      "@type": "SoftwareSourceCode",
+      name: "MMX",
+      description:
+        "Self-hosted trading engine for game economies and virtual commodities.",
+      url: "https://mmx.exchange",
+      codeRepository: "https://github.com/awesomepandapig/mmx",
+      programmingLanguage: "Rust",
+      runtimePlatform: "Linux, macOS",
+      license: [
+        "https://github.com/awesomepandapig/mmx/blob/main/LICENSE-MIT",
+        "https://github.com/awesomepandapig/mmx/blob/main/LICENSE-APACHE",
+      ],
+    },
   },
 ];
 

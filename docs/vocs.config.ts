@@ -2,10 +2,13 @@ import { defineConfig } from "vocs/config";
 
 export default defineConfig({
   title: "MMX",
-  titleTemplate: "%s · MMX",
-  description: "MMX documentation: self-hosted exchange infrastructure for MMO economies.",
+  titleTemplate: "%s - MMX Docs",
+  description: "Install and integrate MMX, the open-source trading engine for game economies. Guides for order matching, REST, WebSocket market data, authentication, and settlement webhooks.",
   baseUrl: process.env.DOCS_BASE_URL ?? "https://docs.mmx.exchange",
-  head: { base: false },
+  head: (path) => ({
+    base: false,
+    ...(path === "/" ? { title: "MMX - Docs" } : {}),
+  }),
   iconUrl: "/favicon.svg",
   accentColor: "light-dark(#2436f0, #a3acff)",
   renderStrategy: "full-static",
@@ -32,6 +35,7 @@ export default defineConfig({
         { text: "Markets", link: "/guides/markets" },
         { text: "Fill webhook", link: "/guides/webhooks" },
         { text: "Authentication", link: "/guides/authentication" },
+        { text: "SDK design", link: "/guides/sdk" },
         { text: "Production operations", link: "/guides/production" },
       ],
     },

@@ -214,17 +214,15 @@ impl Connection {
         if request.channel == Channel::User {
             return self.subscribe_player(request).await;
         }
-        if !self.has_room_for(request.product_ids.len()) {
+        if !self.has_room_for(request.symbols.len()) {
             return self.write_error("too many subscriptions").await;
         }
 
         match request.channel {
             Channel::Heartbeats => self.heartbeats = true,
-            Channel::TickerBatch => self
-                .ticker_batch
-                .extend(request.product_ids.iter().cloned()),
+            Channel::TickerBatch => self.ticker_batch.extend(request.symbols.iter().cloned()),
             _ => {
-                for product in &request.product_ids {
+                for product in &request.symbols {
                     let topic = market_topic(request.channel, product);
                     self.hub.subscribe(self.id, topic.clone());
                     self.topics.insert(topic);
@@ -236,11 +234,8 @@ impl Connection {
 
         // Live updates wait in the queue behind this, so a cached ticker can't follow a newer one.
         match request.channel {
-            Channel::Ticker => self.write_snapshot("ticker", &request.product_ids).await,
-            Channel::TickerBatch => {
-                self.write_snapshot("ticker_batch", &request.product_ids)
-                    .await
-            }
+            Channel::Ticker => self.write_snapshot("ticker", &request.symbols).await,
+            Channel::TickerBatch => self.write_snapshot("ticker_batch", &request.symbols).await,
             _ => Ok(()),
         }
     }
@@ -255,7 +250,7 @@ impl Connection {
         };
 
         let products: Option<HashSet<String>> =
-            (!request.product_ids.is_empty()).then(|| request.product_ids.into_iter().collect());
+            (!request.symbols.is_empty()).then(|| request.symbols.into_iter().collect());
 
         if let Some(existing) = self.players.get_mut(&id) {
             existing.expires_at = expires_at;
@@ -284,7 +279,7 @@ impl Connection {
         match request.channel {
             Channel::Heartbeats => self.heartbeats = false,
             Channel::TickerBatch => {
-                for product in &request.product_ids {
+                for product in &request.symbols {
                     self.ticker_batch.remove(product);
                 }
             }
@@ -299,7 +294,7 @@ impl Connection {
                 }
             }
             _ => {
-                for product in &request.product_ids {
+                for product in &request.symbols {
                     self.drop_topic(&market_topic(request.channel, product));
                 }
             }

@@ -41,7 +41,9 @@ See the [architecture documentation](https://docs.mmx.exchange/guides/architectu
 Deploy MMX to Kubernetes using Helm:
 
 ```sh
-helm install mmx deploy/helm/mmx -n mmx --create-namespace
+helm upgrade --install mmx oci://ghcr.io/awesomepandapig/mmx/charts/mmx \
+  --version 0.1.0-rc.1 --namespace mmx --create-namespace \
+  --wait --timeout 10m
 ```
 
 ### Local Docker
@@ -49,8 +51,9 @@ helm install mmx deploy/helm/mmx -n mmx --create-namespace
 Run the stack locally with Docker Compose:
 
 ```sh
-curl -fsSLO https://github.com/awesomepandapig/sbx/releases/latest/download/install.sh
-sh install.sh 0.1.0
+export MMX_VERSION=0.1.0-rc.1
+curl -fsSLO "https://github.com/awesomepandapig/mmx/releases/download/v$MMX_VERSION/install.sh"
+sh install.sh "$MMX_VERSION"
 export PATH="$HOME/.local/bin:$PATH"
 mmx local up
 ```
@@ -67,7 +70,7 @@ See the [feature status](https://docs.mmx.exchange/status) and [roadmap](ROADMAP
 
 ## Contributing
 
-MMX is open source. For repository structure, guidelines, and commands, see [AGENTS.md](AGENTS.md). For dependencies and local setup, see [STARTUP.md](STARTUP.md).
+MMX is open source. For repository structure, guidelines, and commands, see [AGENTS.md](AGENTS.md). For dependencies and local setup, see [the source development guide](docs/src/pages/installation/source.mdx).
 
 ## License
 

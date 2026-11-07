@@ -1229,7 +1229,7 @@ async fn order_route(
             let body = json!({ "code": "claim_unavailable", "message": "New orders are refused." });
             return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
         }
-        let order = json!({ "id": id, "product_id": "ITEM", "side": "buy", "type": "limit", "size": "1", "price": "10", "filled_size": "0", "status": "open" });
+        let order = json!({ "id": id, "symbol": "ITEM", "side": "buy", "type": "limit", "size": "1", "price": "10", "filled_size": "0", "status": "open" });
         return (StatusCode::CREATED, Json(order)).into_response();
     }
     if method == Method::DELETE {
@@ -1250,7 +1250,7 @@ async fn orders_go_to_the_gateway_as_a_game_server_sends_them() {
 
     let order = |id: Uuid| NewOrder {
         client_order_id: id,
-        product_id: "ITEM".to_string(),
+        symbol: "ITEM".to_string(),
         side: "buy".to_string(),
         r#type: "limit".to_string(),
         size: "1".to_string(),
@@ -1287,7 +1287,7 @@ async fn orders_go_to_the_gateway_as_a_game_server_sends_them() {
         body,
         json!({
             "client_order_id": Uuid::from_u128(2),
-            "product_id": "ITEM",
+            "symbol": "ITEM",
             "side": "buy",
             "type": "limit",
             "size": "1",
@@ -1300,7 +1300,7 @@ async fn orders_go_to_the_gateway_as_a_game_server_sends_them() {
     );
     assert_eq!(
         requests[4].1,
-        "/api/v1/orders?product_id=ITEM&status=open&limit=5"
+        "/api/v1/orders?symbol=ITEM&status=open&limit=5"
     );
 }
 

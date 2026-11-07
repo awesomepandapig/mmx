@@ -305,7 +305,7 @@ pub struct MarketStats {
 #[derive(Deserialize, Debug, Default)]
 struct TickerMessage {
     #[serde(default)]
-    product_id: String,
+    symbol: String,
     #[serde(default)]
     price: String,
     #[serde(default)]
@@ -477,7 +477,7 @@ impl Monitor {
             };
             let non_empty = |text: String| (!text.is_empty()).then_some(text);
             lock(&self.tickers).insert(
-                ticker.product_id,
+                ticker.symbol,
                 Ticker {
                     price: ticker.price,
                     bid: non_empty(ticker.best_bid),

@@ -263,7 +263,7 @@ fn render_webhooks(body: &Value) -> String {
 
 fn render_order(order: &Value) -> String {
     // An order with no record has only a status and what to do about it.
-    if order.get("product_id").is_none() {
+    if order.get("symbol").is_none() {
         return format!(
             "{} {}: {}",
             text(order, "id"),
@@ -274,7 +274,7 @@ fn render_order(order: &Value) -> String {
     format!(
         "{} {:<6} {:<4} {} @ {} {} filled={}",
         text(order, "id"),
-        text(order, "product_id"),
+        text(order, "symbol"),
         text(order, "side"),
         text(order, "size"),
         order
@@ -580,7 +580,7 @@ impl Admin {
 #[derive(Serialize, Debug)]
 pub struct NewOrder {
     pub client_order_id: Uuid,
-    pub product_id: String,
+    pub symbol: String,
     pub side: String,
     pub r#type: String,
     pub size: String,
@@ -655,7 +655,7 @@ impl Orders {
         limit: Option<usize>,
     ) -> Result<(), String> {
         let mut query: Vec<(&str, String)> = Vec::new();
-        query.extend(symbol.map(|symbol| ("product_id", symbol.to_string())));
+        query.extend(symbol.map(|symbol| ("symbol", symbol.to_string())));
         query.extend(status.map(|status| ("status", status.to_string())));
         query.extend(limit.map(|limit| ("limit", limit.to_string())));
         let reply = self
@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn a_market_order_shows_no_price() {
-        let order = json!({ "id": "x", "product_id": "ITEM", "side": "buy", "size": "1", "status": "open", "filled_size": "0" });
+        let order = json!({ "id": "x", "symbol": "ITEM", "side": "buy", "size": "1", "status": "open", "filled_size": "0" });
         assert!(render_order(&order).contains("@ market"));
     }
 
@@ -724,7 +724,7 @@ mod tests {
     fn a_new_order_has_the_gateway_shape() {
         let order = NewOrder {
             client_order_id: Uuid::nil(),
-            product_id: "ITEM".to_string(),
+            symbol: "ITEM".to_string(),
             side: "buy".to_string(),
             r#type: "market".to_string(),
             size: "1".to_string(),
@@ -732,7 +732,7 @@ mod tests {
         };
         let expected = json!({
             "client_order_id": Uuid::nil(),
-            "product_id": "ITEM",
+            "symbol": "ITEM",
             "side": "buy",
             "type": "market",
             "size": "1",

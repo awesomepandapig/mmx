@@ -5,7 +5,7 @@ version=${1:-}
 case "$version" in
     ''|*[!0-9A-Za-z.+-]*) echo 'Usage: sh install.sh VERSION (for example 0.1.0-rc.1)' >&2; exit 1 ;;
 esac
-repository=${MMX_REPOSITORY:-awesomepandapig/sbx}
+repository=${MMX_REPOSITORY:-awesomepandapig/mmx}
 case "$repository" in
     */*) ;;
     *) echo 'MMX_REPOSITORY must be owner/repository' >&2; exit 1 ;;

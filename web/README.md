@@ -13,7 +13,7 @@ npm start
 ```
 
 Set `VITE_DOCS_URL` before building to link a custom documentation deployment. See the repository
-[README](../README.md) and [local setup](../STARTUP.md) for backend and browser validation.
+[README](../README.md) and [local setup](../docs/src/pages/installation/source.mdx) for backend and browser validation.
 
 ## Vercel
 

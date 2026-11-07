@@ -6,10 +6,11 @@ Docker, kind, Helm, kubectl, and the native CLI from [Local Docker](/installatio
 ## Create the cluster
 
 ```sh
-curl -fsSLO https://github.com/awesomepandapig/sbx/releases/download/v0.1.0/quickstart.yaml
+export MMX_VERSION=0.1.0-rc.1
+curl -fsSLO "https://github.com/awesomepandapig/mmx/releases/download/v$MMX_VERSION/quickstart.yaml"
 kind create cluster --name mmx --config quickstart.yaml
 helm upgrade --install mmx oci://ghcr.io/awesomepandapig/mmx/charts/mmx \
-  --version 0.1.0 --namespace mmx --create-namespace \
+  --version "$MMX_VERSION" --namespace mmx --create-namespace \
   --set console.service.type=NodePort --set console.service.nodePort=30093 \
   --set gateway.service.type=NodePort --set gateway.service.nodePort=30080 \
   --set websocket.service.type=NodePort --set websocket.service.nodePort=30081 \
