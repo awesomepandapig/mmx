@@ -4,6 +4,7 @@
 transparent_listener/
 target/
 .run/
+.test-install/
 .terraform/
 .terraform.lock.hcl
 *.tfstate

@@ -38,6 +38,27 @@ try {
         `${label} overflows at ${width}px: ${JSON.stringify(layout)}`);
       if (label === 'landing') {
         await page.getByRole('link', { name: 'Read the docs', exact: true }).first().waitFor();
+        const install = page.locator('form').first();
+        assert.match(await install.locator('code').textContent(), /helm upgrade --install mmx oci:\/\/ghcr\.io\/awesomepandapig\/mmx\/charts\/mmx/);
+        assert.match(await install.locator('code').textContent(), /--version 0\.1\.0-rc\.2/);
+        await page.getByRole('button', { name: 'Install with Helm', exact: true }).click();
+        const setupPrompt = 'Set up MMX for me. Fetch https://docs.mmx.exchange/getting-started.md and follow it.';
+        const codexLink = await page.getByRole('menuitem', { name: /Codex/ }).getAttribute('href');
+        const cursorLink = await page.getByRole('menuitem', { name: /Cursor/ }).getAttribute('href');
+        assert.equal(new URL(codexLink).protocol, 'codex:');
+        assert.equal(new URL(codexLink).searchParams.get('prompt'), setupPrompt);
+        assert.equal(new URL(cursorLink).origin, 'https://cursor.com');
+        assert.equal(new URL(cursorLink).searchParams.get('text'), setupPrompt);
+        await page.getByRole('menuitem', { name: 'Helm', exact: true }).click();
+        await page.getByRole('menu').waitFor({ state: 'hidden' });
+        await page.evaluate(() => {
+          Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: async text => { window.__mmxCopied = text; } },
+          });
+        });
+        await install.getByRole('button', { name: 'Copy', exact: true }).click();
+        assert.equal(await page.evaluate(() => window.__mmxCopied), await install.locator('code').textContent());
         const tab = page.getByRole('tab').last();
         await tab.click();
         assert.equal(await tab.getAttribute('aria-selected'), 'true');

@@ -15,6 +15,7 @@ transparent_listener/
 .codex/
 .aws/
 .run/
+.test-install/
 .terraform/
 notes/
 reports/

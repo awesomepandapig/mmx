@@ -42,7 +42,7 @@ Deploy MMX to Kubernetes using Helm:
 
 ```sh
 helm upgrade --install mmx oci://ghcr.io/awesomepandapig/mmx/charts/mmx \
-  --version 0.1.0-rc.1 --namespace mmx --create-namespace \
+  --version 0.1.0-rc.2 --namespace mmx --create-namespace \
   --wait --timeout 10m
 ```
 
@@ -51,7 +51,7 @@ helm upgrade --install mmx oci://ghcr.io/awesomepandapig/mmx/charts/mmx \
 Run the stack locally with Docker Compose:
 
 ```sh
-export MMX_VERSION=0.1.0-rc.1
+export MMX_VERSION=0.1.0-rc.2
 curl -fsSLO "https://github.com/awesomepandapig/mmx/releases/download/v$MMX_VERSION/install.sh"
 sh install.sh "$MMX_VERSION"
 export PATH="$HOME/.local/bin:$PATH"

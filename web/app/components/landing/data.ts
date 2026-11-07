@@ -1,7 +1,7 @@
 import type { LogoName } from "./BrandLogo";
 
 export const SETUP_PROMPT =
-  "Set up MMX, the self-hosted trading engine for games, in this repo. Follow https://docs.mmx.exchange/getting-started.md";
+  "Set up MMX for me. Fetch https://docs.mmx.exchange/getting-started.md and follow it.";
 
 export interface Agent {
   name: string;
@@ -9,21 +9,33 @@ export interface Agent {
   logo?: LogoName;
   /** Copied as is. Without this, the setup prompt is copied. */
   copyText?: string;
+  /** Official prompt link; opens a composer without submitting the prompt. */
+  launchUrl?: string;
 }
 
-const HELM_INSTALL =
-  "helm install mmx deploy/helm/mmx -n mmx --create-namespace";
+export const HELM_INSTALL =
+  "helm upgrade --install mmx oci://ghcr.io/awesomepandapig/mmx/charts/mmx --version 0.1.0-rc.2 --namespace mmx --create-namespace --wait --timeout 10m";
 
 export const AGENTS: Agent[] = [
   { name: "Helm", logo: "helm", command: HELM_INSTALL, copyText: HELM_INSTALL },
   {
     name: "Claude Code",
     logo: "claude",
-    command: 'claude "Set up MMX in this repo"',
+    command: SETUP_PROMPT,
   },
-  { name: "Cursor", logo: "cursor", command: "Set up MMX in this repo" },
-  { name: "Codex", logo: "openai", command: 'codex "Set up MMX in this repo"' },
-  { name: "Other agent", command: "Set up MMX in this repo" },
+  {
+    name: "Cursor",
+    logo: "cursor",
+    command: SETUP_PROMPT,
+    launchUrl: `https://cursor.com/link/prompt?text=${encodeURIComponent(SETUP_PROMPT)}`,
+  },
+  {
+    name: "Codex",
+    logo: "openai",
+    command: SETUP_PROMPT,
+    launchUrl: `codex://new?prompt=${encodeURIComponent(SETUP_PROMPT)}`,
+  },
+  { name: "Other agent", command: SETUP_PROMPT },
 ];
 
 export const ENGINES: { name: string; logo: LogoName }[] = [

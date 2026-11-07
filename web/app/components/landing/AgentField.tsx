@@ -12,8 +12,12 @@ import { AGENTS, SETUP_PROMPT, type Agent } from "./data";
 /** The clipboard API only exists on secure origins, so plain http falls back to a hidden field. */
 async function writeClipboard(text: string) {
   if (navigator.clipboard) {
-    await navigator.clipboard.writeText(text);
-    return;
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // Some browsers expose the API but deny permission; try the selected field.
+    }
   }
   const field = document.createElement("textarea");
   field.value = text;
@@ -36,6 +40,7 @@ function AgentLogo({ agent }: { agent: Agent }) {
 export default function AgentField() {
   const [agent, setAgent] = useState(AGENTS[0]);
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
 
   useEffect(() => {
     if (!copied) return;
@@ -50,15 +55,16 @@ export default function AgentField() {
     try {
       await writeClipboard(text);
       setCopied(true);
+      setCopyError(false);
     } catch {
-      // The command stays visible in the field, so there's nothing more to show.
+      setCopyError(true);
     }
   }
 
   return (
     <form
       onSubmit={copy}
-      className="flex w-full max-w-[820px] flex-wrap items-center gap-1 rounded-xl border border-mmx-line bg-mmx-surface p-[5px] md:flex-nowrap"
+      className={`flex w-full max-w-[820px] flex-wrap items-center gap-1 rounded-xl border border-mmx-line bg-mmx-surface p-[5px] ${copyError ? "" : "md:flex-nowrap"}`}
     >
       <code className="order-first w-full min-w-0 truncate px-2.5 py-2 font-code text-sm text-mmx-mute md:order-none md:w-auto md:flex-1 md:py-0">
         {agent.command}
@@ -76,7 +82,20 @@ export default function AgentField() {
           align="start"
           className="min-w-[200px] rounded-xl border-mmx-line bg-mmx-raised p-1 font-body text-white"
         >
-          {AGENTS.map((option) => (
+          {AGENTS.map((option) => option.launchUrl ? (
+            <DropdownMenuItem key={option.name} asChild>
+              <a
+                href={option.launchUrl}
+                onClick={() => setAgent(option)}
+                className="cursor-pointer gap-2.5 rounded-lg px-2.5 py-2 text-[15px] font-medium focus:bg-mmx-line focus:text-white"
+                title={`Open ${option.name} with the setup prompt`}
+              >
+                <AgentLogo agent={option} />
+                {option.name}
+                <span className="ml-auto text-xs text-mmx-mute">Open</span>
+              </a>
+            </DropdownMenuItem>
+          ) : (
             <DropdownMenuItem
               key={option.name}
               onSelect={() => setAgent(option)}
@@ -94,6 +113,11 @@ export default function AgentField() {
       >
         {copied ? "Copied" : agent.copyText ? "Copy" : "Copy prompt"}
       </button>
+      {copyError ? (
+        <span role="status" className="w-full px-2.5 text-sm text-mmx-pink">
+          Copy was blocked. Select and copy the text above.
+        </span>
+      ) : null}
     </form>
   );
 }
