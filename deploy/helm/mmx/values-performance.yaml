@@ -35,7 +35,9 @@ gateway:
     sizeLimit: 2Gi
   resources:
     cpu: "1"
-    memory: 512Mi
+    # Three voters' 64MiB report logs use 576MiB across their three terms; ingress and responses
+    # add about 192MiB with the default 16MiB UDP terms. Allow for failover overlap and HTTP state.
+    memory: 1536Mi
 consumers:
   market-data:
     persistence:

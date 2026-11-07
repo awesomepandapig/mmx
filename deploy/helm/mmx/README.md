@@ -11,16 +11,30 @@ The gateway currently trusts your game server's account header; restrict network
 
 ```sh
 helm upgrade --install mmx oci://ghcr.io/awesomepandapig/mmx/charts/mmx \
-  --version 0.1.0-rc.1 --namespace mmx --create-namespace \
+  --version 0.1.0-rc.2 --namespace mmx --create-namespace \
   --wait --timeout 10m
 helm test mmx --namespace mmx --logs
 ```
 
-The first planned release is `0.1.0-rc.1`. Add `--values production-values.yaml` for your own overrides.
+The current release candidate is `0.1.0-rc.2`. Add `--values production-values.yaml` for your own overrides.
 Choose a version that exists in [GitHub releases](https://github.com/awesomepandapig/mmx/releases).
 The version in source is not evidence that a release has been published. Keep credentials in
 Kubernetes Secrets rather than values files. `values-local.yaml` permits development placement;
 `values-performance.yaml` requires nodes prepared for dedicated CPUs.
+
+## Artifact Hub
+
+Artifact Hub indexes the published OCI chart directly. Register a **Helm charts** repository
+named `mmx`, display name `MMX`, with this URL:
+
+```text
+oci://ghcr.io/awesomepandapig/mmx/charts/mmx
+```
+
+Registration is a one-time operation in the Artifact Hub control panel; subsequent published
+versions are indexed automatically. Use an Artifact Hub API key ID and secret to automate
+registration. Store them locally rather than committing them. Listing does not require moving
+the chart to another registry or using `helm repo add`.
 
 ## Validate and package source
 
@@ -41,7 +55,7 @@ the chart, builds the CLI, then pushes the chart to GHCR and attaches it to a Gi
 Run that workflow against the reviewed source revision with a new, unused SemVer:
 
 ```sh
-gh workflow run release.yml --ref main -f version=0.1.0-rc.1
+gh workflow run release.yml --ref main -f version=0.1.0-rc.2
 ```
 
 For the first release, push the reviewed revision as `release/mmx-0.1.0-rc.1`; this triggers the workflow

@@ -37,6 +37,13 @@ refuse_line() {
     if grep -qE -- "^[[:space:]]*(- )?$3\$" "$2"; then fail "$1"; else pass "$1"; fi
 }
 
+# Check both request and limit on the application container, not its Aeron driver sidecar.
+gateway_memory() {
+    count=$(sed -n '/^        - name: gateway$/,/^      volumes:/p' "$2" \
+        | grep -cF -- "memory: \"$3\"" || true)
+    if [ "$count" -eq 2 ]; then pass "$1"; else fail "$1"; fi
+}
+
 # Fails unless the chart refuses these values.
 rejects() {
     name=$1
@@ -90,6 +97,8 @@ helm template mmx "$chart" --set questdbRebuild.enabled=true \
 helm template other "$chart" --namespace elsewhere >"$out/renamed.yaml"
 helm lint "$chart" -f "$chart/values-performance.yaml" >/dev/null
 helm template mmx "$chart" -f "$chart/values-performance.yaml" >"$out/performance.yaml"
+helm template mmx "$chart" -f "$chart/values-performance.yaml" \
+    --show-only templates/gateway.yaml >"$out/performance-gateway.yaml"
 expect "performance profile pins threads" "$out/performance.yaml" 'PIN_THREADS: "true"'
 helm template mmx "$chart" --set image.digests.api=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >"$out/digest.yaml"
 expect "digest overrides image tag" "$out/digest.yaml" "api@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -125,7 +134,9 @@ expect "gateway readiness uses its application check" "$out/gateway.yaml" "path:
 expect "console monitors the websocket" "$out/default.yaml" "MMX_WEBSOCKET_URL"
 refuse "disabled websocket is not monitored" "$out/console-no-ws.yaml" "MMX_WEBSOCKET_URL"
 expect "local market-data has its actual resource override" "$out/local.yaml" 'cpu: "750m"'
-expect "local gateway budgets pre-touched Aeron mappings" "$out/local-gateway.yaml" 'memory: "1Gi"'
+gateway_memory "default gateway leaves headroom for Aeron buffers and failover" "$out/gateway.yaml" 1Gi
+gateway_memory "local gateway budgets pre-touched Aeron mappings" "$out/local-gateway.yaml" 1Gi
+gateway_memory "performance gateway budgets larger report buffers" "$out/performance-gateway.yaml" 1536Mi
 expect "helm test has a real read-only hook" "$out/default.yaml" "helm.sh/hook: test"
 refuse "helm test never submits an order" "$out/default.yaml" "POST /api/v1/orders"
 refuse "no provider is connected by default" "$out/default.yaml" "MMX_OIDC_ISSUER"

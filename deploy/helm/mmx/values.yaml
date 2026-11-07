@@ -117,7 +117,9 @@ gateway:
     sizeLimit: 1Gi
   resources:
     cpu: 250m
-    memory: 512Mi
+    # Three 16MiB ingress logs, three 16MiB report logs and one response log have three terms
+    # each: about 336MiB before metadata and HTTP state. Leave headroom for failover image overlap.
+    memory: 1Gi
 
 # `mmx serve`: the admin API, with the console built in. The Service is all the chart makes, so
 # exposing it, with TLS, is your choice. See deploy/README.md.
