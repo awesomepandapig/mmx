@@ -67,15 +67,22 @@ pub struct ArchiveClient {
 
 pub fn connect(config: &NodeConfig) -> ArchiveClient {
     let context = archive::AeronContext::new().expect("failed to create a client context");
-    context.set_dir(&cstring(&config.aeron_dir)).expect("invalid Aeron dir");
     context
-        .set_error_handler(Some(|code: i32, message: &str| eprintln!("archive client error {code}: {message}")))
+        .set_dir(&cstring(&config.aeron_dir))
+        .expect("invalid Aeron dir");
+    context
+        .set_error_handler(Some(|code: i32, message: &str| {
+            eprintln!("archive client error {code}: {message}")
+        }))
         .expect("failed to set the error handler");
     let aeron = archive::Aeron::new(&context).expect("failed to create a client");
     aeron.start().expect("failed to start the client");
 
-    let archive_context = archive::AeronArchiveContext::new().expect("failed to create an archive context");
-    archive_context.set_aeron(&aeron).expect("failed to set the client");
+    let archive_context =
+        archive::AeronArchiveContext::new().expect("failed to create an archive context");
+    archive_context
+        .set_aeron(&aeron)
+        .expect("failed to set the client");
     archive_context
         .set_control_request_channel(&cstring(&config.archive_control_channel))
         .expect("invalid control channel");
@@ -100,13 +107,21 @@ impl ArchiveClient {
     }
 
     pub(crate) fn is_connected(&self) -> bool {
-        self.client.get_control_response_subscription().is_connected()
+        self.client
+            .get_control_response_subscription()
+            .is_connected()
     }
 
     /// Records a deterministic output stream from `position`, truncating anything newer that a
     /// previous run wrote, and returns the channel to publish on. The replayed log regenerates
     /// identical bytes from that point.
-    pub fn prepare_output(&self, base_channel: &str, stream_id: i32, session_id: i32, position: i64) -> String {
+    pub fn prepare_output(
+        &self,
+        base_channel: &str,
+        stream_id: i32,
+        session_id: i32,
+        position: i64,
+    ) -> String {
         let channel = format!("{base_channel}|session-id={session_id}");
         let recording_id = self
             .client
@@ -116,16 +131,35 @@ impl ArchiveClient {
         // A replacement node has no tape of its own, so its tape starts wherever it joined.
         if recording_id < 0 {
             self.client
-                .start_recording(&cstring(&channel), stream_id, archive::SOURCE_LOCATION_LOCAL, false)
+                .start_recording(
+                    &cstring(&channel),
+                    stream_id,
+                    archive::SOURCE_LOCATION_LOCAL,
+                    false,
+                )
                 .expect("failed to record the output stream");
         } else {
-            let stop = self.client.get_stop_position(recording_id).expect("failed to read the recording");
-            assert!(stop >= position, "output recording stops at {stop}, before {position}");
+            let stop = self
+                .client
+                .get_stop_position(recording_id)
+                .expect("failed to read the recording");
+            assert!(
+                stop >= position,
+                "output recording stops at {stop}, before {position}"
+            );
             if stop > position {
-                self.client.truncate_recording(recording_id, position).expect("failed to truncate the output");
+                self.client
+                    .truncate_recording(recording_id, position)
+                    .expect("failed to truncate the output");
             }
             self.client
-                .extend_recording(recording_id, &cstring(&channel), stream_id, archive::SOURCE_LOCATION_LOCAL, false)
+                .extend_recording(
+                    recording_id,
+                    &cstring(&channel),
+                    stream_id,
+                    archive::SOURCE_LOCATION_LOCAL,
+                    false,
+                )
                 .expect("failed to extend the output recording");
         }
 
@@ -145,9 +179,15 @@ impl ArchiveClient {
         loop {
             let recording = self.find_recording(stream_id, session_id)?;
             if recording.stop >= 0 {
-                return Some(TapeExtent { start: recording.start, stop: recording.stop });
+                return Some(TapeExtent {
+                    start: recording.start,
+                    stop: recording.stop,
+                });
             }
-            assert!(Instant::now() < deadline, "the tape is still being recorded");
+            assert!(
+                Instant::now() < deadline,
+                "the tape is still being recorded"
+            );
             sleep(Duration::from_millis(10));
         }
     }
@@ -161,34 +201,60 @@ impl ArchiveClient {
         to: i64,
         on_message: &mut dyn FnMut(&[u8]),
     ) -> Result<(), String> {
-        let recording = self.find_recording(stream_id, session_id).ok_or("this node has no tape")?;
-        replay(self, recording.id, from, to, TAPE_REPLAY_STREAM_ID, on_message)
+        let recording = self
+            .find_recording(stream_id, session_id)
+            .ok_or("this node has no tape")?;
+        replay(
+            self,
+            recording.id,
+            from,
+            to,
+            TAPE_REPLAY_STREAM_ID,
+            on_message,
+        )
     }
 
     pub(crate) fn find_recording(&self, stream_id: i32, session_id: i32) -> Option<Recording> {
-        let id = self.client.find_last_matching_recording(0, &cstring(""), stream_id, session_id).ok()?;
+        let id = self
+            .client
+            .find_last_matching_recording(0, &cstring(""), stream_id, session_id)
+            .ok()?;
         if id < 0 {
             return None;
         }
         let mut found = None;
         let mut count = 0;
         self.client
-            .list_recording_fn(&mut count, id, |descriptor| found = Some(Recording::from(&descriptor)))
+            .list_recording_fn(&mut count, id, |descriptor| {
+                found = Some(Recording::from(&descriptor))
+            })
             .ok()?;
         found
     }
 
     /// Lists every recording of a stream, oldest first.
-    pub(crate) fn recordings(&self, stream_id: i32) -> Result<Vec<Recording>, archive::AeronArchiveError> {
+    pub(crate) fn recordings(
+        &self,
+        stream_id: i32,
+    ) -> Result<Vec<Recording>, archive::AeronArchiveError> {
         const PAGE: i32 = 256;
         let mut recordings = Vec::new();
         let mut from = 0;
         loop {
             let (mut count, mut page) = (0, Vec::new());
-            self.client.list_recordings_for_uri_fn(&mut count, from, PAGE, &cstring(""), stream_id, |descriptor| {
-                page.push(Recording::from(&descriptor));
-            })?;
-            let Some(last) = page.last() else { return Ok(recordings) };
+            self.client.list_recordings_for_uri_fn(
+                &mut count,
+                from,
+                PAGE,
+                &cstring(""),
+                stream_id,
+                |descriptor| {
+                    page.push(Recording::from(&descriptor));
+                },
+            )?;
+            let Some(last) = page.last() else {
+                return Ok(recordings);
+            };
             from = last.id + 1;
             let finished = page.len() < PAGE as usize;
             recordings.append(&mut page);
@@ -198,11 +264,18 @@ impl ArchiveClient {
         }
     }
 
-    pub(crate) fn purge_recording(&self, recording_id: i64) -> Result<i64, archive::AeronArchiveError> {
+    pub(crate) fn purge_recording(
+        &self,
+        recording_id: i64,
+    ) -> Result<i64, archive::AeronArchiveError> {
         self.client.purge_recording(recording_id)
     }
 
-    pub(crate) fn purge_segments(&self, recording_id: i64, start: i64) -> Result<i64, archive::AeronArchiveError> {
+    pub(crate) fn purge_segments(
+        &self,
+        recording_id: i64,
+        start: i64,
+    ) -> Result<i64, archive::AeronArchiveError> {
         self.client.purge_segments(recording_id, start)
     }
 
@@ -234,13 +307,18 @@ impl From<&archive::AeronArchiveRecordingDescriptor> for Recording {
 fn await_recording(aeron: &archive::Aeron, session_id: i32) -> (i64, i32) {
     loop {
         let mut found = None;
-        aeron.counters_reader().foreach_counter_fn(|_, id, type_id, key, _| {
-            if type_id == RECORDING_POSITION_TYPE_ID
-                && i32::from_le_bytes(key[8..12].try_into().expect("four bytes")) == session_id
-            {
-                found = Some((i64::from_le_bytes(key[0..8].try_into().expect("eight bytes")), id));
-            }
-        });
+        aeron
+            .counters_reader()
+            .foreach_counter_fn(|_, id, type_id, key, _| {
+                if type_id == RECORDING_POSITION_TYPE_ID
+                    && i32::from_le_bytes(key[8..12].try_into().expect("four bytes")) == session_id
+                {
+                    found = Some((
+                        i64::from_le_bytes(key[0..8].try_into().expect("eight bytes")),
+                        id,
+                    ));
+                }
+            });
         if let Some(found) = found {
             return found;
         }
@@ -249,7 +327,10 @@ fn await_recording(aeron: &archive::Aeron, session_id: i32) -> (i64, i32) {
 }
 
 /// Returns the recording that holds the snapshot, for the consensus module's recording log.
-pub fn take<S: ClusteredService>(archive_client: &ArchiveClient, service: &mut S) -> (i64, TapeMark, SnapshotTiming) {
+pub fn take<S: ClusteredService>(
+    archive_client: &ArchiveClient,
+    service: &mut S,
+) -> (i64, TapeMark, SnapshotTiming) {
     let (aeron, client) = (&archive_client.aeron, &archive_client.client);
     let started = Instant::now();
     let publication = aeron
@@ -258,10 +339,18 @@ pub fn take<S: ClusteredService>(archive_client: &ArchiveClient, service: &mut S
         .poll_blocking(TIMEOUT)
         .expect("failed to add the snapshot publication");
 
-    let session_id = publication.get_constants().expect("failed to read the publication").session_id();
+    let session_id = publication
+        .get_constants()
+        .expect("failed to read the publication")
+        .session_id();
     let channel = format!("{SNAPSHOT_CHANNEL}|session-id={session_id}");
     client
-        .start_recording(&cstring(&channel), SNAPSHOT_STREAM_ID, archive::SOURCE_LOCATION_LOCAL, true)
+        .start_recording(
+            &cstring(&channel),
+            SNAPSHOT_STREAM_ID,
+            archive::SOURCE_LOCATION_LOCAL,
+            true,
+        )
         .expect("failed to start the snapshot recording");
     let (recording_id, counter_id) = await_recording(aeron, session_id);
 
@@ -269,7 +358,10 @@ pub fn take<S: ClusteredService>(archive_client: &ArchiveClient, service: &mut S
     let started = Instant::now();
     let tape = service.on_take_snapshot(archive_client, &mut |chunk| {
         while let Err(error) = publication.offer(chunk) {
-            assert!(error.is_retryable(), "failed to write the snapshot: {error}");
+            assert!(
+                error.is_retryable(),
+                "failed to write the snapshot: {error}"
+            );
             std::hint::spin_loop();
         }
     });
@@ -283,15 +375,36 @@ pub fn take<S: ClusteredService>(archive_client: &ArchiveClient, service: &mut S
     while unsafe { std::ptr::read_volatile(recorded) } < target {
         yield_now();
     }
-    (recording_id, tape, SnapshotTiming { setup, write, recorded: started.elapsed() })
+    (
+        recording_id,
+        tape,
+        SnapshotTiming {
+            setup,
+            write,
+            recorded: started.elapsed(),
+        },
+    )
 }
 
-pub fn load<S: ClusteredService>(archive_client: &ArchiveClient, recording_id: i64, service: &mut S) {
-    let stop_position =
-        archive_client.client.get_stop_position(recording_id).expect("failed to read the snapshot length");
-    replay(archive_client, recording_id, 0, stop_position, REPLAY_STREAM_ID, &mut |chunk| {
-        service.on_load_snapshot(chunk);
-    })
+pub fn load<S: ClusteredService>(
+    archive_client: &ArchiveClient,
+    recording_id: i64,
+    service: &mut S,
+) {
+    let stop_position = archive_client
+        .client
+        .get_stop_position(recording_id)
+        .expect("failed to read the snapshot length");
+    replay(
+        archive_client,
+        recording_id,
+        0,
+        stop_position,
+        REPLAY_STREAM_ID,
+        &mut |chunk| {
+            service.on_load_snapshot(chunk);
+        },
+    )
     .expect("failed to replay the snapshot");
 }
 
@@ -305,13 +418,20 @@ fn replay(
     on_message: &mut dyn FnMut(&[u8]),
 ) -> Result<(), String> {
     let (aeron, client) = (&archive_client.aeron, &archive_client.client);
-    let params = archive::AeronArchiveReplayParams::new(-1, 0, from, to - from, -1, -1).map_err(|e| e.to_string())?;
-    let session =
-        client.start_replay(recording_id, &cstring("aeron:ipc"), stream_id, &params).map_err(|e| e.to_string())? as i32;
+    let params = archive::AeronArchiveReplayParams::new(-1, 0, from, to - from, -1, -1)
+        .map_err(|e| e.to_string())?;
+    let session = client
+        .start_replay(recording_id, &cstring("aeron:ipc"), stream_id, &params)
+        .map_err(|e| e.to_string())? as i32;
 
     let channel = format!("aeron:ipc?session-id={session}");
     let subscription = aeron
-        .async_add_subscription(&cstring(&channel), stream_id, archive::Handlers::NONE, archive::Handlers::NONE)
+        .async_add_subscription(
+            &cstring(&channel),
+            stream_id,
+            archive::Handlers::NONE,
+            archive::Handlers::NONE,
+        )
         .map_err(|e| e.to_string())?
         .poll_blocking(TIMEOUT)
         .map_err(|e| e.to_string())?;
@@ -324,7 +444,9 @@ fn replay(
     };
 
     while image.position() < to {
-        let polled = image.poll_fn(|message, _header| on_message(message), 64).map_err(|e| e.to_string())?;
+        let polled = image
+            .poll_fn(|message, _header| on_message(message), 64)
+            .map_err(|e| e.to_string())?;
         if polled == 0 {
             std::hint::spin_loop();
         }

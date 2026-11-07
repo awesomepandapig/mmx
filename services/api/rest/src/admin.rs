@@ -19,7 +19,10 @@ use std::sync::atomic::Ordering;
 use axum::{
     Json,
     extract::{Path, Request, State, rejection::PathRejection},
-    http::{HeaderMap, StatusCode, header::{AUTHORIZATION, CONTENT_TYPE}},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -27,6 +30,7 @@ use axum::{
 use log::{info, warn};
 
 use serde::Serialize;
+use serde_json::{Value, json};
 
 use subtle::ConstantTimeEq;
 
@@ -34,7 +38,9 @@ const PROMETHEUS_TEXT: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// An empty token would let an empty bearer in, so it counts as unset.
 pub fn admin_token() -> Option<String> {
-    let token = env::var("MMX_ADMIN_TOKEN").ok().filter(|token| !token.is_empty());
+    let token = env::var("MMX_ADMIN_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
     if token.is_none() {
         warn!("Admin: MMX_ADMIN_TOKEN isn't set, so admin routes answer 503");
     }
@@ -51,7 +57,9 @@ fn authorize(expected: Option<&str>, headers: &HeaderMap) -> Result<(), AppError
     match bearer(headers) {
         // Only the token's length can leak, which is no help in guessing it.
         Some(token) if bool::from(token.as_bytes().ct_eq(expected.as_bytes())) => Ok(()),
-        _ => Err(AppError::Unauthenticated("A valid admin token is required.".to_string())),
+        _ => Err(AppError::Unauthenticated(
+            "A valid admin token is required.".to_string(),
+        )),
     }
 }
 
@@ -93,8 +101,27 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Rea
         checks.insert("order_claims", claims.load(Ordering::Relaxed));
     }
 
-    let status = if engine { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (status, Json(Readiness { ready: engine, checks }))
+    let status = if engine {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(Readiness {
+            ready: engine,
+            checks,
+        }),
+    )
+}
+
+/// The cluster as this gateway sees it, for `mmx`, which can't read Aeron itself. Each gateway
+/// answers for itself, so one that's cut off from the cluster doesn't hide what the others see.
+pub async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(match &state.cluster {
+        Some(watch) => json!({ "mode": "cluster", "view": watch.view() }),
+        None => json!({ "mode": "standalone" }),
+    })
 }
 
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
@@ -130,18 +157,27 @@ pub struct MarketList {
 
 pub async fn list_markets(State(state): State<Arc<AppState>>) -> Json<MarketList> {
     let markets = state.markets.current();
-    let markets = markets.iter().map(|(name, market)| market_view(&state, name, market)).collect();
+    let markets = markets
+        .iter()
+        .map(|(name, market)| market_view(&state, name, market))
+        .collect();
     Json(MarketList { markets })
 }
 
 fn symbol_from(path: Result<Path<String>, PathRejection>) -> Result<String, AppError> {
-    let Path(symbol) = path.map_err(|_| AppError::ValidationError("Bad market symbol.".to_string()))?;
+    let Path(symbol) =
+        path.map_err(|_| AppError::ValidationError("Bad market symbol.".to_string()))?;
     normalize_symbol(&symbol).map_err(AppError::ValidationError)
 }
 
 /// A typo must not read as a successful halt, so an unlisted market is an error.
 fn listed_market(state: &AppState, symbol: &str) -> Result<Market, AppError> {
-    state.markets.current().listed(symbol).copied().ok_or(AppError::MarketNotFound)
+    state
+        .markets
+        .current()
+        .listed(symbol)
+        .copied()
+        .ok_or(AppError::MarketNotFound)
 }
 
 pub async fn halt_market(
@@ -197,10 +233,14 @@ pub async fn cancel_market_orders(
     if let Some(stream) = &state.report_stream {
         await_recorder(stream, state.store.as_ref()).await?;
     }
-    let orders = state.store.open_orders_in_market(&symbol, MAX_CANCEL_ALL).await.map_err(|err| {
-        warn!("QuestDB: Failed to read a market's open orders: {err}");
-        AppError::RecorderBehind
-    })?;
+    let orders = state
+        .store
+        .open_orders_in_market(&symbol, MAX_CANCEL_ALL)
+        .await
+        .map_err(|err| {
+            warn!("QuestDB: Failed to read a market's open orders: {err}");
+            AppError::RecorderBehind
+        })?;
 
     let mut result = MarketCancelAll {
         requested: orders.len(),
@@ -246,8 +286,13 @@ pub struct ReloadedMarkets {
 pub async fn reload_markets(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ReloadedMarkets>, AppError> {
-    let markets = state.markets.reload().map_err(AppError::MarketsNotReloaded)?;
-    Ok(Json(ReloadedMarkets { markets: markets.symbols() }))
+    let markets = state
+        .markets
+        .reload()
+        .map_err(AppError::MarketsNotReloaded)?;
+    Ok(Json(ReloadedMarkets {
+        markets: markets.symbols(),
+    }))
 }
 
 #[cfg(test)]
@@ -266,8 +311,19 @@ mod tests {
     fn only_the_exact_bearer_token_passes() {
         assert!(authorize(Some("secret"), &with_header("Bearer secret")).is_ok());
         assert!(authorize(Some("secret"), &with_header("bearer secret")).is_ok());
-        for value in ["Bearer wrong", "Bearer secre", "Bearer secret2", "Basic secret", "secret", "Bearer ", "Bearer"] {
-            assert!(authorize(Some("secret"), &with_header(value)).is_err(), "{value}");
+        for value in [
+            "Bearer wrong",
+            "Bearer secre",
+            "Bearer secret2",
+            "Basic secret",
+            "secret",
+            "Bearer ",
+            "Bearer",
+        ] {
+            assert!(
+                authorize(Some("secret"), &with_header(value)).is_err(),
+                "{value}"
+            );
         }
         assert!(authorize(Some("secret"), &HeaderMap::new()).is_err());
     }

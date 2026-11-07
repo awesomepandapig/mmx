@@ -144,7 +144,7 @@ def main():
         time.sleep(1)
         for i in range(NODES):
             start_node(i, public, private)
-        ssh(public["client"], "pkill -9 -f '[i]o.aeron.driver'; pkill -9 sbx-cluster; sudo rm -rf /dev/shm/aeron; true", check=False)
+        ssh(public["client"], "pkill -9 -f '[i]o.aeron.driver'; pkill -9 mmx-cluster; sudo rm -rf /dev/shm/aeron; true", check=False)
         ssh(public["client"], "nohup java --add-opens java.base/jdk.internal.misc=ALL-UNNAMED -XX:+UseZGC -Xmx1g "
             "-Daeron.dir=/dev/shm/aeron -Daeron.dir.delete.on.start=true -Daeron.threading.mode=DEDICATED "
             "-Daeron.socket.so_rcvbuf=4m -Daeron.socket.so_sndbuf=4m -Daeron.rcv.initial.window.length=4m "

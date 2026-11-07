@@ -68,7 +68,10 @@ impl TickerState {
 
     /// Adds a trade. Both sides of a match report it, so only the buy side counts.
     pub fn update_on_match(&mut self, report: &ExecutionReportMessage) {
-        if report.side != SideEnum::Buy || report.last_px == NULL_DECIMAL || report.last_qty == NULL_DECIMAL {
+        if report.side != SideEnum::Buy
+            || report.last_px == NULL_DECIMAL
+            || report.last_qty == NULL_DECIMAL
+        {
             return;
         }
         self.check_and_reset_windows(report.transact_time);
@@ -221,7 +224,10 @@ mod tests {
             matched(&mut state, 2 * NANOS_PER_DAY + 5, 11 * ONE, ONE);
             state
         };
-        assert_eq!(serde_json::to_string(&build()).ok(), serde_json::to_string(&build()).ok());
+        assert_eq!(
+            serde_json::to_string(&build()).ok(),
+            serde_json::to_string(&build()).ok()
+        );
         assert_eq!(build().volume_24_h, ONE);
     }
 
@@ -247,7 +253,11 @@ mod tests {
     #[test]
     fn shows_the_top_of_the_book() {
         let mut book = OrderBook::new();
-        book.apply(&ExecutionReportMessage { price: 9 * ONE, ord_qty: 2 * ONE, ..sample_report() });
+        book.apply(&ExecutionReportMessage {
+            price: 9 * ONE,
+            ord_qty: 2 * ONE,
+            ..sample_report()
+        });
         book.apply(&ExecutionReportMessage {
             price: 11 * ONE,
             ord_qty: ONE,
@@ -257,8 +267,14 @@ mod tests {
 
         let ticker = state().create_ticker(&book, 0);
 
-        assert_eq!((ticker.best_bid.as_str(), ticker.best_bid_quantity.as_str()), ("9", "2"));
-        assert_eq!((ticker.best_ask.as_str(), ticker.best_ask_quantity.as_str()), ("11", "1"));
+        assert_eq!(
+            (ticker.best_bid.as_str(), ticker.best_bid_quantity.as_str()),
+            ("9", "2")
+        );
+        assert_eq!(
+            (ticker.best_ask.as_str(), ticker.best_ask_quantity.as_str()),
+            ("11", "1")
+        );
     }
 
     #[test]

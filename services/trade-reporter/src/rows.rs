@@ -132,7 +132,9 @@ pub fn write_candle(buffer: &mut Buffer, candle: &Candle) -> Result<()> {
         .column_i64("volume", candle.volume)?
         .column_i64("trades", candle.trades as i64)?
         .column_i64("last_match_id", candle.last_match_id as i64)?
-        .at(TimestampNanos::new((candle.start as i64).saturating_mul(NANOS_PER_SECOND)))
+        .at(TimestampNanos::new(
+            (candle.start as i64).saturating_mul(NANOS_PER_SECOND),
+        ))
 }
 
 pub fn write_position(buffer: &mut Buffer, position: i64) -> Result<()> {
@@ -176,7 +178,10 @@ mod tests {
     fn filled_orders_are_recorded() {
         let line = order_line(&filled());
 
-        assert!(line.starts_with("orders,symbol=ITEM,exec_type=trade,ord_status=filled,side=buy "), "{line}");
+        assert!(
+            line.starts_with("orders,symbol=ITEM,exec_type=trade,ord_status=filled,side=buy "),
+            "{line}"
+        );
         assert!(line.contains("order_id=3i"), "{line}");
         assert!(line.contains("exec_id=12i"), "{line}");
         assert!(line.contains("leaves_qty=0i"), "{line}");
@@ -188,12 +193,32 @@ mod tests {
     #[test]
     fn every_report_type_is_recorded() {
         for (exec_type, ord_status, expected) in [
-            (ExecTypeEnum::New, OrdStatusEnum::New, "exec_type=new,ord_status=new"),
-            (ExecTypeEnum::Trade, OrdStatusEnum::PartiallyFilled, "exec_type=trade,ord_status=partially_filled"),
-            (ExecTypeEnum::Canceled, OrdStatusEnum::Canceled, "exec_type=canceled,ord_status=canceled"),
-            (ExecTypeEnum::Rejected, OrdStatusEnum::Rejected, "exec_type=rejected,ord_status=rejected"),
+            (
+                ExecTypeEnum::New,
+                OrdStatusEnum::New,
+                "exec_type=new,ord_status=new",
+            ),
+            (
+                ExecTypeEnum::Trade,
+                OrdStatusEnum::PartiallyFilled,
+                "exec_type=trade,ord_status=partially_filled",
+            ),
+            (
+                ExecTypeEnum::Canceled,
+                OrdStatusEnum::Canceled,
+                "exec_type=canceled,ord_status=canceled",
+            ),
+            (
+                ExecTypeEnum::Rejected,
+                OrdStatusEnum::Rejected,
+                "exec_type=rejected,ord_status=rejected",
+            ),
         ] {
-            let line = order_line(&ExecutionReportMessage { exec_type, ord_status, ..sample_report() });
+            let line = order_line(&ExecutionReportMessage {
+                exec_type,
+                ord_status,
+                ..sample_report()
+            });
             assert!(line.contains(expected), "{line}");
         }
     }
@@ -211,7 +236,10 @@ mod tests {
 
     #[test]
     fn null_values_are_left_out() {
-        let line = order_line(&ExecutionReportMessage { price: NULL_DECIMAL, ..sample_report() });
+        let line = order_line(&ExecutionReportMessage {
+            price: NULL_DECIMAL,
+            ..sample_report()
+        });
 
         assert!(!line.contains("price="), "{line}");
         assert!(!line.contains("avg_px="), "{line}");
@@ -219,7 +247,10 @@ mod tests {
 
     #[test]
     fn uuids_match_the_gateway() {
-        let report = ExecutionReportMessage { cl_ord_id: [0x0011223344556677, 0x8899aabbccddeeff], ..sample_report() };
+        let report = ExecutionReportMessage {
+            cl_ord_id: [0x0011223344556677, 0x8899aabbccddeeff],
+            ..sample_report()
+        };
         assert!(order_line(&report).contains("cl_ord_id=\"00112233-4455-6677-8899-aabbccddeeff\""));
     }
 
@@ -252,7 +283,10 @@ mod tests {
         write_candle(&mut buffer, &candle).expect("writes");
         let line = buffer.as_str();
 
-        assert!(line.starts_with("candles,symbol=ITEM open=1i,high=4i,low=1i,close=2i,volume=5i"), "{line}");
+        assert!(
+            line.starts_with("candles,symbol=ITEM open=1i,high=4i,low=1i,close=2i,volume=5i"),
+            "{line}"
+        );
         assert!(line.ends_with(" 300000000000\n"), "{line}");
     }
 
@@ -287,7 +321,10 @@ mod tests {
 
     #[test]
     fn a_time_before_the_epoch_is_an_error_rather_than_a_panic() {
-        let report = ExecutionReportMessage { transact_time: u64::MAX, ..sample_report() };
+        let report = ExecutionReportMessage {
+            transact_time: u64::MAX,
+            ..sample_report()
+        };
         assert!(write_order(&mut Buffer::new(), &report).is_err());
     }
 }

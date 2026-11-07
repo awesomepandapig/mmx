@@ -1,0 +1,22 @@
+# kind create cluster --name mmx --config quickstart.yaml
+# Three worker nodes preserve the chart's required voter host separation.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+    extraPortMappings:
+      - containerPort: 30093
+        hostPort: 8093
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 30080
+        hostPort: 8000
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      - containerPort: 30081
+        hostPort: 8080
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+  - role: worker
+  - role: worker

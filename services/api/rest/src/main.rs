@@ -4,7 +4,7 @@ mod aeron_handler;
 use aeron_handler::{EngineLink, OrderSender, spawn_order_publisher};
 
 mod cluster_gateway;
-use cluster_gateway::{ClusterConfig, spawn_cluster_gateway};
+use cluster_gateway::{ClusterConfig, ClusterWatch, spawn_cluster_gateway};
 
 mod decimal;
 
@@ -71,6 +71,8 @@ pub struct AppState {
     id_rules: Option<OrderIdRules>,
     claims_ready: Option<Arc<AtomicBool>>,
     engine: Arc<EngineLink>,
+    /// `None` without a cluster.
+    cluster: Option<Arc<ClusterWatch>>,
     halts: Arc<Halts>,
     metrics: Metrics,
     admin_token: Option<String>,
@@ -78,7 +80,9 @@ pub struct AppState {
 
 fn env_number<T: FromStr>(name: &str, default: T) -> Result<T, String> {
     match env::var(name) {
-        Ok(value) => value.parse().map_err(|_| format!("{name} must be a number, got {value:?}")),
+        Ok(value) => value
+            .parse()
+            .map_err(|_| format!("{name} must be a number, got {value:?}")),
         Err(_) => Ok(default),
     }
 }
@@ -92,7 +96,9 @@ fn parse_duration(text: &str) -> Option<Duration> {
     if let Some(digits) = text.strip_suffix('s') {
         return number(digits).map(Duration::from_secs);
     }
-    text.strip_suffix('m').and_then(number).map(|minutes| Duration::from_secs(minutes * 60))
+    text.strip_suffix('m')
+        .and_then(number)
+        .map(|minutes| Duration::from_secs(minutes * 60))
 }
 
 /// The session timeout has no default, because a guess that's too short could report a live order
@@ -102,17 +108,25 @@ fn order_id_rules() -> Result<OrderIdRules, String> {
     if window == 0 {
         return Err("ORDER_ID_WINDOW_SECS must be above 0".to_string());
     }
-    let session_timeout = env::var("CLUSTER_SESSION_TIMEOUT")
-        .map_err(|_| "CLUSTER_SESSION_TIMEOUT must match the cluster's session timeout".to_string())?;
-    let session_timeout = parse_duration(&session_timeout)
-        .ok_or_else(|| format!("CLUSTER_SESSION_TIMEOUT must look like 30s, got {session_timeout:?}"))?;
-    Ok(OrderIdRules { window: Duration::from_secs(window), session_timeout })
+    let session_timeout = env::var("CLUSTER_SESSION_TIMEOUT").map_err(|_| {
+        "CLUSTER_SESSION_TIMEOUT must match the cluster's session timeout".to_string()
+    })?;
+    let session_timeout = parse_duration(&session_timeout).ok_or_else(|| {
+        format!("CLUSTER_SESSION_TIMEOUT must look like 30s, got {session_timeout:?}")
+    })?;
+    Ok(OrderIdRules {
+        window: Duration::from_secs(window),
+        session_timeout,
+    })
 }
 
 fn rate_limiter(id_rules: Option<OrderIdRules>) -> Result<Arc<dyn RateLimiter>, String> {
     let Ok(url) = env::var("VALKEY_URL") else {
         if id_rules.is_some() {
-            return Err("VALKEY_URL is required in cluster mode, because orders are claimed there".to_string());
+            return Err(
+                "VALKEY_URL is required in cluster mode, because orders are claimed there"
+                    .to_string(),
+            );
         }
         warn!("Rate limit: VALKEY_URL isn't set, so orders aren't limited");
         return Ok(Arc::new(Unlimited));
@@ -121,7 +135,10 @@ fn rate_limiter(id_rules: Option<OrderIdRules>) -> Result<Arc<dyn RateLimiter>, 
         orders: env_number("RATE_LIMIT_ORDERS", DEFAULT_RATE_LIMIT_ORDERS)?,
         window_ms: env_number("RATE_LIMIT_WINDOW_MS", DEFAULT_RATE_LIMIT_WINDOW_MS)?,
     };
-    info!("Rate limit: {} orders per {} ms by default", limit.orders, limit.window_ms);
+    info!(
+        "Rate limit: {} orders per {} ms by default",
+        limit.orders, limit.window_ms
+    );
     Ok(Arc::new(Valkey::new(&url, limit, id_rules)?))
 }
 
@@ -163,10 +180,16 @@ async fn start() -> Result<(), String> {
 
     let markets_file = transport::env_or("MARKETS_FILE", DEFAULT_MARKETS_FILE);
     let markets = MarketRegistry::load(&markets_file)?;
-    info!("Markets: Enabled {:?} from {}", markets.current().symbols(), markets_file);
+    info!(
+        "Markets: Enabled {:?} from {}",
+        markets.current().symbols(),
+        markets_file
+    );
 
-    let store: Arc<dyn OrderStore> =
-        Arc::new(QuestDb::new(&transport::env_or("QUESTDB_URL", DEFAULT_QUESTDB_URL))?);
+    let store: Arc<dyn OrderStore> = Arc::new(QuestDb::new(&transport::env_or(
+        "QUESTDB_URL",
+        DEFAULT_QUESTDB_URL,
+    ))?);
 
     // One read before serving, so a normal start never bounces orders while the list loads.
     let halts = halts()?;
@@ -175,7 +198,7 @@ async fn start() -> Result<(), String> {
 
     let engine = Arc::new(EngineLink::default());
 
-    let (orders, report_stream, id_rules) = match ClusterConfig::from_env() {
+    let (orders, report_stream, id_rules, cluster) = match ClusterConfig::from_env()? {
         Some(config) => {
             let id_rules = order_id_rules()?;
             info!(
@@ -184,13 +207,20 @@ async fn start() -> Result<(), String> {
                 id_rules.settled_after()
             );
             let stream = Arc::new(ReportStream::default());
-            let orders = spawn_cluster_gateway(config, stream.clone(), engine.clone())?;
-            (orders, Some(stream), Some(id_rules))
+            let watch = Arc::new(ClusterWatch::default());
+            let orders =
+                spawn_cluster_gateway(config, stream.clone(), engine.clone(), watch.clone())?;
+            (orders, Some(stream), Some(id_rules), Some(watch))
         }
         None => {
             let channel = transport::env_or("PUB_CHANNEL", transport::ORDERS_CHANNEL);
             let stream_id = transport::stream_id_or("PUB_STREAM_ID", transport::ORDERS_STREAM);
-            (spawn_order_publisher(&channel, stream_id, engine.clone())?, None, None)
+            (
+                spawn_order_publisher(&channel, stream_id, engine.clone())?,
+                None,
+                None,
+                None,
+            )
         }
     };
 
@@ -207,6 +237,7 @@ async fn start() -> Result<(), String> {
         id_rules,
         claims_ready,
         engine,
+        cluster,
         halts,
         metrics: Metrics::default(),
         admin_token: admin::admin_token(),
@@ -226,7 +257,9 @@ async fn start() -> Result<(), String> {
         startup_duration
     );
 
-    axum::serve(listener, app).await.map_err(|e| format!("Server failed: {e}"))
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| format!("Server failed: {e}"))
 }
 
 #[tokio::main]

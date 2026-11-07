@@ -13,10 +13,12 @@ use std::time::{Duration, Instant};
 
 use rusteron_client::*;
 
+mod log;
 mod retention;
 mod schedule;
 mod snapshot;
 
+use log::LogAssembler;
 use retention::Housekeeper;
 use schedule::SnapshotSchedule;
 
@@ -102,7 +104,13 @@ pub enum SnapshotRequest {
 /// The application side of a cluster node. Callbacks run on the service thread, in log order, so
 /// every node sees exactly the same sequence.
 pub trait ClusteredService {
-    fn on_session_message(&mut self, archive: &ArchiveClient, timestamp: i64, log_position: i64, payload: &[u8]);
+    fn on_session_message(
+        &mut self,
+        archive: &ArchiveClient,
+        timestamp: i64,
+        log_position: i64,
+        payload: &[u8],
+    );
     fn on_role_change(&mut self, role: Role);
     /// Runs in log order when a leadership term starts. Nothing from an older term can follow,
     /// because the consensus module drops ingress stamped with any other term.
@@ -117,7 +125,11 @@ pub trait ClusteredService {
     }
     /// Writes the full state in chunks small enough for one Aeron message, and returns where the
     /// snapshot sits on the tape.
-    fn on_take_snapshot(&mut self, archive: &ArchiveClient, write: &mut dyn FnMut(&[u8])) -> TapeMark;
+    fn on_take_snapshot(
+        &mut self,
+        archive: &ArchiveClient,
+        write: &mut dyn FnMut(&[u8]),
+    ) -> TapeMark;
     /// Receives the chunks written by `on_take_snapshot`, in order.
     fn on_load_snapshot(&mut self, chunk: &[u8]);
     /// Runs once any snapshot is loaded, before the service joins the log.
@@ -157,13 +169,23 @@ fn template_of(buffer: &[u8]) -> Option<u16> {
     (buffer.len() >= HEADER_LENGTH && read_u16(buffer, 4) == SCHEMA_ID).then(|| read_u16(buffer, 2))
 }
 
-fn find_counter(aeron: &Aeron, wanted: i32, cluster_id: i32, key_offset: usize) -> Option<(i32, Vec<u8>)> {
+fn find_counter(
+    aeron: &Aeron,
+    wanted: i32,
+    cluster_id: i32,
+    key_offset: usize,
+) -> Option<(i32, Vec<u8>)> {
     let mut found = None;
-    aeron.counters_reader().foreach_counter_fn(|_, id, type_id, key, _| {
-        if type_id == wanted && key.len() >= key_offset + 4 && read_i32(key, key_offset) == cluster_id {
-            found = Some((id, key.to_vec()));
-        }
-    });
+    aeron
+        .counters_reader()
+        .foreach_counter_fn(|_, id, type_id, key, _| {
+            if type_id == wanted
+                && key.len() >= key_offset + 4
+                && read_i32(key, key_offset) == cluster_id
+            {
+                found = Some((id, key.to_vec()));
+            }
+        });
     found
 }
 
@@ -223,7 +245,10 @@ impl<S: ClusteredService> Agent<'_, S> {
         self.ack_id += 1;
 
         while let Err(error) = self.consensus.offer(&message) {
-            assert!(error.is_retryable(), "failed to ack the consensus module: {error}");
+            assert!(
+                error.is_retryable(),
+                "failed to ack the consensus module: {error}"
+            );
             spin_loop();
         }
     }
@@ -237,7 +262,9 @@ impl<S: ClusteredService> Agent<'_, S> {
         }
         let wanted = match self.service.snapshot_request() {
             SnapshotRequest::Now => true,
-            SnapshotRequest::Scheduled => self.schedule.is_due(self.log_position, self.cluster_time),
+            SnapshotRequest::Scheduled => {
+                self.schedule.is_due(self.log_position, self.cluster_time)
+            }
             SnapshotRequest::Hold => false,
         };
         if wanted {
@@ -251,7 +278,9 @@ impl<S: ClusteredService> Agent<'_, S> {
     }
 
     fn on_control_message(&mut self, buffer: &[u8]) {
-        let Some(template_id) = template_of(buffer) else { return };
+        let Some(template_id) = template_of(buffer) else {
+            return;
+        };
         let body = &buffer[HEADER_LENGTH..];
 
         match template_id {
@@ -276,7 +305,9 @@ impl<S: ClusteredService> Agent<'_, S> {
     }
 
     fn on_log_message(&mut self, buffer: &[u8], position: i64) {
-        let Some(template_id) = template_of(buffer) else { return };
+        let Some(template_id) = template_of(buffer) else {
+            return;
+        };
         let body = &buffer[HEADER_LENGTH..];
         self.log_position = position;
 
@@ -307,7 +338,8 @@ impl<S: ClusteredService> Agent<'_, S> {
                     let (recording_id, tape, timing) = snapshot::take(&self.archive, self.service);
                     self.ack(log_position, recording_id);
                     self.schedule.on_snapshot(log_position, self.cluster_time);
-                    self.housekeeper.on_snapshot(recording_id, log_position, tape);
+                    self.housekeeper
+                        .on_snapshot(recording_id, log_position, tape);
                     eprintln!("snapshot recording {recording_id}: {timing}");
                 }
             }
@@ -331,12 +363,20 @@ impl<S: ClusteredService> Agent<'_, S> {
             sleep(Duration::from_micros(100));
         };
 
-        assert_eq!(image.position(), self.log_position, "the log must be contiguous");
-        assert_eq!(active.log_position, self.log_position, "the log must be contiguous");
+        assert_eq!(
+            image.position(),
+            self.log_position,
+            "the log must be contiguous"
+        );
+        assert_eq!(
+            active.log_position, self.log_position,
+            "the log must be contiguous"
+        );
 
         self.max_log_position = active.max_log_position;
         if active.is_live() {
-            self.service.on_join_live_log(&self.archive, active.role, active.log_position);
+            self.service
+                .on_join_live_log(&self.archive, active.role, active.log_position);
         }
         self.ack(active.log_position, NULL_VALUE);
 
@@ -407,7 +447,7 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
     }
     agent.ack(agent.log_position, aeron.client_id());
 
-    let mut log: Option<(AeronSubscription, AeronImage)> = None;
+    let mut log: Option<(AeronSubscription, AeronImage, LogAssembler)> = None;
     let mut loops = 0u64;
     let mut last_keep_alive = Instant::now();
 
@@ -419,31 +459,51 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
         if log.is_none()
             && let Some(active) = agent.active_log.take()
         {
-            log = Some(agent.join_log(active));
+            let (subscription, image) = agent.join_log(active);
+            let assembler = match LogAssembler::new() {
+                Ok(assembler) => assembler,
+                Err(error) => {
+                    // Continuing without assembly could apply only part of a committed command.
+                    // Stop before polling this image; a restart can replay it without lost effects.
+                    eprintln!("cannot create the committed-log fragment assembler: {error:?}");
+                    std::process::exit(1);
+                }
+            };
+            log = Some((subscription, image, assembler));
         }
 
-        if agent.termination_position != NULL_POSITION && agent.log_position >= agent.termination_position {
+        if agent.termination_position != NULL_POSITION
+            && agent.log_position >= agent.termination_position
+        {
             agent.ack(agent.log_position, NULL_VALUE);
             return;
         }
 
-        if agent.requested_ack_position != NULL_POSITION && agent.log_position >= agent.requested_ack_position {
+        if agent.requested_ack_position != NULL_POSITION
+            && agent.log_position >= agent.requested_ack_position
+        {
             agent.requested_ack_position = NULL_POSITION;
             agent.ack(agent.log_position, NULL_VALUE);
         }
 
         let mut polled = 0;
         let mut finished = false;
-        if let Some((_, image)) = &log {
+        if let Some((_, image, assembler)) = &mut log {
             // SAFETY: the counter lives in the driver's counters file for the client's lifetime.
             let limit = unsafe { ptr::read_volatile(commit_position) };
-            polled = image
-                .bounded_poll_fn(
-                    |buffer, header| agent.on_log_message(buffer, header.position()),
-                    limit,
-                    FRAGMENT_LIMIT,
-                )
-                .expect("failed to poll the log");
+            polled = match assembler.poll(
+                image,
+                limit,
+                FRAGMENT_LIMIT,
+                &mut agent,
+                |agent, buffer, header| agent.on_log_message(buffer, header.position()),
+            ) {
+                Ok(read) => read,
+                Err(error) => {
+                    eprintln!("cannot safely consume the committed log: {error}");
+                    std::process::exit(1);
+                }
+            };
             finished = polled == 0
                 && (image.position() >= agent.max_log_position
                     || image.is_end_of_stream()
@@ -451,9 +511,19 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
         }
 
         if finished {
-            if let Some((_, image)) = log.take() {
-                agent.log_position = agent.log_position.max(image.position());
+            // Check before taking/dropping this image: padding can advance its raw position,
+            // but a BEGIN/middle fragment must never be acknowledged as a completed command.
+            if let Some((_, image, assembler)) = &log {
+                agent.log_position =
+                    match assembler.finish_position(agent.log_position, image.position()) {
+                        Ok(position) => position,
+                        Err(error) => {
+                            eprintln!("refusing to finish the committed-log image: {error}");
+                            std::process::exit(1);
+                        }
+                    };
             }
+            log = None;
             if agent.role != Role::Follower {
                 agent.role = Role::Follower;
                 agent.service.on_role_change(Role::Follower);
@@ -463,7 +533,9 @@ pub fn run<S: ClusteredService>(aeron: &Aeron, config: &NodeConfig, service: &mu
         agent.service.do_background_work(&agent.archive);
         loops = loops.wrapping_add(1);
         // Checked rarely, because this loop runs between messages.
-        if loops.is_multiple_of(KEEP_ALIVE_CHECK_LOOPS) && last_keep_alive.elapsed() >= ARCHIVE_KEEP_ALIVE {
+        if loops.is_multiple_of(KEEP_ALIVE_CHECK_LOOPS)
+            && last_keep_alive.elapsed() >= ARCHIVE_KEEP_ALIVE
+        {
             agent.archive.keep_alive();
             last_keep_alive = Instant::now();
         }
@@ -509,7 +581,11 @@ impl ClusterClient {
         for endpoint in ingress_endpoints {
             let channel = std::ffi::CString::new(format!("aeron:udp?endpoint={endpoint}"))
                 .expect("channel has no nul");
-            ingress.push(aeron.async_add_publication(&channel, ingress_stream)?.poll_blocking(Duration::from_secs(10))?);
+            ingress.push(
+                aeron
+                    .async_add_publication(&channel, ingress_stream)?
+                    .poll_blocking(Duration::from_secs(10))?,
+            );
         }
 
         let channel = std::ffi::CString::new(response_channel).expect("channel has no nul");
@@ -534,7 +610,10 @@ impl ClusterClient {
         let deadline = Instant::now() + Duration::from_secs(60);
         let mut last_request = Instant::now() - Duration::from_secs(1);
         while client.session_id == NULL_VALUE {
-            assert!(Instant::now() < deadline, "no cluster leader accepted the session");
+            assert!(
+                Instant::now() < deadline,
+                "no cluster leader accepted the session"
+            );
             if last_request.elapsed() > Duration::from_millis(250) {
                 client.send_connect_requests();
                 last_request = Instant::now();
@@ -618,11 +697,14 @@ impl ClusterClient {
     }
 
     pub fn is_leader_connected(&self) -> bool {
-        self.leader.is_some_and(|leader| self.ingress[leader].is_connected())
+        self.leader
+            .is_some_and(|leader| self.ingress[leader].is_connected())
     }
 
     pub fn offer(&mut self, payload: &[u8]) -> OfferResult {
-        let Some(leader) = self.leader else { return OfferResult::Retry };
+        let Some(leader) = self.leader else {
+            return OfferResult::Retry;
+        };
         let length = SESSION_HEADER_LENGTH + payload.len();
         write_header(&mut self.buffer, 24, TEMPLATE_SESSION_MESSAGE);
         self.buffer[8..16].copy_from_slice(&self.leadership_term_id.to_le_bytes());

@@ -38,7 +38,10 @@ impl Ledger {
         match frame {
             Frame::Execution(report) => {
                 if report.exec_id != expected {
-                    return Err(format!("expected exec_id {expected}, got {}", report.exec_id));
+                    return Err(format!(
+                        "expected exec_id {expected}, got {}",
+                        report.exec_id
+                    ));
                 }
                 self.last_exec_id = expected;
 
@@ -46,27 +49,43 @@ impl Ledger {
                 let open = self.open.get(&key).copied();
                 if report.exec_type == ExecType::New {
                     self.open.insert(key, report.order_id);
-                    return Ok(Stamp { exec_id: expected, flags: 0 });
+                    return Ok(Stamp {
+                        exec_id: expected,
+                        flags: 0,
+                    });
                 }
 
                 // A full book rejects before the engine checks for duplicates, so a repeat can
                 // arrive with reason `Other`. Only the order ID tells it apart from a real reject.
                 let repeat = report.exec_type == ExecType::Rejected
-                    && (report.reject_reason == Some(RejectReason::DuplicateOrder) || open.is_some_and(|id| id != report.order_id));
+                    && (report.reject_reason == Some(RejectReason::DuplicateOrder)
+                        || open.is_some_and(|id| id != report.order_id));
                 if repeat {
-                    return Ok(Stamp { exec_id: expected, flags: REPEAT_OF_OPEN_ORDER });
+                    return Ok(Stamp {
+                        exec_id: expected,
+                        flags: REPEAT_OF_OPEN_ORDER,
+                    });
                 }
 
                 if report.ord_status.is_terminal() && open == Some(report.order_id) {
                     self.open.remove(&key);
                 }
-                Ok(Stamp { exec_id: expected, flags: 0 })
+                Ok(Stamp {
+                    exec_id: expected,
+                    flags: 0,
+                })
             }
             Frame::CancelReject { .. } => {
                 self.last_exec_id = expected;
-                Ok(Stamp { exec_id: expected, flags: 0 })
+                Ok(Stamp {
+                    exec_id: expected,
+                    flags: 0,
+                })
             }
-            Frame::TermMarker | Frame::Unknown(_) => Ok(Stamp { exec_id: self.last_exec_id, flags: 0 }),
+            Frame::TermMarker | Frame::Unknown(_) => Ok(Stamp {
+                exec_id: self.last_exec_id,
+                flags: 0,
+            }),
         }
     }
 }

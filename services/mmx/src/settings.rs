@@ -2,7 +2,9 @@
 //! here. Secrets are written but never read back, apart from a webhook secret at the moment it's
 //! generated, which is the only time anyone can see it.
 
-use crate::auth::{self, Caller, OidcSettings, hint, random_hex, update_settings};
+use crate::auth::{
+    self, Caller, DEFAULT_GROUPS_CLAIM, OidcSettings, RoleGroups, hint, random_hex, update_settings,
+};
 use crate::oidc;
 use crate::server::{ApiError, AppState, error, invalid, store_failed};
 use crate::store::{StoreError, WEBHOOK_SECRET_KEY, WEBHOOK_URL_KEY};
@@ -11,7 +13,8 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,27 +22,32 @@ use sha2::{Digest, Sha256};
 use tracing::info;
 use url::Url;
 
-fn oidc_view(state: &AppState) -> Value {
+fn oidc_view(state: &AppState, headers: &HeaderMap) -> Value {
     let keys = state.auth.keys();
-    let settings = &keys.settings;
-    let oidc = settings.oidc.clone().unwrap_or_default();
+    let oidc = keys.settings.oidc.clone().unwrap_or_default();
+    let claim = if oidc.groups_claim.is_empty() {
+        DEFAULT_GROUPS_CLAIM
+    } else {
+        &oidc.groups_claim
+    };
     json!({
         "enabled": oidc.enabled,
         "issuer": oidc.issuer,
         "client_id": oidc.client_id,
         "display_name": oidc.display_name,
-        "allowed": oidc.allowed,
+        "groups_claim": claim,
+        "roles": oidc.roles,
         "client_secret_hint": state.auth.oidc_secret_hint(),
-        "redirect_uri": auth::redirect_uri(settings),
+        "redirect_uri": auth::redirect_uri(headers),
+        "managed": state.auth.oidc_managed(),
     })
 }
 
-pub async fn get_settings(State(state): State<Arc<AppState>>) -> Json<Value> {
+pub async fn get_settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Json<Value> {
     let keys = state.auth.keys();
     Json(json!({
-        "public_url": keys.settings.public_url,
-        "password_login": keys.settings.password_login,
-        "oidc": oidc_view(&state),
+        "password_login": keys.password_login,
+        "oidc": oidc_view(&state, &headers),
         "store": state.store.info(),
         "admin_token_set": state.auth.has_token(),
         "version": env!("CARGO_PKG_VERSION"),
@@ -49,23 +57,7 @@ pub async fn get_settings(State(state): State<Arc<AppState>>) -> Json<Value> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsBody {
-    public_url: Option<String>,
-    password_login: Option<bool>,
-}
-
-fn check_public_url(text: &str) -> Result<String, ApiError> {
-    let url = Url::parse(text).map_err(|err| invalid(format!("That isn't a URL: {err}")))?;
-    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
-        return Err(invalid(
-            "The public URL must start with http:// or https://.",
-        ));
-    }
-    if url.path() != "/" || url.query().is_some() {
-        return Err(invalid(
-            "The public URL is only the scheme and host, because the console runs at the root.",
-        ));
-    }
-    Ok(text.trim_end_matches('/').to_string())
+    password_login: bool,
 }
 
 /// Turning passwords off can lock everyone out, so it needs proof that sign-on works: the person
@@ -91,29 +83,15 @@ fn check_password_login(state: &AppState, caller: &Caller, on: bool) -> Result<(
 pub async fn put_settings(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
     body: Result<Json<SettingsBody>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(body) = body.map_err(|rejection| invalid(rejection.body_text()))?;
-    let public_url = match body.public_url.as_deref() {
-        Some("") | None => None,
-        Some(text) => Some(check_public_url(text)?),
-    };
-    let clear_url = body.public_url.as_deref() == Some("");
-    if let Some(on) = body.password_login {
-        check_password_login(&state, &caller, on)?;
-    }
+    check_password_login(&state, &caller, body.password_login)?;
 
     let _edit = state.edits.lock().await;
     update_settings(&state.store, |settings| {
-        if let Some(url) = &public_url {
-            settings.public_url = Some(url.clone());
-        }
-        if clear_url {
-            settings.public_url = None;
-        }
-        if let Some(on) = body.password_login {
-            settings.password_login = on;
-        }
+        settings.password_login = Some(body.password_login);
         Ok(())
     })
     .await
@@ -123,7 +101,7 @@ pub async fn put_settings(
         .refresh()
         .await
         .map_err(|message| store_failed(StoreError::Failed(message)))?;
-    Ok(get_settings(State(state.clone())).await)
+    Ok(get_settings(State(state.clone()), headers).await)
 }
 
 #[derive(Deserialize)]
@@ -135,23 +113,42 @@ pub struct OidcBody {
     /// Left out, the stored one stays.
     client_secret: Option<String>,
     display_name: Option<String>,
+    groups_claim: Option<String>,
     #[serde(default)]
-    allowed: Vec<String>,
+    roles: RoleGroups,
 }
 
+fn clean(groups: &[String]) -> Vec<String> {
+    groups
+        .iter()
+        .map(|group| group.trim().to_string())
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+/// A change here can take away someone's role, and a role is only read at sign-in, so everyone has
+/// to sign in again. The person making the change stays signed in.
 pub async fn put_oidc(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
+    headers: HeaderMap,
     body: Result<Json<OidcBody>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|rejection| invalid(rejection.body_text()))?;
+    if state.auth.oidc_managed() {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "managed_by_deployment",
+            "This provider is set by the deployment. Change it there.",
+        ));
+    }
     let keys = state.auth.keys();
     let client_secret = body.client_secret.filter(|secret| !secret.is_empty());
-    let allowed: Vec<String> = body
-        .allowed
-        .iter()
-        .map(|entry| entry.trim().to_string())
-        .filter(|entry| !entry.is_empty())
-        .collect();
+    let roles = RoleGroups {
+        admin: clean(&body.roles.admin),
+        operator: clean(&body.roles.operator),
+        viewer: clean(&body.roles.viewer),
+    };
 
     if !body.issuer.is_empty() {
         oidc::check_url("The issuer", body.issuer.trim()).map_err(invalid)?;
@@ -163,17 +160,10 @@ pub async fn put_oidc(
         if client_secret.is_none() && state.auth.oidc_secret_hint().is_none() {
             return Err(invalid("Single sign-on needs a client secret."));
         }
-        if allowed.is_empty() {
-            return Err(invalid(
-                "List who may sign in. Otherwise any account at the provider could become an admin.",
-            ));
+        if roles.admin.is_empty() {
+            return Err(invalid("Map at least one group to the admin role."));
         }
-        if keys.settings.public_url.is_none() {
-            return Err(invalid(
-                "Set the public URL first, because the provider needs a redirect URI.",
-            ));
-        }
-    } else if !keys.settings.password_login {
+    } else if !keys.password_login {
         return Err(invalid(
             "Turn on password login first, or nobody could sign in.",
         ));
@@ -184,8 +174,14 @@ pub async fn put_oidc(
         issuer: body.issuer.trim().trim_end_matches('/').to_string(),
         client_id: body.client_id.trim().to_string(),
         display_name: body.display_name.filter(|name| !name.trim().is_empty()),
-        allowed,
+        groups_claim: body
+            .groups_claim
+            .map(|claim| claim.trim().to_string())
+            .filter(|claim| !claim.is_empty())
+            .unwrap_or_else(|| DEFAULT_GROUPS_CLAIM.to_string()),
+        roles,
     };
+    let changed = keys.settings.oidc.as_ref() != Some(&oidc);
     let _edit = state.edits.lock().await;
     if let Some(secret) = &client_secret {
         state.auth.set_oidc_secret(secret).await?;
@@ -201,7 +197,16 @@ pub async fn put_oidc(
         .refresh()
         .await
         .map_err(|message| store_failed(StoreError::Failed(message)))?;
-    Ok(Json(oidc_view(&state)))
+    if !changed {
+        return Ok(Json(oidc_view(&state, &headers)).into_response());
+    }
+    state.auth.revoke_sessions().await?;
+    let mut response = Json(oidc_view(&state, &headers)).into_response();
+    if let Caller::Session(session) = &caller {
+        let cookie = state.auth.reissue(session, &headers)?;
+        response.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -324,6 +329,18 @@ pub async fn put_webhook_config(
     webhook_config(State(state.clone())).await
 }
 
+/// The authenticated control plane rolls only its configured outbox Deployment.
+pub async fn restart_webhook(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+    state
+        .store
+        .restart_outbox(&state.outbox_kind, &state.outbox_deployment)
+        .await
+        .map_err(store_failed)?;
+    Ok(Json(
+        json!({ "restart_requested": true, "deployment": state.outbox_deployment }),
+    ))
+}
+
 /// Generates a signing secret. This answer is the only place it ever appears.
 pub async fn rotate_webhook_secret(
     State(state): State<Arc<AppState>>,
@@ -409,16 +426,5 @@ mod tests {
             webhook_fingerprint("ab", "c"),
             webhook_fingerprint("a", "bc")
         );
-    }
-
-    #[test]
-    fn a_public_url_is_only_scheme_and_host() {
-        assert_eq!(
-            check_public_url("https://console.example/").unwrap(),
-            "https://console.example"
-        );
-        assert!(check_public_url("http://localhost:8093").is_ok());
-        assert!(check_public_url("https://console.example/mmx").is_err());
-        assert!(check_public_url("ftp://console.example").is_err());
     }
 }

@@ -79,7 +79,10 @@ impl OrderBook {
                 Some(remaining)
             }
             Entry::Vacant(_) => {
-                warn!("Report {} is for an empty level at price {}", exec_id, report.price);
+                warn!(
+                    "Report {} is for an empty level at price {}",
+                    exec_id, report.price
+                );
                 None
             }
         }
@@ -113,7 +116,10 @@ pub fn track_order_id(last_seen_id: &mut u64, report: &ExecutionReportMessage) {
     }
     let expected = last_seen_id.wrapping_add(1);
     if report.order_id != expected {
-        warn!("Received order {} but expected {}", report.order_id, expected);
+        warn!(
+            "Received order {} but expected {}",
+            report.order_id, expected
+        );
     }
     *last_seen_id = report.order_id;
 }
@@ -125,15 +131,27 @@ mod tests {
     use crate::messages::sample_report;
 
     fn new_order(qty: i64) -> ExecutionReportMessage {
-        ExecutionReportMessage { ord_qty: qty, leaves_qty: qty, ..sample_report() }
+        ExecutionReportMessage {
+            ord_qty: qty,
+            leaves_qty: qty,
+            ..sample_report()
+        }
     }
 
     fn trade(qty: i64) -> ExecutionReportMessage {
-        ExecutionReportMessage { exec_type: ExecTypeEnum::Trade, last_qty: qty, ..sample_report() }
+        ExecutionReportMessage {
+            exec_type: ExecTypeEnum::Trade,
+            last_qty: qty,
+            ..sample_report()
+        }
     }
 
     fn cancel(leaves_qty: i64) -> ExecutionReportMessage {
-        ExecutionReportMessage { exec_type: ExecTypeEnum::Canceled, leaves_qty, ..sample_report() }
+        ExecutionReportMessage {
+            exec_type: ExecTypeEnum::Canceled,
+            leaves_qty,
+            ..sample_report()
+        }
     }
 
     #[test]
@@ -159,7 +177,10 @@ mod tests {
     #[test]
     fn market_orders_do_not_touch_the_book() {
         let mut book = OrderBook::new();
-        let market = ExecutionReportMessage { price: NULL_DECIMAL, ..new_order(10) };
+        let market = ExecutionReportMessage {
+            price: NULL_DECIMAL,
+            ..new_order(10)
+        };
         assert_eq!(book.apply(&market), None);
         assert!(book.bids.is_empty());
     }
@@ -167,7 +188,10 @@ mod tests {
     #[test]
     fn rejects_change_nothing() {
         let mut book = OrderBook::new();
-        let reject = ExecutionReportMessage { exec_type: ExecTypeEnum::Rejected, ..new_order(10) };
+        let reject = ExecutionReportMessage {
+            exec_type: ExecTypeEnum::Rejected,
+            ..new_order(10)
+        };
         assert_eq!(book.apply(&reject), None);
         assert!(book.bids.is_empty());
     }
@@ -191,17 +215,31 @@ mod tests {
     #[test]
     fn a_report_with_no_side_is_skipped_instead_of_panicking() {
         let mut book = OrderBook::new();
-        let report = ExecutionReportMessage { side: SideEnum::NullVal, ..new_order(3) };
+        let report = ExecutionReportMessage {
+            side: SideEnum::NullVal,
+            ..new_order(3)
+        };
         assert_eq!(book.apply(&report), None);
     }
 
     #[test]
     fn best_prices_come_from_the_top_of_each_side() {
         let mut book = OrderBook::new();
-        book.apply(&ExecutionReportMessage { price: 90, ..new_order(1) });
+        book.apply(&ExecutionReportMessage {
+            price: 90,
+            ..new_order(1)
+        });
         book.apply(&new_order(2));
-        book.apply(&ExecutionReportMessage { price: 110, side: SideEnum::Sell, ..new_order(3) });
-        book.apply(&ExecutionReportMessage { price: 120, side: SideEnum::Sell, ..new_order(4) });
+        book.apply(&ExecutionReportMessage {
+            price: 110,
+            side: SideEnum::Sell,
+            ..new_order(3)
+        });
+        book.apply(&ExecutionReportMessage {
+            price: 120,
+            side: SideEnum::Sell,
+            ..new_order(4)
+        });
 
         assert_eq!(book.get_best_bid(), Some((&100, &2)));
         assert_eq!(book.get_best_ask(), Some((&110, &3)));
@@ -210,11 +248,27 @@ mod tests {
     #[test]
     fn order_id_gaps_resynchronise() {
         let mut last_seen = 0;
-        track_order_id(&mut last_seen, &ExecutionReportMessage { order_id: 1, ..sample_report() });
+        track_order_id(
+            &mut last_seen,
+            &ExecutionReportMessage {
+                order_id: 1,
+                ..sample_report()
+            },
+        );
         assert_eq!(last_seen, 1);
-        track_order_id(&mut last_seen, &ExecutionReportMessage { order_id: 5, ..sample_report() });
+        track_order_id(
+            &mut last_seen,
+            &ExecutionReportMessage {
+                order_id: 5,
+                ..sample_report()
+            },
+        );
         assert_eq!(last_seen, 5);
-        let trade = ExecutionReportMessage { order_id: 2, exec_type: ExecTypeEnum::Trade, ..sample_report() };
+        let trade = ExecutionReportMessage {
+            order_id: 2,
+            exec_type: ExecTypeEnum::Trade,
+            ..sample_report()
+        };
         track_order_id(&mut last_seen, &trade);
         assert_eq!(last_seen, 5);
     }
@@ -222,9 +276,27 @@ mod tests {
     #[test]
     fn the_largest_order_id_does_not_overflow() {
         let mut last_seen = u64::MAX;
-        track_order_id(&mut last_seen, &ExecutionReportMessage { order_id: 1, ..sample_report() });
-        track_order_id(&mut last_seen, &ExecutionReportMessage { order_id: u64::MAX, ..sample_report() });
-        track_order_id(&mut last_seen, &ExecutionReportMessage { order_id: 7, ..sample_report() });
+        track_order_id(
+            &mut last_seen,
+            &ExecutionReportMessage {
+                order_id: 1,
+                ..sample_report()
+            },
+        );
+        track_order_id(
+            &mut last_seen,
+            &ExecutionReportMessage {
+                order_id: u64::MAX,
+                ..sample_report()
+            },
+        );
+        track_order_id(
+            &mut last_seen,
+            &ExecutionReportMessage {
+                order_id: 7,
+                ..sample_report()
+            },
+        );
         assert_eq!(last_seen, 7);
     }
 }

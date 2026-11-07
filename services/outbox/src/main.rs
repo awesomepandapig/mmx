@@ -1,6 +1,6 @@
 mod tape;
 
-use outbox::delivery::{Deliverer, DeliveryConfig};
+use outbox::delivery::{self, Deliverer, DeliveryConfig};
 use outbox::outbox::{Error, Outbox, SyncConfig};
 use outbox::status::{self, WebhookStatus};
 use outbox::webhook;
@@ -12,11 +12,38 @@ use std::thread;
 use std::time::Duration;
 
 fn required(name: &str) -> String {
-    std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
+    std::env::var(name).unwrap_or_else(|_| {
+        eprintln!("{name} is required and must contain valid Unicode");
+        exit(1)
+    })
+}
+
+fn parse_optional<T: std::str::FromStr>(
+    name: &str,
+    value: Option<&str>,
+    default: T,
+) -> Result<T, String> {
+    match value {
+        None => Ok(default),
+        Some(value) => value
+            .parse()
+            .map_err(|_| format!("{name} has an invalid value")),
+    }
 }
 
 fn optional<T: std::str::FromStr>(name: &str, default: T) -> T {
-    std::env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
+    let value = match std::env::var(name) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => {
+            eprintln!("{name} must contain valid Unicode");
+            exit(1);
+        }
+    };
+    parse_optional(name, value.as_deref(), default).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        exit(1)
+    })
 }
 
 fn setting(name: &str) -> Option<String> {
@@ -24,10 +51,19 @@ fn setting(name: &str) -> Option<String> {
 }
 
 fn serve_status(dir: PathBuf, outbox: &Outbox, webhook: WebhookStatus) {
-    let listener = TcpListener::bind(std::env::var("OUTBOX_HTTP").unwrap_or_else(|_| "0.0.0.0:8092".to_string()))
-        .expect("failed to bind the status address");
+    let listener = TcpListener::bind(optional("OUTBOX_HTTP", "0.0.0.0:8092".to_string()))
+        .unwrap_or_else(|error| {
+            eprintln!("cannot bind the status address: {error}");
+            exit(1)
+        });
     let shared = outbox.shared();
-    thread::spawn(move || status::serve(&listener, dir, shared, webhook));
+    if let Err(error) = thread::Builder::new()
+        .name("outbox-status".into())
+        .spawn(move || status::serve(&listener, dir, shared, webhook))
+    {
+        eprintln!("cannot start the status server: {error}");
+        exit(1);
+    }
 }
 
 fn main() {
@@ -46,17 +82,25 @@ fn main() {
         }
     };
     let shared = outbox.shared();
-    eprintln!("outbox open at {}, tracking {} open orders", outbox.position(), outbox.open_orders());
+    eprintln!(
+        "outbox open at {}, tracking {} open orders",
+        outbox.position(),
+        outbox.open_orders()
+    );
 
     // A fresh install has no webhook yet, and crash-looping until it does says nothing useful. The
     // tape keeps everything, so a restart with settings starts from where this journal stands.
     let (Some(url), Some(secret)) = (setting("WEBHOOK_URL"), setting("WEBHOOK_SECRET")) else {
         eprintln!("no webhook is configured, so waiting for a restart with one");
-        serve_status(dir, &outbox, WebhookStatus {
-            configured: false,
-            webhook_url: setting("WEBHOOK_URL"),
-            config_id: None,
-        });
+        serve_status(
+            dir,
+            &outbox,
+            WebhookStatus {
+                configured: false,
+                webhook_url: setting("WEBHOOK_URL"),
+                config_id: None,
+            },
+        );
         while !shared.is_stopping() {
             thread::sleep(Duration::from_secs(1));
         }
@@ -78,12 +122,25 @@ fn main() {
             exit(1);
         }
     };
-    thread::spawn(move || {
-        if let Err(error) = deliverer.run() {
-            eprintln!("delivery failed: {error}");
-            exit(1);
-        }
-    });
+    let sender_shared = outbox.shared();
+    if let Err(error) = thread::Builder::new()
+        .name("outbox-delivery".into())
+        .spawn(move || {
+            if let Err(error) = delivery::supervise(|| deliverer.run()) {
+                eprintln!("delivery failed: {error}");
+                exit(1);
+            }
+            if !sender_shared.is_stopping() {
+                eprintln!(
+                    "delivery stopped unexpectedly; refusing to remain healthy without a sender"
+                );
+                exit(1);
+            }
+        })
+    {
+        eprintln!("cannot start delivery: {error}");
+        exit(1);
+    }
 
     serve_status(dir, &outbox, webhook);
 
@@ -98,6 +155,26 @@ fn main() {
         Error::Io(error) => {
             eprintln!("disk failure, exiting: {error}");
             exit(1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_optional;
+
+    #[test]
+    fn invalid_explicit_configuration_does_not_use_the_default() {
+        assert_eq!(
+            parse_optional("WEBHOOK_MAX_EVENTS", None, 100usize),
+            Ok(100)
+        );
+        assert_eq!(
+            parse_optional("WEBHOOK_MAX_EVENTS", Some("7"), 100usize),
+            Ok(7)
+        );
+        for value in ["", " ", "invalid", "-1", "184467440737095516160"] {
+            assert!(parse_optional("WEBHOOK_MAX_EVENTS", Some(value), 100usize).is_err());
         }
     }
 }

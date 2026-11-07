@@ -21,7 +21,7 @@ pub struct Order {
     pub client_order_id: UuidType, // 16 bytes - Client Order ID
     pub account: UuidType,         // 16 bytes - Account ID
     pub transact_time: u64,        // 8 bytes - Time of transaction from client
-    pub symbol: SymbolType, // 6 bytes - Instrument symbol
+    pub symbol: SymbolType,        // 6 bytes - Instrument symbol
 }
 
 impl Order {
@@ -93,9 +93,12 @@ pub fn encode_order(order: &Order, record: &mut [u8; ORDER_RECORD]) {
 }
 
 pub fn decode_order(record: &[u8]) -> Order {
-    let i64_at = |at: usize| i64::from_le_bytes(record[at..at + 8].try_into().expect("eight bytes"));
-    let u64_at = |at: usize| u64::from_le_bytes(record[at..at + 8].try_into().expect("eight bytes"));
-    let u128_at = |at: usize| u128::from_le_bytes(record[at..at + 16].try_into().expect("sixteen bytes"));
+    let i64_at =
+        |at: usize| i64::from_le_bytes(record[at..at + 8].try_into().expect("eight bytes"));
+    let u64_at =
+        |at: usize| u64::from_le_bytes(record[at..at + 8].try_into().expect("eight bytes"));
+    let u128_at =
+        |at: usize| u128::from_le_bytes(record[at..at + 16].try_into().expect("sixteen bytes"));
     let mut order = Order::empty();
     order.price = i64_at(0);
     order.quantity = i64_at(8);

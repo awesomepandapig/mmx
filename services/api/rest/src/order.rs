@@ -5,8 +5,8 @@ use super::validation::ValidOrder;
 use sbe::WriteBuf;
 use sbe::message_header_codec::ENCODED_LENGTH;
 use sbe::new_order_single_codec::{NewOrderSingleEncoder, SBE_BLOCK_LENGTH};
-use sbe::order_cancel_request_codec::{self, OrderCancelRequestEncoder};
 use sbe::ord_type_enum::OrdTypeEnum;
+use sbe::order_cancel_request_codec::{self, OrderCancelRequestEncoder};
 use sbe::side_enum::SideEnum;
 use uuid::Uuid;
 
@@ -76,7 +76,9 @@ impl Order {
     pub fn accepted(order: &ValidOrder, timestamp_ns: u64) -> Self {
         Order {
             id: u64s_to_uuid(order.cl_ord_id).to_string(),
-            product_id: String::from_utf8_lossy(&order.symbol).trim_end_matches('\0').to_string(),
+            product_id: String::from_utf8_lossy(&order.symbol)
+                .trim_end_matches('\0')
+                .to_string(),
             side: side_name(order.side),
             r#type: match order.ord_type {
                 OrdTypeEnum::Limit => "limit".to_string(),
@@ -110,7 +112,12 @@ impl Order {
             product_id: order.symbol,
             side: side_name(order.side),
             // The engine only leaves the price null on market orders.
-            r#type: if order.price_mantissa.is_some() { "limit" } else { "market" }.to_string(),
+            r#type: if order.price_mantissa.is_some() {
+                "limit"
+            } else {
+                "market"
+            }
+            .to_string(),
             created_at: order.created_at,
             updated_at: Some(order.updated_at),
             size: decimal::format(i128::from(order.leaves_mantissa) + i128::from(filled)),
@@ -121,7 +128,9 @@ impl Order {
             )),
             status: status.to_string(),
             settled,
-            price: order.price_mantissa.map(|price| decimal::format(i128::from(price))),
+            price: order
+                .price_mantissa
+                .map(|price| decimal::format(i128::from(price))),
             cancel_after: None,
         }
     }

@@ -42,18 +42,34 @@ const NANOS_PER_MILLI: u64 = 1_000_000;
 pub fn router(state: Arc<AppState>) -> Router {
     // Every route here shares the one layer, so a new one can't forget its auth.
     let admin_routes = Router::new()
+        .route("/api/v1/admin/cluster", get(admin::cluster))
         .route("/api/v1/admin/markets", get(admin::list_markets))
         .route("/api/v1/admin/markets/reload", post(admin::reload_markets))
-        .route("/api/v1/admin/markets/{symbol}/halt", post(admin::halt_market))
-        .route("/api/v1/admin/markets/{symbol}/resume", post(admin::resume_market))
-        .route("/api/v1/admin/markets/{symbol}/cancel-all", post(admin::cancel_market_orders))
-        .route_layer(middleware::from_fn_with_state(state.clone(), admin::require_admin));
+        .route(
+            "/api/v1/admin/markets/{symbol}/halt",
+            post(admin::halt_market),
+        )
+        .route(
+            "/api/v1/admin/markets/{symbol}/resume",
+            post(admin::resume_market),
+        )
+        .route(
+            "/api/v1/admin/markets/{symbol}/cancel-all",
+            post(admin::cancel_market_orders),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            admin::require_admin,
+        ));
 
     Router::new()
         .route("/healthz", get(admin::healthz))
         .route("/readyz", get(admin::readyz))
         .route("/metrics", get(admin::metrics))
-        .route("/api/v1/orders", get(list_orders).post(post_order).delete(cancel_all_orders))
+        .route(
+            "/api/v1/orders",
+            get(list_orders).post(post_order).delete(cancel_all_orders),
+        )
         .route("/api/v1/orders/{id}", get(get_order).delete(cancel_order))
         .merge(admin_routes)
         .with_state(state)
@@ -76,7 +92,12 @@ async fn submit(
     let (published, result) = oneshot::channel();
     state
         .orders
-        .send(OutboundOrder { request, message, send_by, published })
+        .send(OutboundOrder {
+            request,
+            message,
+            send_by,
+            published,
+        })
         .await
         .map_err(|_| AppError::InternalServerError("Order publisher stopped".to_string()))?;
     Ok(result)
@@ -122,9 +143,10 @@ fn check_halt(state: &AppState, order: &ValidOrder) -> Result<(), AppError> {
     let symbol = String::from_utf8_lossy(&order.symbol);
     let symbol = symbol.trim_end_matches('\0');
     state.halts.check(symbol).map_err(|refusal| match refusal {
-        Refusal::Halted => {
-            AppError::MarketHalted { symbol: symbol.to_string(), id: u64s_to_uuid(order.cl_ord_id) }
-        }
+        Refusal::Halted => AppError::MarketHalted {
+            symbol: symbol.to_string(),
+            id: u64s_to_uuid(order.cl_ord_id),
+        },
         Refusal::Unknown => AppError::HaltStateUnknown,
     })
 }
@@ -134,8 +156,13 @@ pub async fn post_order(
     player: Player,
     payload: Result<Json<CreateOrder>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Order>), AppError> {
+    let started = Instant::now();
     let result = place_order(&state, player, payload).await;
     state.metrics.record_order(&result);
+    // A refused order never reached the engine, so it would only flatter the numbers.
+    if result.is_ok() {
+        state.metrics.record_latency(started.elapsed());
+    }
     result
 }
 
@@ -167,14 +194,21 @@ async fn place_order(
         OrderOutcome::Rejected => return Err(AppError::OrderRejected(id)),
         OrderOutcome::TimedOut => return Err(AppError::OrderOutcomeUnknown(id)),
         OrderOutcome::Failed(err) => {
-            return Err(AppError::InternalServerError(format!("Failed to publish order: {err}")));
+            return Err(AppError::InternalServerError(format!(
+                "Failed to publish order: {err}"
+            )));
         }
         other => {
-            return Err(AppError::InternalServerError(format!("Unexpected outcome: {other:?}")));
+            return Err(AppError::InternalServerError(format!(
+                "Unexpected outcome: {other:?}"
+            )));
         }
     }
 
-    Ok((StatusCode::CREATED, Json(Order::accepted(&order, now_ns()?))))
+    Ok((
+        StatusCode::CREATED,
+        Json(Order::accepted(&order, now_ns()?)),
+    ))
 }
 
 #[derive(Serialize, Debug)]
@@ -193,7 +227,10 @@ pub async fn submit_cancel(
     let (orig_cl_ord_id, cancel_id) = (uuid_to_u64s(id), uuid_to_u64s(Uuid::new_v4()));
     let account = player.account();
     let message = create_cancel_buffer(&orig_cl_ord_id, &cancel_id, &account, now_ns()?).to_vec();
-    let request = EngineRequest::Cancel { order: (account, orig_cl_ord_id), cancel_id };
+    let request = EngineRequest::Cancel {
+        order: (account, orig_cl_ord_id),
+        cancel_id,
+    };
     submit(state, request, message, Instant::now() + REQUEST_DEADLINE).await
 }
 
@@ -204,16 +241,26 @@ pub async fn cancel_order(
 ) -> Result<(StatusCode, Json<CancelledOrder>), AppError> {
     let Path(id) = id?;
     match outcome(submit_cancel(&state, player, id).await?).await? {
-        OrderOutcome::Canceled => {
-            Ok((StatusCode::OK, Json(CancelledOrder { id, status: "canceled" })))
-        }
+        OrderOutcome::Canceled => Ok((
+            StatusCode::OK,
+            Json(CancelledOrder {
+                id,
+                status: "canceled",
+            }),
+        )),
         // Without a cluster nothing reads the reports, so this only means it was published.
-        OrderOutcome::Accepted => {
-            Ok((StatusCode::ACCEPTED, Json(CancelledOrder { id, status: "pending" })))
-        }
+        OrderOutcome::Accepted => Ok((
+            StatusCode::ACCEPTED,
+            Json(CancelledOrder {
+                id,
+                status: "pending",
+            }),
+        )),
         OrderOutcome::NotOpen => Err(AppError::OrderNotFound),
         OrderOutcome::TimedOut => Err(AppError::OrderOutcomeUnknown(id)),
-        other => Err(AppError::InternalServerError(format!("Failed to cancel order: {other:?}"))),
+        other => Err(AppError::InternalServerError(format!(
+            "Failed to cancel order: {other:?}"
+        ))),
     }
 }
 
@@ -243,7 +290,11 @@ pub async fn cancel_all_orders(
     params: Result<Query<CancelAllParams>, QueryRejection>,
 ) -> Result<Json<CancelAllResult>, AppError> {
     let Query(params) = params?;
-    let symbol = params.product_id.as_deref().map(normalize_symbol).transpose();
+    let symbol = params
+        .product_id
+        .as_deref()
+        .map(normalize_symbol)
+        .transpose();
     let symbol = symbol.map_err(AppError::ValidationError)?;
 
     if let Some(stream) = &state.report_stream {
@@ -267,7 +318,10 @@ pub async fn cancel_all_orders(
         waiting.push((order.id, submit_cancel(&state, player, order.id).await?));
     }
 
-    let mut result = CancelAllResult { more: orders.len() == MAX_CANCEL_ALL, ..Default::default() };
+    let mut result = CancelAllResult {
+        more: orders.len() == MAX_CANCEL_ALL,
+        ..Default::default()
+    };
     for (id, answer) in waiting {
         match outcome(answer).await? {
             OrderOutcome::Canceled => result.canceled.push(id),
@@ -302,7 +356,11 @@ pub async fn list_orders(
     params: Result<Query<ListParams>, QueryRejection>,
 ) -> Result<Json<Vec<Order>>, AppError> {
     let Query(params) = params?;
-    let symbol = params.product_id.as_deref().map(normalize_symbol).transpose();
+    let symbol = params
+        .product_id
+        .as_deref()
+        .map(normalize_symbol)
+        .transpose();
     let symbol = symbol.map_err(AppError::ValidationError)?;
     let limit = params.limit.unwrap_or(DEFAULT_LIST_LIMIT);
     if limit == 0 || limit > MAX_LIST_LIMIT {
@@ -337,12 +395,23 @@ pub struct MissingOrder {
 impl MissingOrder {
     fn unknown(id: Uuid) -> Self {
         let message = "This order may still land. Keep any funds on hold and ask again.";
-        Self { id, status: "unknown", settled: false, message }
+        Self {
+            id,
+            status: "unknown",
+            settled: false,
+            message,
+        }
     }
 
     fn never_landed(id: Uuid) -> Self {
-        let message = "This order never reached the engine and can't now. Any funds can be released.";
-        Self { id, status: "never_landed", settled: true, message }
+        let message =
+            "This order never reached the engine and can't now. Any funds can be released.";
+        Self {
+            id,
+            status: "never_landed",
+            settled: true,
+            message,
+        }
     }
 }
 
@@ -361,13 +430,26 @@ pub async fn get_order(
 ) -> Result<Json<OrderStatus>, AppError> {
     let Path(id) = id?;
     // The account is part of the query, so another player's order is simply not found.
-    let query = OrderQuery { account: player.0, cl_ord_id: Some(id), limit: 1, ..Default::default() };
-    let found = state.store.orders(&query).await.map(|orders| orders.into_iter().next());
+    let query = OrderQuery {
+        account: player.0,
+        cl_ord_id: Some(id),
+        limit: 1,
+        ..Default::default()
+    };
+    let found = state
+        .store
+        .orders(&query)
+        .await
+        .map(|orders| orders.into_iter().next());
     let found = found.inspect_err(|err| warn!("QuestDB: Failed to read an order: {err}"));
 
     if state.id_rules.is_none() {
-        let order = found.map_err(|_| AppError::RecorderBehind)?.ok_or(AppError::OrderNotFound)?;
-        return Ok(Json(OrderStatus::Recorded(Box::new(Order::recorded(order)))));
+        let order = found
+            .map_err(|_| AppError::RecorderBehind)?
+            .ok_or(AppError::OrderNotFound)?;
+        return Ok(Json(OrderStatus::Recorded(Box::new(Order::recorded(
+            order,
+        )))));
     }
     let status = match found {
         Ok(Some(order)) => OrderStatus::Recorded(Box::new(Order::recorded(order))),
@@ -385,26 +467,40 @@ pub async fn get_order(
 /// used does that with no change to the engine. It's reported like any other, so the game gets a
 /// `cancel_rejected` webhook naming that ID. An ID this old can't land after the marker, so once the
 /// recorder has passed the marker, a second read is the last word.
-async fn prove_absent(state: &AppState, player: Player, id: Uuid, query: &OrderQuery) -> OrderStatus {
+async fn prove_absent(
+    state: &AppState,
+    player: Player,
+    id: Uuid,
+    query: &OrderQuery,
+) -> OrderStatus {
     let unknown = || OrderStatus::Missing(MissingOrder::unknown(id));
     let (Some(rules), Some(stream)) = (&state.id_rules, &state.report_stream) else {
         return unknown();
     };
-    let Some(time_ms) = order_id::time_ms(id) else { return unknown() };
+    let Some(time_ms) = order_id::time_ms(id) else {
+        return unknown();
+    };
     let Ok(now) = now_ns() else { return unknown() };
     let age = Duration::from_millis((now / NANOS_PER_MILLI).saturating_sub(time_ms));
     if age <= rules.settled_after() {
         return unknown();
     }
 
-    let Ok(marker) = submit_cancel(state, player, Uuid::new_v4()).await else { return unknown() };
+    let Ok(marker) = submit_cancel(state, player, Uuid::new_v4()).await else {
+        return unknown();
+    };
     if !matches!(outcome(marker).await, Ok(OrderOutcome::NotOpen)) {
         return unknown();
     }
     if await_recorder(stream, state.store.as_ref()).await.is_err() {
         return unknown();
     }
-    match state.store.orders(query).await.map(|orders| orders.into_iter().next()) {
+    match state
+        .store
+        .orders(query)
+        .await
+        .map(|orders| orders.into_iter().next())
+    {
         Ok(Some(order)) => OrderStatus::Recorded(Box::new(Order::recorded(order))),
         Ok(None) => OrderStatus::Missing(MissingOrder::never_landed(id)),
         Err(err) => {

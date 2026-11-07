@@ -90,7 +90,9 @@ pub fn output_start(position: i64, tape_stop: Option<i64>) -> Result<(i64, u64),
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RebuildPlan {
-    Apply { from: i64 },
+    Apply {
+        from: i64,
+    },
     /// The command doesn't fit this state. Every node reaches the same answer, so it changes
     /// nothing. Ignoring it also matters on replay: exiting would turn a typo in the log into a
     /// crash loop.
@@ -113,7 +115,9 @@ pub fn plan_rebuild(request: &RebuildRequest) -> RebuildPlan {
     let (from, current) = request.quiet;
     let (expected, target) = (request.expected, request.target);
     if expected < from || expected > current {
-        return RebuildPlan::Ignore(format!("expected {expected}, but the engine is at {from}..{current}"));
+        return RebuildPlan::Ignore(format!(
+            "expected {expected}, but the engine is at {from}..{current}"
+        ));
     }
     if target <= current {
         return RebuildPlan::Ignore(format!("the engine is already at {current}, past {target}"));
@@ -122,7 +126,9 @@ pub fn plan_rebuild(request: &RebuildRequest) -> RebuildPlan {
         return RebuildPlan::Ignore(format!("{target} is before the durable position {durable}"));
     }
     if !request.held {
-        return RebuildPlan::Refuse("output is open, so restart with DURABLE_POSITION set".to_string());
+        return RebuildPlan::Refuse(
+            "output is open, so restart with DURABLE_POSITION set".to_string(),
+        );
     }
     match request.tape {
         None => RebuildPlan::Refuse("this node has no tape".to_string()),
@@ -186,16 +192,21 @@ impl TapeFold {
     }
 
     pub fn apply(&mut self, message: &[u8]) -> Result<(), String> {
-        let header: MessageHeaderDecoder<ReadBuf<'_>> = MessageHeaderDecoder::default().wrap(ReadBuf::new(message), 0);
+        let header: MessageHeaderDecoder<ReadBuf<'_>> =
+            MessageHeaderDecoder::default().wrap(ReadBuf::new(message), 0);
         match header.template_id() {
-            REPORT_TEMPLATE => self.apply_report(ExecutionReportDecoder::default().header(header, 0)),
+            REPORT_TEMPLATE => {
+                self.apply_report(ExecutionReportDecoder::default().header(header, 0))
+            }
             CANCEL_REJECT_TEMPLATE => {
                 self.finish_tail()?;
                 self.exec_id += 1; // Cancel rejects spend an exec ID but don't carry it.
                 Ok(())
             }
             // Markers sit between inbound messages and change nothing.
-            publisher::TERM_MARKER_TEMPLATE | publisher::RECOVERY_MARKER_TEMPLATE => self.finish_tail(),
+            publisher::TERM_MARKER_TEMPLATE | publisher::RECOVERY_MARKER_TEMPLATE => {
+                self.finish_tail()
+            }
             template => Err(format!("the tape holds an unknown template {template}")),
         }
     }
@@ -212,7 +223,9 @@ impl TapeFold {
 
     fn apply_report(&mut self, report: ExecutionReportDecoder<'_>) -> Result<(), String> {
         let order_id = report.order_id();
-        let is_tail = self.tail.is_some_and(|order| order.sequence_number == order_id);
+        let is_tail = self
+            .tail
+            .is_some_and(|order| order.sequence_number == order_id);
         self.exec_id = report.exec_id();
         self.transact_time = report.transact_time_decoder().time();
 
@@ -231,20 +244,30 @@ impl TapeFold {
             }
             ExecTypeEnum::Canceled => {
                 self.finish_tail()?;
-                self.live.remove(&order_id).ok_or_else(|| format!("order {order_id} was canceled but isn't open"))?;
+                self.live
+                    .remove(&order_id)
+                    .ok_or_else(|| format!("order {order_id} was canceled but isn't open"))?;
             }
             ExecTypeEnum::Rejected => {
                 self.finish_tail()?;
                 self.order_id = self.order_id.max(order_id); // Rejected orders still spend an ID.
             }
-            ExecTypeEnum::NullVal => return Err("the tape holds a report with no exec type".to_string()),
+            ExecTypeEnum::NullVal => {
+                return Err("the tape holds a report with no exec type".to_string());
+            }
         }
         Ok(())
     }
 
-    fn apply_trade(&mut self, report: ExecutionReportDecoder<'_>, is_tail: bool) -> Result<(), String> {
+    fn apply_trade(
+        &mut self,
+        report: ExecutionReportDecoder<'_>,
+        is_tail: bool,
+    ) -> Result<(), String> {
         let order_id = report.order_id();
-        let match_id = report.trd_match_id().ok_or("the tape holds a trade with no match ID")?;
+        let match_id = report
+            .trd_match_id()
+            .ok_or("the tape holds a trade with no match ID")?;
         let quantity = report.last_qty_decoder().mantissa();
         let price = report.last_px_decoder().mantissa();
         self.match_id = match_id;
@@ -253,7 +276,11 @@ impl TapeFold {
             if self.half_trade.is_some() {
                 return Err("the tape is missing the resting side of a trade".to_string());
             }
-            self.half_trade = Some(HalfTrade { match_id, quantity, price });
+            self.half_trade = Some(HalfTrade {
+                match_id,
+                quantity,
+                price,
+            });
             if let Some(order) = &mut self.tail {
                 order.fill(quantity, price);
             }
@@ -261,7 +288,10 @@ impl TapeFold {
         }
 
         self.half_trade = None;
-        let order = self.live.get_mut(&order_id).ok_or_else(|| format!("order {order_id} traded but isn't open"))?;
+        let order = self
+            .live
+            .get_mut(&order_id)
+            .ok_or_else(|| format!("order {order_id} traded but isn't open"))?;
         order.fill(quantity, price);
         if order.leaves_quantity == 0 {
             self.live.remove(&order_id);
@@ -288,7 +318,13 @@ impl TapeFold {
             return Ok(());
         };
         if let Some(trade) = self.half_trade {
-            handler.settle_resting_side(order.side, &order.symbol, trade.match_id, trade.quantity, trade.price)?;
+            handler.settle_resting_side(
+                order.side,
+                &order.symbol,
+                trade.match_id,
+                trade.quantity,
+                trade.price,
+            )?;
         }
         if order.leaves_quantity > 0 {
             handler.resume(&mut order);
@@ -312,7 +348,11 @@ fn new_order(report: ExecutionReportDecoder<'_>) -> Order {
     order.price = price;
     order.sequence_number = report.order_id();
     // Only limit orders carry a price on the tape.
-    order.r#type = if price == i64::MIN { OrdTypeEnum::Market } else { OrdTypeEnum::Limit };
+    order.r#type = if price == i64::MIN {
+        OrdTypeEnum::Market
+    } else {
+        OrdTypeEnum::Limit
+    };
     order
 }
 
@@ -323,7 +363,10 @@ mod tests {
     const DURABLE: i64 = 1_000;
 
     fn config(durable: Option<i64>) -> RecoveryConfig {
-        RecoveryConfig { durable, rebuild: false }
+        RecoveryConfig {
+            durable,
+            rebuild: false,
+        }
     }
 
     #[test]
@@ -385,7 +428,10 @@ mod tests {
             quiet: (768, 960),
             durable: Some(1_920),
             held: true,
-            tape: Some(TapeExtent { start: 0, stop: 1_920 }),
+            tape: Some(TapeExtent {
+                start: 0,
+                stop: 1_920,
+            }),
         }
     }
 
@@ -396,31 +442,47 @@ mod tests {
 
     #[test]
     fn term_markers_during_the_hold_do_not_invalidate_the_command() {
-        let moved = RebuildRequest { quiet: (768, 1_152), ..request() };
+        let moved = RebuildRequest {
+            quiet: (768, 1_152),
+            ..request()
+        };
         assert_eq!(plan_rebuild(&moved), RebuildPlan::Apply { from: 768 });
     }
 
     #[test]
     fn a_stale_command_changes_nothing() {
-        let stale = RebuildRequest { expected: 192, ..request() };
+        let stale = RebuildRequest {
+            expected: 192,
+            ..request()
+        };
         assert!(matches!(plan_rebuild(&stale), RebuildPlan::Ignore(_)));
     }
 
     #[test]
     fn a_repeated_command_changes_nothing() {
-        let repeated = RebuildRequest { quiet: (1_920, 1_920), expected: 1_920, ..request() };
+        let repeated = RebuildRequest {
+            quiet: (1_920, 1_920),
+            expected: 1_920,
+            ..request()
+        };
         assert!(matches!(plan_rebuild(&repeated), RebuildPlan::Ignore(_)));
     }
 
     #[test]
     fn a_rebuild_cannot_stop_short_of_the_durable_position() {
-        let short = RebuildRequest { target: 1_728, ..request() };
+        let short = RebuildRequest {
+            target: 1_728,
+            ..request()
+        };
         assert!(matches!(plan_rebuild(&short), RebuildPlan::Ignore(_)));
     }
 
     #[test]
     fn a_node_with_open_output_cannot_rebuild() {
-        let open = RebuildRequest { held: false, ..request() };
+        let open = RebuildRequest {
+            held: false,
+            ..request()
+        };
         assert!(matches!(plan_rebuild(&open), RebuildPlan::Refuse(_)));
     }
 
@@ -428,10 +490,19 @@ mod tests {
     fn a_node_needs_every_byte_it_would_read() {
         for tape in [
             None,
-            Some(TapeExtent { start: 960, stop: 1_920 }),
-            Some(TapeExtent { start: 0, stop: 1_728 }),
+            Some(TapeExtent {
+                start: 960,
+                stop: 1_920,
+            }),
+            Some(TapeExtent {
+                start: 0,
+                stop: 1_728,
+            }),
         ] {
-            assert!(matches!(plan_rebuild(&RebuildRequest { tape, ..request() }), RebuildPlan::Refuse(_)));
+            assert!(matches!(
+                plan_rebuild(&RebuildRequest { tape, ..request() }),
+                RebuildPlan::Refuse(_)
+            ));
         }
     }
 }

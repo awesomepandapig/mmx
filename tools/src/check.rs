@@ -88,7 +88,12 @@ impl Checker {
     fn violation(&mut self, rule: &'static str, exec_id: u64, order_id: u64, detail: String) {
         self.violation_count += 1;
         if self.violations.len() < MAX_STORED_VIOLATIONS {
-            self.violations.push(Violation { rule, exec_id, order_id, detail });
+            self.violations.push(Violation {
+                rule,
+                exec_id,
+                order_id,
+                detail,
+            });
         }
     }
 
@@ -135,7 +140,11 @@ impl Checker {
     fn check_exec_id(&mut self, report: &Execution) {
         let expected = self.last_exec_id + 1;
         if report.exec_id != expected {
-            let hint = if self.started { "" } else { " (started after the engine?)" };
+            let hint = if self.started {
+                ""
+            } else {
+                " (started after the engine?)"
+            };
             self.violation(
                 "exec_id_sequence",
                 report.exec_id,
@@ -173,12 +182,18 @@ impl Checker {
         }
 
         if let Some(aggressor) = self.aggressor.take() {
-            let symbol = self.orders.get(&aggressor).map(|order| order.symbol.clone());
+            let symbol = self
+                .orders
+                .get(&aggressor)
+                .map(|order| order.symbol.clone());
             let resting = self.orders.get(&aggressor).and_then(|order| {
                 let rests = !order.finished && order.leaves_qty > 0;
                 rests.then_some((order.side, order.price))
             });
-            let book = self.books.entry(symbol.clone().unwrap_or_default()).or_default();
+            let book = self
+                .books
+                .entry(symbol.clone().unwrap_or_default())
+                .or_default();
             match resting {
                 Some((Side::Buy, Some(price))) => {
                     book.bids.entry(price).or_default().push_back(aggressor);
@@ -349,10 +364,20 @@ impl Checker {
 
         let (exec_id, order_id) = (report.exec_id, report.order_id);
         if finished_already {
-            self.violation("no_activity_after_finish", exec_id, order_id, "traded".to_string());
+            self.violation(
+                "no_activity_after_finish",
+                exec_id,
+                order_id,
+                "traded".to_string(),
+            );
         }
         if last_qty <= 0 {
-            self.violation("positive_quantity", exec_id, order_id, format!("last_qty {last_qty}"));
+            self.violation(
+                "positive_quantity",
+                exec_id,
+                order_id,
+                format!("last_qty {last_qty}"),
+            );
         }
         if report.leaves_qty != expected_leaves
             || report.cum_qty != expected_cum
@@ -370,7 +395,12 @@ impl Checker {
             );
         }
         if !limit_ok {
-            self.violation("limit_respected", exec_id, order_id, format!("traded at {last_px}"));
+            self.violation(
+                "limit_respected",
+                exec_id,
+                order_id,
+                format!("traded at {last_px}"),
+            );
         }
         if !status_ok {
             self.violation(
@@ -442,9 +472,18 @@ impl Checker {
 
         let Some(price) = resting.price else { return };
         let book = self.books.entry(symbol).or_default();
-        let levels = if resting.side == Side::Buy { &mut book.bids } else { &mut book.asks };
+        let levels = if resting.side == Side::Buy {
+            &mut book.bids
+        } else {
+            &mut book.asks
+        };
         let Some(queue) = levels.get_mut(&price) else {
-            self.violation("order_in_book", exec_id, order_id, format!("no level at {price}"));
+            self.violation(
+                "order_in_book",
+                exec_id,
+                order_id,
+                format!("no level at {price}"),
+            );
             return;
         };
 
@@ -456,7 +495,12 @@ impl Checker {
             levels.remove(&price);
         }
         if front != Some(order_id) {
-            self.violation("time_priority", exec_id, order_id, format!("front was {front:?}"));
+            self.violation(
+                "time_priority",
+                exec_id,
+                order_id,
+                format!("front was {front:?}"),
+            );
         }
     }
 
@@ -494,7 +538,11 @@ impl Checker {
             self.aggressor = None;
         } else if let Some(price) = price {
             let book = self.books.entry(symbol).or_default();
-            let levels = if side == Side::Buy { &mut book.bids } else { &mut book.asks };
+            let levels = if side == Side::Buy {
+                &mut book.bids
+            } else {
+                &mut book.asks
+            };
             if let Some(queue) = levels.get_mut(&price) {
                 queue.retain(|id| *id != report.order_id);
                 if queue.is_empty() {
@@ -580,9 +628,8 @@ impl Checker {
         let Some(book) = self.books.get(symbol) else {
             return Vec::new();
         };
-        let row = |(price, queue): (&i64, &VecDeque<u64>)| {
-            (*price, self.level_qty(queue), queue.len())
-        };
+        let row =
+            |(price, queue): (&i64, &VecDeque<u64>)| (*price, self.level_qty(queue), queue.len());
         match side {
             Side::Buy => book.bids.iter().rev().take(depth).map(row).collect(),
             _ => book.asks.iter().take(depth).map(row).collect(),
@@ -596,7 +643,13 @@ mod tests {
 
     const Q: i64 = crate::event::SCALE;
 
-    fn report(exec_id: u64, order_id: u64, exec_type: ExecType, side: Side, price: Option<i64>) -> Execution {
+    fn report(
+        exec_id: u64,
+        order_id: u64,
+        exec_type: ExecType,
+        side: Side,
+        price: Option<i64>,
+    ) -> Execution {
         Execution {
             exec_id,
             order_id,
@@ -621,14 +674,27 @@ mod tests {
         Event::Execution(report(exec_id, order_id, ExecType::New, side, Some(price)))
     }
 
-    fn fill(exec_id: u64, order_id: u64, side: Side, price: i64, qty: i64, cum: i64, px: i64, match_id: u64) -> Event {
+    fn fill(
+        exec_id: u64,
+        order_id: u64,
+        side: Side,
+        price: i64,
+        qty: i64,
+        cum: i64,
+        px: i64,
+        match_id: u64,
+    ) -> Event {
         let mut r = report(exec_id, order_id, ExecType::Trade, side, Some(price));
         r.last_qty = Some(qty * Q);
         r.last_px = Some(px);
         r.match_id = Some(match_id);
         r.cum_qty = cum * Q;
         r.leaves_qty = (10 - cum) * Q;
-        r.ord_status = if cum == 10 { OrdStatus::Filled } else { OrdStatus::PartiallyFilled };
+        r.ord_status = if cum == 10 {
+            OrdStatus::Filled
+        } else {
+            OrdStatus::PartiallyFilled
+        };
         Event::Execution(r)
     }
 
@@ -670,7 +736,10 @@ mod tests {
         let checker = run(&partial_cross());
         assert!(checker.is_clean(), "{:?}", checker.violations);
         assert_eq!(checker.stats.trades, 1);
-        assert_eq!(checker.top_of_book("JSP", Side::Buy, 1), vec![(100, i128::from(6 * Q), 1)]);
+        assert_eq!(
+            checker.top_of_book("JSP", Side::Buy, 1),
+            vec![(100, i128::from(6 * Q), 1)]
+        );
         assert!(checker.top_of_book("JSP", Side::Sell, 1).is_empty());
     }
 
@@ -688,7 +757,10 @@ mod tests {
 
     #[test]
     fn cancel_rejects_spend_an_exec_id_but_no_order_id() {
-        let reject = Event::CancelReject { cl_ord_id: "a".into(), orig_cl_ord_id: "b".into() };
+        let reject = Event::CancelReject {
+            cl_ord_id: "a".into(),
+            orig_cl_ord_id: "b".into(),
+        };
         let checker = run(&[new(1, 1, Side::Buy, 100), reject, new(3, 2, Side::Buy, 99)]);
         assert!(checker.is_clean(), "{:?}", checker.violations);
     }
@@ -704,7 +776,10 @@ mod tests {
             new(4, 3, Side::Buy, 99),
         ]);
         assert!(checker.is_clean(), "{:?}", checker.violations);
-        assert_eq!(checker.top_of_book("JSP", Side::Buy, 1), vec![(100, i128::from(10 * Q), 1)]);
+        assert_eq!(
+            checker.top_of_book("JSP", Side::Buy, 1),
+            vec![(100, i128::from(10 * Q), 1)]
+        );
     }
 
     #[test]
@@ -729,7 +804,11 @@ mod tests {
     #[test]
     fn flags_joining_late() {
         let checker = run(&[new(5, 5, Side::Buy, 100)]);
-        assert!(checker.violations[0].detail.contains("started after the engine"));
+        assert!(
+            checker.violations[0]
+                .detail
+                .contains("started after the engine")
+        );
     }
 
     #[test]
@@ -740,8 +819,15 @@ mod tests {
 
     #[test]
     fn flags_a_crossed_book() {
-        let checker = run(&[new(1, 1, Side::Buy, 100), new(2, 2, Side::Sell, 90), new(3, 3, Side::Buy, 1)]);
-        assert_eq!(rules(&checker), ["book_uncrossed", "book_uncrossed"].to_vec());
+        let checker = run(&[
+            new(1, 1, Side::Buy, 100),
+            new(2, 2, Side::Sell, 90),
+            new(3, 3, Side::Buy, 1),
+        ]);
+        assert_eq!(
+            rules(&checker),
+            ["book_uncrossed", "book_uncrossed"].to_vec()
+        );
     }
 
     #[test]

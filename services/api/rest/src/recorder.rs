@@ -22,7 +22,9 @@ pub struct ReportStream {
 
 impl Default for ReportStream {
     fn default() -> Self {
-        Self { position: AtomicI64::new(UNKNOWN_POSITION) }
+        Self {
+            position: AtomicI64::new(UNKNOWN_POSITION),
+        }
     }
 }
 

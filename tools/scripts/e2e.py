@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Follow real trades through a running cluster, from the REST API to a game webhook.
 
-    tools/scripts/sbx.py up --cluster
-    tools/scripts/sbx.py e2e
-    tools/scripts/sbx.py e2e --kill 0     kill this node instead of the leader
+    tools/scripts/mmx.py up --cluster
+    tools/scripts/mmx.py e2e
+    tools/scripts/mmx.py e2e --kill 0     kill this node instead of the leader
 
 It stands in for the game: it receives and verifies webhooks, places orders over REST, and watches
 NATS and the websocket. It checks that a repeated POST places nothing, including across two
@@ -32,11 +32,11 @@ import urllib.error
 import urllib.request
 import uuid
 
-import sbx
+import mmx
 
 GATEWAY = "http://127.0.0.1:8000"
 SECOND_GATEWAY = "http://127.0.0.1:8001"
-SECOND_GATEWAY_LOG = sbx.RUN / "api-second.log"
+SECOND_GATEWAY_LOG = mmx.RUN / "api-second.log"
 SECOND_GATEWAY_RESPONSES = "aeron:udp?endpoint=localhost:20302"
 SYMBOL = "ITEM"
 PRICE = "100"
@@ -55,7 +55,7 @@ RACERS = 6
 ORDER_ID_WINDOW = 60
 SETTLED_AFTER = 98
 FILL_ID = re.compile(r"^[0-9a-f]{32}$")
-JAR = os.environ.get("AERON_JAR", str(sbx.RUN / "aeron-all-1.54.0.jar"))
+JAR = os.environ.get("AERON_JAR", str(mmx.RUN / "aeron-all-1.54.0.jar"))
 retries = collections.Counter()
 
 
@@ -343,10 +343,10 @@ class SecondGateway:
         self.process = None
 
     def start(self):
-        settings = next(extra for name, _, extra, _ in sbx.cluster_services() if name == "api")
-        env = {**sbx.base_env(), **settings, "BIND_ADDR": SECOND_GATEWAY.rsplit("/", 1)[1],
+        settings = next(extra for name, _, extra, _ in mmx.cluster_services() if name == "api")
+        env = {**mmx.base_env(), **settings, "BIND_ADDR": SECOND_GATEWAY.rsplit("/", 1)[1],
                "CLUSTER_RESPONSE_CHANNEL": SECOND_GATEWAY_RESPONSES}
-        self.process = subprocess.Popen([str(sbx.BIN / "api")], env=env, cwd=sbx.ROOT,
+        self.process = subprocess.Popen([str(mmx.BIN / "api")], env=env, cwd=mmx.ROOT,
                                         stdout=SECOND_GATEWAY_LOG.open("w"),
                                         stderr=subprocess.STDOUT)
         wait_for(lambda: readiness(SECOND_GATEWAY), QUERY_WAIT, "the second gateway to start")
@@ -461,7 +461,7 @@ def check_order_ids():
 
 
 def run_valkey(*args):
-    runtime = sbx.container_runtime()
+    runtime = mmx.container_runtime()
     subprocess.run([runtime, *args], check=True, capture_output=True, timeout=60)
 
 
@@ -474,7 +474,7 @@ def check_valkey_stopped():
     resting_id, status, reply = place(MAKER, "sell", "1")
     require(status == 201, f"the resting order answered {status}: {reply}")
 
-    run_valkey("stop", "sbx-valkey")
+    run_valkey("stop", "mmx-valkey")
     try:
         order = order_body("buy", "1")
         wait_for(lambda: not claims_ready(), QUERY_WAIT, "/readyz to report the claim store")
@@ -492,7 +492,7 @@ def check_valkey_stopped():
                 f"a cancel with Valkey down answered {status}: {reply}")
         passed("a cancel still worked")
     finally:
-        run_valkey("start", "sbx-valkey")
+        run_valkey("start", "mmx-valkey")
 
     # What Valkey kept depends on how it stopped, so either way this waits for a safe state.
     wait_for_claims()
@@ -509,7 +509,7 @@ def check_valkey_emptied(second):
     claimed["client_order_id"], status, reply = place(MAKER, "sell", "1")
     require(status == 201, f"the order answered {status}: {reply}")
 
-    run_valkey("exec", "sbx-valkey", "valkey-cli", "FLUSHALL")
+    run_valkey("exec", "mmx-valkey", "valkey-cli", "FLUSHALL")
     emptied_at = time.time()
     # A replay of the lost claim, at once, before any poll could have noticed.
     status, reply = call("POST", "/orders", MAKER, claimed)
@@ -619,7 +619,7 @@ def settle(order_id, player):
 def check_failover(game, nats, websocket, target):
     print("Failover", flush=True)
     start_position = max([event["tape_position"] for event in game.seen()], default=0)
-    leader = sbx.cluster_leader()
+    leader = mmx.cluster_leader()
     require(leader is not None, "the cluster has no leader")
     killed = leader if target is None else target
 
@@ -627,7 +627,7 @@ def check_failover(game, nats, websocket, target):
     stream = threading.Thread(target=stream_orders, args=(orders, slowest), daemon=True)
     stream.start()
     wait_for(lambda: len(orders) >= KILL_AFTER_PAIRS * 2, QUERY_WAIT, "orders to start flowing")
-    sbx.cluster_script("kill", str(killed))
+    mmx.cluster_script("kill", str(killed))
     killed_at = time.time()
     role = "leader" if killed == leader else "follower"
     passed(f"killed {role} node {killed} after {len(orders)} orders")
@@ -636,7 +636,7 @@ def check_failover(game, nats, websocket, target):
         stream.join(FAILOVER_WAIT * 2)
         require(not stream.is_alive(), f"orders stalled after the kill, {len(orders)} answered")
         passed(f"{len(orders)} orders answered, slowest took {max(slowest):.2f}s, new leader is "
-               f"node {sbx.cluster_leader()}")
+               f"node {mmx.cluster_leader()}")
 
         order_id, status, reply = place(MAKER, "sell", "1")
         require(status == 201, f"a new order after the failover answered {status}: {reply}")
@@ -692,7 +692,7 @@ def check_exactly_once(game, orders, start_position):
 
 
 def outbox_position():
-    address = sbx.outbox_settings()["OUTBOX_HTTP"]
+    address = mmx.outbox_settings()["OUTBOX_HTTP"]
     with urllib.request.urlopen(f"http://{address}/position", timeout=5) as response:
         return json.loads(response.read())
 
@@ -704,44 +704,44 @@ def outbox_settled():
 
 def member_positions():
     """Each node's log position as the leader sees it."""
-    leader = sbx.cluster_leader()
+    leader = mmx.cluster_leader()
     if leader is None:
         return {}
     result = subprocess.run(
         ["java", "--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
          f"-Daeron.dir=/Volumes/DevShm/cluster-{leader}", "-cp", JAR,
-         "io.aeron.cluster.ClusterTool", str(sbx.CLUSTER_RUN / str(leader) / "cluster"),
+         "io.aeron.cluster.ClusterTool", str(mmx.CLUSTER_RUN / str(leader) / "cluster"),
          "list-members"], capture_output=True, text=True)
     members = re.findall(r"ClusterMember\{id=(\d+).*?logPosition=(-?\d+)", result.stdout)
     return {int(node): int(position) for node, position in members}
 
 
 def restart_node(node, killed_at):
-    time.sleep(max(0.0, killed_at + sbx.NODE_RESTART_DELAY - time.time()))
-    sbx.cluster_script("start", str(node))
+    time.sleep(max(0.0, killed_at + mmx.NODE_RESTART_DELAY - time.time()))
+    mmx.cluster_script("start", str(node))
 
     def caught_up():
         positions = member_positions()
-        return len(positions) == sbx.CLUSTER_NODES and len(set(positions.values())) == 1 \
+        return len(positions) == mmx.CLUSTER_NODES and len(set(positions.values())) == 1 \
             and positions[node] > 0 and positions
     positions = wait_for(caught_up, REJOIN_WAIT, f"node {node} to catch up with the leader")
     passed(f"node {node} restarted and caught up, log positions {positions}")
 
 
 def preflight():
-    missing = [name for name, *_ in sbx.cluster_services() if sbx.pid_of(name) is None]
-    require(not missing, f"not running: {missing}. Start with `tools/scripts/sbx.py up --cluster`.")
-    down = [node for node in sbx.cluster_script("status").splitlines() if "False" in node]
+    missing = [name for name, *_ in mmx.cluster_services() if mmx.pid_of(name) is None]
+    require(not missing, f"not running: {missing}. Start with `tools/scripts/mmx.py up --cluster`.")
+    down = [node for node in mmx.cluster_script("status").splitlines() if "False" in node]
     require(not down, f"nodes are down: {down}")
 
 
 def run(target):
     preflight()
-    settings = sbx.outbox_settings()
+    settings = mmx.outbox_settings()
     game = Game(settings["WEBHOOK_URL"], settings["WEBHOOK_SECRET"])
     threading.Thread(target=game.serve_forever, daemon=True).start()
     nats = NatsWatch([f"l2.{SYMBOL}", f"ticker.{SYMBOL}", f"candles.{SYMBOL}"])
-    websocket = WebSocketWatch(sbx.WS_ADDR, SYMBOL)
+    websocket = WebSocketWatch(mmx.WS_ADDR, SYMBOL)
     nats.start()
     websocket.start()
 
@@ -775,7 +775,7 @@ def run(target):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--kill", type=int, choices=range(sbx.CLUSTER_NODES),
+    parser.add_argument("--kill", type=int, choices=range(mmx.CLUSTER_NODES),
                         help="the node to kill, by default the leader")
     try:
         run(parser.parse_args().kill)

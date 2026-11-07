@@ -1,8 +1,8 @@
 # Roadmap
 
-MMX is a self-hosted order book for game economies. Release 1 is done when an agent can follow our
-docs alone to install the Helm chart, define a market in `markets.yaml`, connect an OIDC provider and
-add a fill webhook that dedupes on `fill_id`.
+MMX is general self-hosted exchange infrastructure with game-focused defaults and SDKs. Release 1 is
+done when an agent can follow our docs alone to install the Helm chart, define a market in
+`markets.yaml`, connect an OIDC provider and add a fill webhook that dedupes on `fill_id`.
 
 ## How the system fits together
 
@@ -15,25 +15,32 @@ game server -> gateway -> engine (Aeron Cluster) -> tape (Aeron Archive)
 
 These decisions are settled:
 
-- **The engine only matches.** It has no IO, HTTP or validation, trusts everything it receives, and
+- **The engine only matches.** It has no IO, HTTP or business/risk validation. Its protocol boundary
+  validates complete message envelopes before applying effects. It trusts authorized ingress and
   keeps no gateway state. New symbols go live when orders arrive, and trees are never freed.
 - **The tape is the record.** Aeron Archive output is authoritative, byte-identical on every node, and
   kept forever by default. Everything else is a consumer that can lag behind it.
 - **QuestDB is a required query view, not the source of truth.** `GET` orders reads from it, and it's
   rebuilt from the tape if lost. Open-source QuestDB is single-node, and that's fine for this role.
-- **Gateways bounce.** Validation, rate limits and enabled markets live there. Only game servers can
-  reach gateways, enforced by firewall policy.
-- **A POST is a guarantee.** It's held across a failover and answered with the engine's decision. If
-  the gateway can't answer, the outcome is unknown: the caller never retries, keeps the funds on hold
-  and asks any gateway for the order's status. Callers supply `client_order_id`.
+- **Gateways are the authenticated edge.** Public clients are first-class; validation, account/risk
+  authorization, rate limits and enabled markets live at admission. Internal services trust authorized
+  ingress and remain isolated from public access. The current header-only player identity is not the
+  production authentication design.
+- **Retries preserve one operation.** The required contract binds a stable account-scoped operation
+  key to immutable intent. Repeating it cannot create another economic action; changing its payload
+  conflicts. Unknown outcomes keep assets reserved until authoritative reconciliation. The current
+  expiring boolean claims are a partial implementation, not the complete durable retry protocol.
 - **Failover** uses the term marker in the report stream to tell which in-flight orders landed.
 - **Data only flows one way.** Consumers derive state from the tape and never feed it back. Archive is
   the source of truth, and it holds the snapshots.
-- **Nothing reaches the game until it's durable.** Archive sync level 1 is the default, so a commit is
+- **Execution notifications follow durability.** Archive sync level 1 is the default, so a commit is
   on a quorum's disks and a total power loss can't undo what the game has seen. The outbox also syncs
   to disk before sending a webhook. Sync 0 is an opt-in for operators who accept that window.
-- **Escrow lives with the game.** It must always clear for orders that didn't execute, and this must
-  never allow a double spend, even if every node dies at once.
+- **Admission/risk integration is general.** The game-focused default validates at the gateway,
+  durably records admission intent, asks the game ledger to reserve assets, and waits for durable
+  confirmation before submitting to matching. Other providers must establish equivalent configured
+  authority. Pre-admission reservations need durable orchestration beyond the execution tape.
+  Terminal non-execution releases holds only after possible delayed submissions have been fenced.
 - **After a total loss,** trading stops and the book is rebuilt from the tape with no new entries, so
   open orders survive. The admin then reopens entries, or cancels all open orders instead.
 - **Rate limits** are per player in Valkey, with defaults that game owners can override.
@@ -44,7 +51,9 @@ These decisions are settled:
   operator's job. Aeron stays unencrypted for throughput, and the tape isn't sensitive.
 - **Gateways always authenticate.** A JWT is on by default, even when only game servers connect, so an
   accidental exposure can't accept orders. OIDC is an optional flag. Players trading directly, such as
-  from Python, is off by default and needs a validating auth service.
+  from Python, is a production design requirement, enabled with valid authentication/account/risk
+  configuration by default; administrators can disable direct access. Missing required authority must
+  refuse admission, not fall back to trusting a public header.
 - **No default passwords.** Password auth reads a value from the environment or generates a random one
   at startup. Enabling OIDC can turn passwords off entirely.
 - **The console owns markets after install.** `values.yaml` seeds them once. The console reads and writes
@@ -77,7 +86,7 @@ Owns `services/api/rest`.
 - [x] `GET` orders
 - [ ] JWT validation on by default, including game-server-only deployments
 - [ ] Optional OIDC, with token introspection, mapping users to accounts
-- [ ] Optional direct player access, off by default
+- [ ] Direct public player access with validated account/risk authority; administrator can disable it
 - [x] Atomic claim in Valkey with UUIDv7 IDs, so a repeated ID can never execute twice, on any gateway
 
 ### 2. WebSocket (wave 1)
@@ -112,7 +121,7 @@ Owns the new `services/outbox`.
 - [x] Webhooks for fills, cancels and rejects, so the game can always release escrow
 - [x] Dedupe key `fill_id`, retries and backoff, and a signature the game can verify
 - [ ] Replication design, so one disk loss can't block webhooks
-- [ ] Honour `429` and `Retry-After`, so a restarting game can ask for breathing room
+- [x] Honour `429`/`503` and `Retry-After` seconds/date hints with interruptible waits and stable retry event IDs
 - [ ] Pause after repeated failures on one batch and alert the operator, so a batch that crashes the game can't crashloop it
 - [ ] Optional maximum delivery rate
 
@@ -131,7 +140,7 @@ Owns `crates/cluster` and `services/matching-engine`.
 - [x] Report a repeat of a resting order as a duplicate, even on a full book
 - [x] Keep held Archive connections alive and reconnect before a snapshot if one has dropped. Unread pings filled a 64 KB term in about 17 minutes, so every timed snapshot panicked every node
 - [ ] Recovery plan for an order that panics every node, since replay hits the same panic
-- [ ] Reject a message split across frames instead of panicking; only `sbx-cluster-bench --batch` above about 13 sends one
+- [ ] Reject a message split across frames instead of panicking; only `mmx-cluster-bench --batch` above about 13 sends one
 - [ ] Give a full book its own reject reason and an operator alert
 - [ ] Give self-trade cancels their own reason
 - [ ] Clear stale TODOs in `publisher.rs`, `types.rs`, `config.rs` and `handler.rs`
@@ -153,13 +162,16 @@ Owns the new `deploy/`.
 - [x] Per-market cancel-all, across every player
 - [x] `mmx` CLI: status, health, markets and config
 - [x] Console: first-run setup, sessions and OIDC login, and a YAML market editor backed by the Kubernetes API
+- [x] Console: roles from provider groups, recent sign-in for destructive actions, a provider set at install, and no public URL setting
+- [x] Console: market page with a live book and log, search over thousands of markets, and a sampled activity feed
+- [ ] Book snapshots from `market-data`, so opening a market doesn't scan its history on the tape
 - [x] Seed the markets ConfigMap only when it's missing, so `helm upgrade` can't overwrite console edits
 - [x] `mmx` in the chart, with RBAC limited to one ConfigMap and one Secret by name
 - [ ] Console API keys
 
 ### 8. Demo and public face
 
-- [ ] Rename SBX to MMX, and remove game-specific references
+- [ ] Rename MMX to MMX, and remove game-specific references
 - [ ] Retire the `auth` service
 - [ ] Demo trading UI, with credentials from the environment or generated at startup
 - [ ] Finish `OrderDrawer.tsx`: live status, order updates and error handling
@@ -189,7 +201,7 @@ the raw APIs or an SDK.
 - [ ] Remove every `.expect`, `unwrap` and panic on a runtime path outside the matching engine, with an explicit handler for each invariant. Services never panic unless it's truly unrecoverable. The engine may panic on a real safety violation, because stopping is safer than continuing
 - [ ] Consistent logging, traces, config and startup across services
 - [ ] `/healthz`, `/readyz` and `/metrics` on every service: gateway has all three, outbox and `mmx` have health only
-- [x] Local end-to-end check with `sbx.py e2e`: a signed fill webhook through a leader kill
+- [x] Local end-to-end check with `mmx.py e2e`: a signed fill webhook through a leader kill
 - [ ] Fix Aeron's persistent subscription leak: carry the patch, report it upstream, then remove the consumers' client replacement
 - [ ] Investigate the burst drain on the output path
 

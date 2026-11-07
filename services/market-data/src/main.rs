@@ -14,7 +14,9 @@ use tape::feed::{self, Processor};
 use tracing::error;
 
 fn spawn<P: Processor + 'static>() {
-    let started = thread::Builder::new().name(P::NAME.to_string()).spawn(feed::run::<P>);
+    let started = thread::Builder::new()
+        .name(P::NAME.to_string())
+        .spawn(feed::run::<P>);
     if let Err(e) = started {
         error!("Failed to start {}: {}", P::NAME, e);
         process::exit(1);

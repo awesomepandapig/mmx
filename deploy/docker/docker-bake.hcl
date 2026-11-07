@@ -50,8 +50,12 @@ variable "VITE_DOCS_URL" {
   default = null
 }
 
+variable "DOCS_BASE_URL" {
+  default = "https://docs.mmx.exchange"
+}
+
 group "default" {
-  targets = ["core", "observer", "tools", "web", "docs", "auth"]
+  targets = ["core", "observer", "tools", "web", "docs"]
 }
 
 group "core" {
@@ -97,7 +101,7 @@ target "service" {
       { image = "market-data", bin = "market-data" },
       { image = "trade-reporter", bin = "trade-reporter" },
       { image = "outbox", bin = "outbox" },
-      { image = "observer", bin = "sbx-observer" },
+      { image = "observer", bin = "mmx-observer" },
     ]
   }
   target = "service"
@@ -147,9 +151,10 @@ target "web" {
 
 target "docs" {
   inherits = ["_common"]
-  target   = "remix"
+  target   = "docs"
   args = {
     APP          = "docs"
+    DOCS_BASE_URL = DOCS_BASE_URL
     VITE_DOMAIN  = VITE_DOMAIN
     VITE_API_URL = VITE_API_URL
     VITE_WS_URL  = VITE_WS_URL

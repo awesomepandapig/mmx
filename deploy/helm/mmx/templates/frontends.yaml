@@ -10,18 +10,25 @@ metadata:
   name: {{ $name }}
   labels:
     {{- include "mmx.labels" $labels | nindent 4 }}
+  {{- with $websocket.service.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with $websocket.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
   type: {{ $websocket.service.type }}
+  {{- include "mmx.serviceNetworking" $websocket.service | nindent 2 }}
   selector:
     {{- include "mmx.selectorLabels" $labels | nindent 4 }}
   ports:
     - name: ws
       port: {{ $websocket.port }}
       targetPort: ws
+      {{- if and (has $websocket.service.type (list "NodePort" "LoadBalancer")) $websocket.service.nodePort }}
+      nodePort: {{ $websocket.service.nodePort }}
+      {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -83,18 +90,25 @@ metadata:
   name: {{ $name }}
   labels:
     {{- include "mmx.labels" $labels | nindent 4 }}
+  {{- with $ui.service.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with $ui.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
   type: {{ $ui.service.type }}
+  {{- include "mmx.serviceNetworking" $ui.service | nindent 2 }}
   selector:
     {{- include "mmx.selectorLabels" $labels | nindent 4 }}
   ports:
     - name: http
       port: {{ $ui.port }}
       targetPort: http
+      {{- if and (has $ui.service.type (list "NodePort" "LoadBalancer")) $ui.service.nodePort }}
+      nodePort: {{ $ui.service.nodePort }}
+      {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment

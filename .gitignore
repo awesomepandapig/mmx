@@ -1,7 +1,6 @@
 .vscode
 .DS_Store
 
-tests/
 transparent_listener/
 target/
 .run/
@@ -11,3 +10,36 @@ target/
 *.tfstate.backup
 tools/bench/ec2/hosts.json
 __pycache__/
+
+# Deprecated services
+auth/
+
+# Local agent workspaces, worktrees, investigations, and scratch folders
+.claude/
+.local/
+reports/
+research_notes/
+reviews/
+ARCHITECTURE_PRINCIPLES.md
+PRODUCTION_READINESS_PLAN.md
+RESILIENCE_CONTRACT.md
+STATE_MACHINES.md
+WORKTREE_REVIEW.md
+
+# Dependencies and build outputs
+**/node_modules/
+**/build/
+**/dist/
+**/.vocs/
+**/.vite/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+!.env.example
+
+# Vercel project links and build output
+**/.vercel/
+
+# Runtime state for an explicit source Compose deployment
+/deploy/config/

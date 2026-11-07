@@ -129,7 +129,11 @@ impl Handler {
     /// Cancels every resting order, oldest first, so that the reports are the same on every node
     /// however each one's pool is laid out. Returns how many there were.
     pub fn cancel_all(&mut self) -> usize {
-        let mut orders: Vec<_> = self.book.resting().map(|order| (order.sequence_number, order.key())).collect();
+        let mut orders: Vec<_> = self
+            .book
+            .resting()
+            .map(|order| (order.sequence_number, order.key()))
+            .collect();
         orders.sort_unstable_by_key(|(sequence_number, _)| *sequence_number);
         for (_, key) in &orders {
             let order = self.book.remove(*key);
@@ -154,13 +158,18 @@ impl Handler {
         quantity: i64,
         price: i64,
     ) -> Result<(), String> {
-        let resting = if aggressor_side == SideEnum::Buy { self.book.best_ask(symbol) } else { self.book.best_bid(symbol) };
+        let resting = if aggressor_side == SideEnum::Buy {
+            self.book.best_ask(symbol)
+        } else {
+            self.book.best_bid(symbol)
+        };
         let resting = resting.ok_or("the tape traded against an empty book")?;
         resting.fill(quantity, price);
         let order = *resting;
 
         self.counter_exec_id += 1;
-        self.publisher.publish_trade(&order, self.counter_exec_id, match_id, quantity, price);
+        self.publisher
+            .publish_trade(&order, self.counter_exec_id, match_id, quantity, price);
         if order.leaves_quantity == 0 {
             self.book.remove(order.key());
         }
@@ -265,7 +274,9 @@ impl Handler {
     fn handle_limit_order<S: SideSpecificContext>(&mut self, aggressor_order: &mut Order) {
         while aggressor_order.leaves_quantity > 0 {
             // Get the best price level
-            let Some(mut resting_order) = S::get_best_opposite(&mut self.book, &aggressor_order.symbol) else {
+            let Some(mut resting_order) =
+                S::get_best_opposite(&mut self.book, &aggressor_order.symbol)
+            else {
                 break; // No orders on opposite side
             };
 
@@ -321,7 +332,9 @@ impl Handler {
     fn handle_market_order<S: SideSpecificContext>(&mut self, aggressor_order: &mut Order) {
         while aggressor_order.leaves_quantity > 0 {
             // Get the best price level
-            let Some(mut resting_order) = S::get_best_opposite(&mut self.book, &aggressor_order.symbol) else {
+            let Some(mut resting_order) =
+                S::get_best_opposite(&mut self.book, &aggressor_order.symbol)
+            else {
                 // No orders on opposite side
                 self.publish_cancel(aggressor_order);
                 return;

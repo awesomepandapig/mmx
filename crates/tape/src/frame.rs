@@ -60,7 +60,8 @@ mod tests {
 
     fn encoded_report(order_id: u64) -> Vec<u8> {
         let mut bytes = vec![0u8; 256];
-        let encoder = ExecutionReportEncoder::default().wrap(WriteBuf::new(&mut bytes), ENCODED_LENGTH);
+        let encoder =
+            ExecutionReportEncoder::default().wrap(WriteBuf::new(&mut bytes), ENCODED_LENGTH);
         let mut encoder = encoder.header(0).parent().expect("header fits");
         encoder.order_id(order_id);
         encoder.exec_type(ExecTypeEnum::Trade);

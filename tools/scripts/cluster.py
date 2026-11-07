@@ -8,13 +8,18 @@ import os, shutil, signal, subprocess, sys, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-RUN = ROOT / ".run" / "cluster"
-JAR = Path(os.environ.get("AERON_JAR", ROOT / ".run" / "aeron-all-1.54.0.jar"))
-ENGINE = Path(os.environ.get("ENGINE", ROOT / "target" / "dist" / "matching-engine"))
-SHM = Path("/Volumes/DevShm")
+RUN = Path(os.environ.get("MMX_RUN_DIR", ROOT / ".run")) / "cluster"
+JAR = Path(os.environ.get("AERON_JAR", Path(os.environ.get("MMX_RUN_DIR", ROOT / ".run")) / "aeron-all-1.54.0.jar"))
+ENGINE = Path(os.environ.get("ENGINE", ROOT / "target" / "release" / "matching-engine"))
+SHM = Path(os.environ.get("MMX_SHM_DIR", "/Volumes/DevShm" if sys.platform == "darwin" else "/dev/shm/mmx"))
+PORT_OFFSET = int(os.environ.get("MMX_PORT_OFFSET", "0"))
+
+def port(value):
+    return value + PORT_OFFSET
+
 NODES = 3
 MEMBERS = "|".join(
-    f"{i},localhost:{20000+i},localhost:{20010+i},localhost:{20020+i},localhost:{20030+i},localhost:{8010+i}"
+    f"{i},localhost:{port(20000)+i},localhost:{port(20010)+i},localhost:{port(20020)+i},localhost:{port(20030)+i},localhost:{port(8010)+i}"
     for i in range(NODES))
 HEARTBEAT = os.environ.get("LEADER_HEARTBEAT_TIMEOUT", "1s")
 
@@ -28,17 +33,19 @@ aeron.threading.mode={os.environ.get("THREADING", "SHARED")}
 aeron.term.buffer.sparse.file=true
 aeron.spies.simulate.connection=true
 aeron.archive.dir={RUN}/{i}/archive
-aeron.archive.control.channel=aeron:udp?endpoint=localhost:{8010+i}
+aeron.archive.control.channel=aeron:udp?endpoint=localhost:{port(8010)+i}
 aeron.archive.control.response.channel=aeron:udp?endpoint=localhost:0
 aeron.archive.replication.channel=aeron:udp?endpoint=localhost:0
 aeron.archive.threading.mode=SHARED
 aeron.archive.recording.events.enabled=false
+aeron.archive.file.sync.level={os.environ.get("SYNC", "1")}
+aeron.archive.catalog.file.sync.level={os.environ.get("SYNC", "1")}
 aeron.cluster.dir={RUN}/{i}/cluster
 aeron.cluster.id=0
 aeron.cluster.member.id={i}
 aeron.cluster.members={MEMBERS}
 aeron.cluster.ingress.channel=aeron:udp
-aeron.cluster.log.channel=aeron:udp?term-length={os.environ.get("LOG_TERM_LENGTH", "16m")}|control-mode=manual|control=localhost:{20040+i}
+aeron.cluster.log.channel=aeron:udp?term-length={os.environ.get("LOG_TERM_LENGTH", "16m")}|control-mode=manual|control=localhost:{port(20040)+i}
 aeron.cluster.replication.channel=aeron:udp?endpoint=localhost:0
 aeron.cluster.clock=io.aeron.cluster.NanosecondClusterClock
 aeron.cluster.leader.heartbeat.timeout={HEARTBEAT}
@@ -98,9 +105,9 @@ def start(i):
         sys.exit(f"node {i} exited on startup, see {RUN}/java{i}.log")
     spawn(f"engine{i}", [ENGINE], {
         "CLUSTER_ID": "0", "AERON_DIR": f"{SHM}/cluster-{i}", "MAX_ORDERS": os.environ.get("MAX_ORDERS", "1000000"),
-        "PUB_CHANNEL": f"aeron:udp?control=localhost:{40450+i}|control-mode=dynamic|term-length=64m",
+        "PUB_CHANNEL": f"aeron:udp?control=localhost:{port(40450)+i}|control-mode=dynamic|term-length=64m",
         "PUB_STREAM_ID": "1002", "NODE_ID": str(i), "RUST_BACKTRACE": "1",
-        "ARCHIVE_CONTROL": f"aeron:udp?endpoint=localhost:{8010+i}",
+        "ARCHIVE_CONTROL": f"aeron:udp?endpoint=localhost:{port(8010)+i}",
         "TIMING_FILE": f"{RUN}/timing{i}", "DIGEST_FILE": f"{RUN}/digest{i}", **({} if os.environ.get("NO_DIGEST") else {"DIGEST": "1"})})
 
 
@@ -109,6 +116,17 @@ def down():
         stop(f"engine{i}")
         stop(f"java{i}")
     stop("clientdriver")
+
+
+def driver_command():
+    properties = [f"-Daeron.dir={SHM}/cluster-client",
+                  f"-Daeron.threading.mode={os.environ.get('CLIENT_THREADING', 'SHARED')}",
+                  "-Daeron.dir.delete.on.start=true", *os.environ.get("CLIENT_PROPS", "").split()]
+    native = Path(os.environ.get("AERON_BIN", Path.home() / "Projects/aeron/cppbuild/Release/binaries")) / "aeronmd"
+    if native.exists():
+        return [native, *properties]
+    return ["java", "--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED",
+            *properties, "-cp", JAR, "io.aeron.driver.MediaDriver"]
 
 
 def main():
@@ -121,11 +139,7 @@ def main():
         for i in range(NODES):
             shutil.rmtree(SHM / f"cluster-{i}", ignore_errors=True)
             start(i)
-        spawn("clientdriver", [Path.home() / "Projects/aeron/cppbuild/Release/binaries/aeronmd",
-                               f"-Daeron.dir={SHM}/cluster-client",
-                               f"-Daeron.threading.mode={os.environ.get('CLIENT_THREADING', 'SHARED')}",
-                               "-Daeron.dir.delete.on.start=true",
-                               *os.environ.get("CLIENT_PROPS", "").split()])
+        spawn("clientdriver", driver_command())
     elif command == "down":
         down()
     elif command == "status":
@@ -155,4 +169,5 @@ def main():
         start(int(sys.argv[2]))
 
 
-main()
+if __name__ == "__main__":
+    main()

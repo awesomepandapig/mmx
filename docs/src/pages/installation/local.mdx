@@ -1,0 +1,47 @@
+# Local Docker installation
+
+Run the exchange with Docker Compose and published GHCR images. Install Docker with the Compose plugin and start its daemon. No Rust toolchain is required.
+
+## Install
+
+Install the native CLI on Linux (amd64 or arm64) or macOS (Apple silicon):
+
+```sh
+curl -fsSLO https://github.com/awesomepandapig/sbx/releases/latest/download/install.sh
+sh install.sh 0.1.0
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The installer verifies the release checksum. Alternatively, download the `mmx` binary for your platform from the [release assets](https://github.com/awesomepandapig/sbx/releases) and put it on your `PATH`.
+
+Start the exchange:
+
+```sh
+mmx local up
+mmx local status
+```
+
+The CLI installs its bundled Compose deployment into `$XDG_CONFIG_HOME/mmx` or `~/.config/mmx`, generates a private admin token, pulls published images, and waits for containers to start. Docker volumes preserve exchange state.
+
+## Connect
+
+The local deployment exposes REST on **8000**, the console on **8093**, and WebSocket on **8080**. The CLI uses the local console and stored token automatically:
+
+```sh
+mmx health
+mmx status
+mmx local credentials
+```
+
+`credentials` reads the first-run password from the console logs. Choose a new password when you first sign in.
+
+Open your Docker host's console service on port 8093, or continue with the CLI walkthrough in [Getting started](/getting-started).
+
+## Stop and restart
+
+```sh
+mmx local restart outbox
+mmx local down
+```
+
+`down` stops the containers and preserves data volumes. For source changes, use the [source build](/installation/source) path.

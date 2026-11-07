@@ -45,7 +45,10 @@ mod tests {
 
     #[test]
     fn timestamps_keep_nanoseconds() {
-        assert_eq!(format_timestamp(1_500_000_000), "1970-01-01T00:00:01.500000000Z");
+        assert_eq!(
+            format_timestamp(1_500_000_000),
+            "1970-01-01T00:00:01.500000000Z"
+        );
     }
 
     #[test]

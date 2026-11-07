@@ -69,7 +69,7 @@ def ensure_tape(name):
     TAPES.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         print(f"generating {path}")
-        digest = run([TOOLS / "sbx-tape", "--out", path, *spec["args"]])
+        digest = run([TOOLS / "mmx-tape", "--out", path, *spec["args"]])
     else:
         digest = run(["shasum", "-a", "256", path]).split()[0]
     if digest != spec["sha256"]:
@@ -99,7 +99,7 @@ def measure(engine, tape, mode, profile, rate, max_orders):
     try:
         time.sleep(1)
         limit = ["--limit", LATENCY_ORDERS] if mode == "latency" else []
-        output = run([TOOLS / "sbx-bench", "--tape", tape, "--mode", mode, "--rate", rate, *limit,
+        output = run([TOOLS / "mmx-bench", "--tape", tape, "--mode", mode, "--rate", rate, *limit,
                       "--orders-channel", orders_channel, "--exec-channel", exec_sub],
                      env=env, timeout=900)
         if matching.poll() is not None:

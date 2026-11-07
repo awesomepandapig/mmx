@@ -10,7 +10,7 @@ use crate::outbox::Shared;
 use crate::webhook::{self, Delivery as Body, Event};
 
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::sleep;
@@ -23,6 +23,49 @@ const IDLE: Duration = Duration::from_millis(1);
 const WAIT_SLICE: Duration = Duration::from_millis(10);
 /// How often to record progress over records the game doesn't hear about.
 const CURSOR_PERIOD: Duration = Duration::from_secs(1);
+pub const MAX_BATCH_EVENTS: usize = 10_000;
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug)]
+struct PostError {
+    reason: String,
+    retry_after: Option<Duration>,
+}
+
+impl PostError {
+    fn local(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            retry_after: None,
+        }
+    }
+}
+
+fn unix_seconds(now: SystemTime) -> Result<u64, PostError> {
+    now.duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|_| PostError::local("clock is before the Unix epoch; refusing to sign a webhook"))
+}
+
+/// A valid receiver hint is a lower bound, independent of our local exponential-backoff cap.
+/// Waiting uses elapsed time rather than adding to Instant, so even large delays are safe and
+/// remain interruptible by stop/halt. Invalid hints fall back to local backoff.
+fn retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
+    let value = value?.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return value.parse::<u64>().ok().map(Duration::from_secs);
+    }
+    httpdate::parse_http_date(value)
+        .ok()
+        .map(|date| date.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// A failed sender must not leave a healthy-looking process without delivery. The binary treats
+/// this error as fatal. State is not reused after a caught panic.
+pub fn supervise(run: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+        .map_err(|_| io::Error::other("webhook sender panicked; delivery must restart"))?
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cursor {
@@ -40,7 +83,8 @@ impl Cursor {
             Err(error) => return Err(error),
         };
         if bytes.len() != CURSOR_LENGTH
-            || crc32fast::hash(&bytes[..16]) != u32::from_le_bytes(bytes[16..20].try_into().expect("four bytes"))
+            || crc32fast::hash(&bytes[..16])
+                != u32::from_le_bytes(bytes[16..20].try_into().expect("four bytes"))
         {
             eprintln!("the delivery cursor is damaged, so delivery repeats from the start");
             return Ok(Self::default());
@@ -106,17 +150,30 @@ pub struct Deliverer {
 impl Deliverer {
     /// Starts from the saved cursor, refusing a journal that has lost what was already delivered.
     pub fn open(dir: &Path, shared: Arc<Shared>, config: DeliveryConfig) -> io::Result<Self> {
+        if !(1..=MAX_BATCH_EVENTS).contains(&config.max_events) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("WEBHOOK_MAX_EVENTS must be between 1 and {MAX_BATCH_EVENTS}"),
+            ));
+        }
         let cursor = Cursor::load(dir)?;
         if cursor.offset > shared.durable_length() {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
-                format!("delivery reached offset {}, but the journal ends at {}", cursor.offset, shared.durable_length()),
+                format!(
+                    "delivery reached offset {}, but the journal ends at {}",
+                    cursor.offset,
+                    shared.durable_length()
+                ),
             ));
         }
         shared.set_delivered(cursor.position);
 
         // A redirect is a failure, not a delivery, and following it would turn the POST into a GET.
-        let agent = ureq::AgentBuilder::new().timeout(config.timeout).redirects(0).build();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(config.timeout)
+            .redirects(0)
+            .build();
         Ok(Self {
             agent,
             reader: JournalReader::open(dir, cursor.offset)?,
@@ -139,7 +196,8 @@ impl Deliverer {
 
             let (events, end) = self.next_batch()?;
             if !events.is_empty() {
-                let body = serde_json::to_vec(&Body { events: &events }).expect("events serialize");
+                let body =
+                    serde_json::to_vec(&Body { events: &events }).map_err(io::Error::other)?;
                 if !self.send_until_accepted(&body) {
                     // Halted or stopping. Neither clears within this process, and the cursor still
                     // points before this batch, so it's sent again after a restart.
@@ -174,8 +232,13 @@ impl Deliverer {
         let mut events = Vec::new();
         let mut end = self.done;
         while events.len() < self.config.max_events {
-            let Some(record) = self.reader.next_below(limit)? else { break };
-            end = Cursor { offset: self.reader.offset(), position: record.position };
+            let Some(record) = self.reader.next_below(limit)? else {
+                break;
+            };
+            end = Cursor {
+                offset: self.reader.offset(),
+                position: record.position,
+            };
             events.extend(webhook::event(&record));
         }
         Ok((events, end))
@@ -184,51 +247,220 @@ impl Deliverer {
     /// Retries with exponential backoff, and returns false if delivery has to stop instead.
     fn send_until_accepted(&mut self, body: &[u8]) -> bool {
         let mut delay = self.config.first_retry;
-        let mut failures = 0;
+        let mut failures = 0u64;
         loop {
             if self.shared.is_stopping() || !self.shared.may_deliver() {
                 return false;
             }
-            match self.post(body) {
+            let wait = match self.post(body) {
                 Ok(()) => {
                     self.shared.set_consecutive_failures(0);
                     return true;
                 }
-                Err(reason) => {
-                    failures += 1;
+                Err(error) => {
+                    failures = failures.saturating_add(1);
                     self.shared.set_consecutive_failures(failures);
-                    eprintln!("webhook attempt {failures} failed, retrying in {delay:?}: {reason}");
+                    let wait = error.retry_after.map_or(delay, |hint| hint.max(delay));
+                    eprintln!(
+                        "webhook attempt {failures} failed, retrying in {wait:?}: {}",
+                        error.reason
+                    );
+                    wait
                 }
-            }
-            self.wait(delay);
-            delay = (delay * 2).min(self.config.max_retry);
+            };
+            self.wait(wait);
+            delay = delay.saturating_mul(2).min(self.config.max_retry);
         }
     }
 
     fn wait(&self, delay: Duration) {
         let started = Instant::now();
-        while started.elapsed() < delay && !self.shared.is_stopping() {
-            sleep(WAIT_SLICE.min(delay));
+        while started.elapsed() < delay && !self.shared.is_stopping() && self.shared.may_deliver() {
+            sleep(WAIT_SLICE.min(delay.saturating_sub(started.elapsed())));
         }
     }
 
-    fn post(&self, body: &[u8]) -> Result<(), String> {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock is after the epoch").as_secs();
-        let response = self
+    fn post(&self, body: &[u8]) -> Result<(), PostError> {
+        let now = SystemTime::now();
+        let timestamp = unix_seconds(now)?;
+        let response = match self
             .agent
             .post(&self.config.url)
             .set("Content-Type", "application/json")
             .set(webhook::TIMESTAMP_HEADER, &timestamp.to_string())
-            .set(webhook::SIGNATURE_HEADER, &webhook::signature(&self.config.secret, timestamp, body))
+            .set(
+                webhook::SIGNATURE_HEADER,
+                &webhook::signature(&self.config.secret, timestamp, body),
+            )
             .send_bytes(body)
-            .map_err(|error| match error {
-                ureq::Error::Status(status, _) => format!("status {status}"),
-                ureq::Error::Transport(transport) => transport.kind().to_string(),
-            })?;
+        {
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(error)) => {
+                return Err(PostError::local(error.kind().to_string()));
+            }
+        };
 
         let status = response.status();
-        // Reads the body so the connection can be reused.
-        let _ = response.into_string();
-        if (200..300).contains(&status) { Ok(()) } else { Err(format!("status {status}")) }
+        let hint = retry_after(response.header("Retry-After"), SystemTime::now());
+        // The body is not part of the delivery receipt. Bound draining/allocation even when a
+        // receiver returns an oversized body; dropping an unread tail closes that connection.
+        let _ = io::copy(
+            &mut response.into_reader().take(MAX_RESPONSE_BYTES),
+            &mut io::sink(),
+        );
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(PostError {
+                reason: format!("status {status}"),
+                retry_after: hint,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{self, FakeGame, TestDir};
+    use crate::outbox::{Outbox, SyncConfig};
+    use std::sync::mpsc;
+
+    #[test]
+    fn retry_after_accepts_seconds_dates_and_large_interruptible_delays() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert_eq!(
+            retry_after(Some(" 120 "), now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(retry_after(Some("0"), now), Some(Duration::ZERO));
+        assert_eq!(
+            retry_after(Some(&u64::MAX.to_string()), now),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        let future = httpdate::fmt_http_date(now + Duration::from_secs(90));
+        assert_eq!(
+            retry_after(Some(&future), now),
+            Some(Duration::from_secs(90))
+        );
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(90));
+        assert_eq!(retry_after(Some(&past), now), Some(Duration::ZERO));
+        for value in ["", "later", "-1", "+1", "1.5", "184467440737095516160"] {
+            assert_eq!(retry_after(Some(value), now), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn clock_errors_and_sender_panics_become_explicit_failures() {
+        assert!(unix_seconds(UNIX_EPOCH - Duration::from_secs(1)).is_err());
+        assert_eq!(unix_seconds(UNIX_EPOCH).expect("valid clock"), 0);
+        assert!(supervise(|| panic!("simulated sender failure")).is_err());
+        assert!(supervise(|| Err(io::Error::other("disk failed"))).is_err());
+        assert!(supervise(|| Ok(())).is_ok());
+    }
+
+    #[test]
+    fn invalid_batch_sizes_are_refused_before_delivery_starts() {
+        let dir = TestDir::new("batch-validation");
+        let outbox = Outbox::open(&dir.0, SyncConfig::default()).expect("journal");
+        for size in [0, MAX_BATCH_EVENTS + 1, usize::MAX] {
+            let mut config = DeliveryConfig::new("http://127.0.0.1:1/webhook".into(), vec![]);
+            config.max_events = size;
+            let error = Deliverer::open(&dir.0, outbox.shared(), config)
+                .err()
+                .expect("invalid size");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        }
+    }
+
+    fn queued(dir: &Path) -> Outbox {
+        let mut outbox = Outbox::open(
+            dir,
+            SyncConfig {
+                max_pending_bytes: usize::MAX,
+                max_delay: Duration::from_secs(3600),
+            },
+        )
+        .expect("journal");
+        for (position, frame) in fixture::tape(1) {
+            outbox.ingest(position, &frame).expect("frame");
+        }
+        outbox.sync().expect("sync");
+        outbox
+    }
+
+    #[test]
+    fn receiver_backoff_blocks_cursor_progress_and_stops_promptly() {
+        for status in [429, 503] {
+            let dir = TestDir::new("receiver-backoff");
+            let game = FakeGame::start();
+            game.retry_next(1, status, "3600");
+            let outbox = queued(&dir.0);
+            let shared = outbox.shared();
+            let mut config = DeliveryConfig::new(game.url.clone(), b"secret".to_vec());
+            config.first_retry = Duration::from_millis(1);
+            config.max_retry = Duration::from_millis(5);
+            let sender = Deliverer::open(&dir.0, Arc::clone(&shared), config).expect("sender");
+            let (finished, result) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                finished.send(sender.run()).expect("result");
+            });
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while game.requests().is_empty() && Instant::now() < deadline {
+                sleep(Duration::from_millis(1));
+            }
+            assert_eq!(game.requests().len(), 1, "initial attempt");
+            sleep(Duration::from_millis(40));
+            assert_eq!(
+                game.requests().len(),
+                1,
+                "server hint must outlive local backoff cap"
+            );
+            assert_eq!(
+                shared.position().delivered_position,
+                0,
+                "failed batch cannot advance cursor"
+            );
+            shared.stop();
+            result
+                .recv_timeout(Duration::from_secs(1))
+                .expect("interrupt backoff")
+                .expect("clean stop");
+            handle.join().expect("sender");
+            assert_eq!(Cursor::load(&dir.0).expect("cursor"), Cursor::default());
+        }
+    }
+
+    #[test]
+    fn retry_uses_identical_events_and_resumes_after_the_server_delay() {
+        let dir = TestDir::new("receiver-retry");
+        let game = FakeGame::start();
+        game.retry_next(1, 429, "1");
+        let outbox = queued(&dir.0);
+        let shared = outbox.shared();
+        let end = outbox.position();
+        let mut config = DeliveryConfig::new(game.url.clone(), b"secret".to_vec());
+        config.first_retry = Duration::from_millis(1);
+        config.max_retry = Duration::from_millis(5);
+        let sender = Deliverer::open(&dir.0, Arc::clone(&shared), config).expect("sender");
+        let handle = std::thread::spawn(move || sender.run().expect("delivery"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shared.position().delivered_position < end && Instant::now() < deadline {
+            sleep(Duration::from_millis(1));
+        }
+        shared.stop();
+        handle.join().expect("sender");
+        assert_eq!(shared.position().delivered_position, end);
+        let requests = game.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].body, requests[1].body);
+        assert!(
+            requests[1]
+                .received_at
+                .duration_since(requests[0].received_at)
+                >= Duration::from_secs(1)
+        );
+        assert!(!requests[0].accepted);
+        assert!(requests[1].accepted);
     }
 }

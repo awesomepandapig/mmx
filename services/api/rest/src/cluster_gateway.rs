@@ -7,16 +7,18 @@
 //! That resend is the gateway's own and happens below the ID claim, so it needs no claim of its
 //! own. Repeats from callers never get this far, because they stop at the claim.
 
-use super::aeron_handler::{EngineLink, EngineRequest, OrderKey, OrderOutcome, OrderSender, OutboundOrder};
+use super::aeron_handler::{
+    EngineLink, EngineRequest, OrderKey, OrderOutcome, OrderSender, OutboundOrder,
+};
 use super::order::UuidType;
 use super::recorder::ReportStream;
 
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cluster::{ClusterClient, OfferResult};
 
@@ -26,11 +28,14 @@ use sbe::ReadBuf;
 use sbe::exec_type_enum::ExecTypeEnum;
 use sbe::execution_report_codec::ExecutionReportDecoder;
 use sbe::message_header_codec::MessageHeaderDecoder;
-use sbe::order_cancel_reject_codec::OrderCancelRejectDecoder;
 use sbe::ord_rej_reason_enum::OrdRejReasonEnum;
+use sbe::order_cancel_reject_codec::OrderCancelRejectDecoder;
 
-use tokio::sync::{mpsc, oneshot};
+use serde::Serialize;
 use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::{mpsc, oneshot};
+
+use transport::AeronSubscription;
 
 const ORDER_QUEUE_LENGTH: usize = 4096;
 const INGRESS_STREAM: i32 = 101;
@@ -43,6 +48,7 @@ const SWEEP_INTERVAL: Duration = Duration::from_millis(50);
 const POSITION_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Where to find the cluster. All three variables hold comma-separated values, one per member.
+#[derive(Debug)]
 pub struct ClusterConfig {
     ingress_endpoints: Vec<String>,
     response_channel: String,
@@ -50,16 +56,50 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    pub fn from_env() -> Option<Self> {
-        let list = |name: &str| -> Option<Vec<String>> {
-            let value = env::var(name).ok()?;
-            Some(value.split(',').map(str::to_string).collect())
-        };
-        Some(Self {
-            ingress_endpoints: list("CLUSTER_INGRESS_ENDPOINTS")?,
-            response_channel: env::var("CLUSTER_RESPONSE_CHANNEL").ok()?,
-            report_channels: list("CLUSTER_REPORT_CHANNELS")?,
+    pub fn from_env() -> Result<Option<Self>, String> {
+        Self::from_lookup(|name| match env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(env::VarError::NotPresent) => Ok(None),
+            Err(env::VarError::NotUnicode(_)) => Err(format!("{name} must contain Unicode text")),
         })
+    }
+
+    /// Keep parsing independent of process-global environment mutation, including in tests.
+    fn from_lookup(
+        mut lookup: impl FnMut(&str) -> Result<Option<String>, String>,
+    ) -> Result<Option<Self>, String> {
+        let names = [
+            "CLUSTER_INGRESS_ENDPOINTS",
+            "CLUSTER_RESPONSE_CHANNEL",
+            "CLUSTER_REPORT_CHANNELS",
+        ];
+        let values = [lookup(names[0])?, lookup(names[1])?, lookup(names[2])?];
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        let required = |index: usize| -> Result<&str, String> {
+            values[index]
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "{} is required and must not be empty in cluster mode",
+                        names[index]
+                    )
+                })
+        };
+        let list = |index: usize| -> Result<Vec<String>, String> {
+            let entries: Vec<_> = required(index)?.split(',').map(str::trim).collect();
+            if entries.iter().any(|entry| entry.is_empty()) {
+                return Err(format!("{} must not contain empty entries", names[index]));
+            }
+            Ok(entries.into_iter().map(str::to_string).collect())
+        };
+        Ok(Some(Self {
+            ingress_endpoints: list(0)?,
+            response_channel: required(1)?.trim().to_string(),
+            report_channels: list(2)?,
+        }))
     }
 }
 
@@ -92,26 +132,71 @@ enum Waiting {
 /// What a report means for the requests waiting on it.
 #[derive(Debug, PartialEq, Eq)]
 enum Decoded {
-    Accepted { exec_id: u64, order: OrderKey },
-    Rejected { exec_id: u64, order: OrderKey, repeat: bool },
-    Canceled { exec_id: u64, order: OrderKey },
-    CancelRejected { cancel_id: UuidType },
-    Progress { exec_id: u64 },
+    Accepted {
+        exec_id: u64,
+        order: OrderKey,
+    },
+    Rejected {
+        exec_id: u64,
+        order: OrderKey,
+        repeat: bool,
+    },
+    Canceled {
+        exec_id: u64,
+        order: OrderKey,
+    },
+    CancelRejected {
+        cancel_id: UuidType,
+    },
+    Progress {
+        exec_id: u64,
+    },
     TermMarker(i64),
     Other,
 }
 
 fn decode(buffer: &[u8]) -> Decoded {
-    if buffer.len() < 16 {
+    use sbe::message_header_codec::ENCODED_LENGTH;
+
+    // Generated codecs assume callers have validated the entire fixed block. They perform
+    // unchecked indexing even when only a small part of the report is needed here.
+    if buffer.len() < ENCODED_LENGTH {
         return Decoded::Other;
     }
-    match u16::from_le_bytes([buffer[2], buffer[3]]) {
+    let header: MessageHeaderDecoder<ReadBuf<'_>> =
+        MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
+    let template = header.template_id();
+    let (block_length, schema, version) = match template {
+        REPORT_TEMPLATE => (
+            sbe::execution_report_codec::SBE_BLOCK_LENGTH,
+            sbe::SBE_SCHEMA_ID,
+            sbe::SBE_SCHEMA_VERSION,
+        ),
+        CANCEL_REJECT_TEMPLATE => (
+            sbe::order_cancel_reject_codec::SBE_BLOCK_LENGTH,
+            sbe::SBE_SCHEMA_ID,
+            sbe::SBE_SCHEMA_VERSION,
+        ),
+        // Term markers use the publisher's private envelope, not the generated SBE schema.
+        TERM_MARKER_TEMPLATE => (8, 0, 0),
+        _ => return Decoded::Other,
+    };
+    // Only the current protocol is supported. Reject unknown layouts instead of silently
+    // treating a newer or incompatible message as a decision. Fixed-size tape slots may pad it.
+    if header.block_length() != block_length
+        || header.schema_id() != schema
+        || header.version() != version
+        || buffer.len() < ENCODED_LENGTH + usize::from(block_length)
+    {
+        return Decoded::Other;
+    }
+    match template {
         TERM_MARKER_TEMPLATE => {
-            Decoded::TermMarker(i64::from_le_bytes(buffer[8..16].try_into().expect("eight bytes")))
+            let mut term = [0u8; 8];
+            term.copy_from_slice(&buffer[ENCODED_LENGTH..ENCODED_LENGTH + 8]);
+            Decoded::TermMarker(i64::from_le_bytes(term))
         }
         REPORT_TEMPLATE => {
-            let header: MessageHeaderDecoder<ReadBuf<'_>> =
-                MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
             let report: ExecutionReportDecoder<'_> =
                 ExecutionReportDecoder::default().header(header, 0);
             let exec_id = report.exec_id();
@@ -128,11 +213,11 @@ fn decode(buffer: &[u8]) -> Decoded {
             }
         }
         CANCEL_REJECT_TEMPLATE => {
-            let header: MessageHeaderDecoder<ReadBuf<'_>> =
-                MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
             let reject: OrderCancelRejectDecoder<'_> =
                 OrderCancelRejectDecoder::default().header(header, 0);
-            Decoded::CancelRejected { cancel_id: reject.cl_ord_id() }
+            Decoded::CancelRejected {
+                cancel_id: reject.cl_ord_id(),
+            }
         }
         _ => Decoded::Other,
     }
@@ -187,11 +272,19 @@ impl Tracker {
             }
             // The ID was claimed, so nobody else sent this order. The engine holding it can only
             // mean a resend found the first attempt resting, and the order is working.
-            Decoded::Rejected { exec_id, order, repeat: true } if self.is_new(exec_id) => {
+            Decoded::Rejected {
+                exec_id,
+                order,
+                repeat: true,
+            } if self.is_new(exec_id) => {
                 warn!("Cluster: A resend found its order already working");
                 self.resolve(Waiting::New(order), || OrderOutcome::Accepted);
             }
-            Decoded::Rejected { exec_id, order, repeat: false } if self.is_new(exec_id) => {
+            Decoded::Rejected {
+                exec_id,
+                order,
+                repeat: false,
+            } if self.is_new(exec_id) => {
                 self.resolve(Waiting::New(order), || OrderOutcome::Rejected);
             }
             Decoded::Canceled { exec_id, order } if self.is_new(exec_id) => {
@@ -221,15 +314,23 @@ impl Tracker {
         }
         self.awaiting_term = false;
         // Oldest first, so a cancel can't overtake the order it cancels.
-        let mut held: Vec<(u64, Waiting)> =
-            self.pending.iter().map(|(waiting, order)| (order.sequence, *waiting)).collect();
+        let mut held: Vec<(u64, Waiting)> = self
+            .pending
+            .iter()
+            .map(|(waiting, order)| (order.sequence, *waiting))
+            .collect();
         held.sort_unstable_by_key(|(sequence, _)| *sequence);
         self.unsent = held.into_iter().map(|(_, waiting)| waiting).collect();
         Some(self.unsent.len())
     }
 
     fn admit(&mut self, order: OutboundOrder) {
-        let OutboundOrder { request, message, send_by, published } = order;
+        let OutboundOrder {
+            request,
+            message,
+            send_by,
+            published,
+        } = order;
         let (waiting, cancel_id) = match request {
             EngineRequest::New(order) => (Waiting::New(order), None),
             EngineRequest::Cancel { order, cancel_id } => (Waiting::Cancel(order), Some(cancel_id)),
@@ -300,6 +401,77 @@ impl Tracker {
     }
 }
 
+/// One cluster member as this gateway hears it. Each member publishes its own copy of the report
+/// stream, and the copies are byte-identical, so positions compare directly.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+pub struct MemberView {
+    pub member: usize,
+    /// Whether this member's stream is reaching the gateway.
+    pub connected: bool,
+    /// Bytes of the report stream read from this member. `None` until it's first connected.
+    pub position: Option<i64>,
+}
+
+/// What this gateway knows of the cluster, for operators.
+#[derive(Serialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterView {
+    pub term: i64,
+    pub leader: Option<usize>,
+    pub leader_connected: bool,
+    pub leader_changes: u64,
+    /// Unix milliseconds of the last change this gateway saw. It's `None` if there's been none
+    /// since it started.
+    pub last_leader_change_ms: Option<u64>,
+    /// The newest exec ID on the report stream, which is how far consumers have to go.
+    pub last_exec_id: u64,
+    pub members: Vec<MemberView>,
+}
+
+/// Aeron handles can't leave their thread, so it copies what it knows here for the admin route.
+#[derive(Default)]
+pub struct ClusterWatch(RwLock<ClusterView>);
+
+impl ClusterWatch {
+    fn publish(&self, view: ClusterView) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = view;
+    }
+
+    pub fn view(&self) -> ClusterView {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Reads the member behind each report channel, which are listed in member order. A member back from
+/// a restart can briefly have two images, so the furthest one speaks for it.
+fn member_views(reports: &[AeronSubscription], stream: &ReportStream) -> Vec<MemberView> {
+    reports
+        .iter()
+        .enumerate()
+        .map(|(member, subscription)| {
+            let mut position = None;
+            subscription.for_each_image(|image| {
+                let read = image.position();
+                position = Some(position.map_or(read, |best: i64| best.max(read)));
+                stream.advance_to(read);
+            });
+            MemberView {
+                member,
+                connected: position.is_some(),
+                position,
+            }
+        })
+        .collect()
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
 fn on_error(code: i32, message: &str) {
     error!("Aeron: Error {}: {}", code, message);
 }
@@ -308,13 +480,14 @@ pub fn spawn_cluster_gateway(
     config: ClusterConfig,
     stream: Arc<ReportStream>,
     link: Arc<EngineLink>,
+    watch: Arc<ClusterWatch>,
 ) -> Result<OrderSender, String> {
     let (orders, incoming) = mpsc::channel::<OutboundOrder>(ORDER_QUEUE_LENGTH);
     let (started, startup) = std_mpsc::channel();
 
     thread::Builder::new()
         .name("cluster-gateway".to_string())
-        .spawn(move || run(config, stream, link, incoming, started))
+        .spawn(move || run(config, stream, link, watch, incoming, started))
         .map_err(|err| err.to_string())?;
 
     startup.recv().map_err(|err| err.to_string())??;
@@ -325,6 +498,7 @@ fn run(
     config: ClusterConfig,
     stream: Arc<ReportStream>,
     link: Arc<EngineLink>,
+    watch: Arc<ClusterWatch>,
     mut incoming: mpsc::Receiver<OutboundOrder>,
     started: std_mpsc::Sender<Result<(), String>>,
 ) {
@@ -358,12 +532,16 @@ fn run(
             return;
         }
     };
-    info!("Cluster: Session open, leader is member {:?}", client.leader());
+    info!(
+        "Cluster: Session open, leader is member {:?}",
+        client.leader()
+    );
 
     let mut tracker = Tracker::new();
     let mut leader_changes = client.leader_changes();
     let mut last_sweep = Instant::now();
     let mut last_position = Instant::now();
+    let mut last_leader_change_ms = None;
 
     loop {
         let mut idle = true;
@@ -381,15 +559,19 @@ fn run(
 
         if last_position.elapsed() >= POSITION_INTERVAL {
             last_position = Instant::now();
-            let mut images = 0;
-            for subscription in &reports {
-                subscription.for_each_image(|image| {
-                    images += 1;
-                    stream.advance_to(image.position());
-                });
-            }
+            let members = member_views(&reports, &stream);
             // An order needs a way in and a way to hear the answer.
-            link.set(client.is_leader_connected() && images > 0);
+            let heard = members.iter().any(|member| member.connected);
+            link.set(client.is_leader_connected() && heard);
+            watch.publish(ClusterView {
+                term: client.leadership_term(),
+                leader: client.leader(),
+                leader_connected: client.is_leader_connected(),
+                leader_changes: client.leader_changes(),
+                last_leader_change_ms,
+                last_exec_id: tracker.last_exec_id,
+                members,
+            });
         }
 
         client.poll_egress();
@@ -397,13 +579,20 @@ fn run(
 
         if client.leader_changes() != leader_changes {
             leader_changes = client.leader_changes();
+            last_leader_change_ms = Some(unix_ms());
             tracker.on_leader_change();
-            warn!("Cluster: Leader changed to {:?}, holding orders", client.leader());
+            warn!(
+                "Cluster: Leader changed to {:?}, holding orders",
+                client.leader()
+            );
         }
 
         let term = client.leadership_term();
         if let Some(resending) = tracker.resolve_term(term, client.is_leader_connected()) {
-            info!("Cluster: Term {} resolved, resending {} orders", term, resending);
+            info!(
+                "Cluster: Term {} resolved, resending {} orders",
+                term, resending
+            );
         }
 
         match incoming.try_recv() {
@@ -440,16 +629,22 @@ mod tests {
     use sbe::WriteBuf;
     use sbe::execution_report_codec::ExecutionReportEncoder;
     use sbe::message_header_codec::ENCODED_LENGTH;
-    use sbe::order_cancel_reject_codec::OrderCancelRejectEncoder;
     use sbe::ord_status_enum::OrdStatusEnum;
+    use sbe::order_cancel_reject_codec::OrderCancelRejectEncoder;
 
     use tokio::sync::oneshot::error::TryRecvError as AnswerEmpty;
 
     const PLAYER: UuidType = [7, 7];
 
-    fn report(exec_id: u64, order: OrderKey, exec_type: ExecTypeEnum, reason: OrdRejReasonEnum) -> Vec<u8> {
+    fn report(
+        exec_id: u64,
+        order: OrderKey,
+        exec_type: ExecTypeEnum,
+        reason: OrdRejReasonEnum,
+    ) -> Vec<u8> {
         let mut buffer = vec![0u8; ENCODED_LENGTH + 130];
-        let encoder = ExecutionReportEncoder::default().wrap(WriteBuf::new(&mut buffer), ENCODED_LENGTH);
+        let encoder =
+            ExecutionReportEncoder::default().wrap(WriteBuf::new(&mut buffer), ENCODED_LENGTH);
         let mut encoder = encoder.header(0).parent().unwrap();
         encoder.account(&order.0);
         encoder.cl_ord_id(&order.1);
@@ -465,12 +660,18 @@ mod tests {
     }
 
     fn canceled(exec_id: u64, order: OrderKey) -> Vec<u8> {
-        report(exec_id, order, ExecTypeEnum::Canceled, OrdRejReasonEnum::NullVal)
+        report(
+            exec_id,
+            order,
+            ExecTypeEnum::Canceled,
+            OrdRejReasonEnum::NullVal,
+        )
     }
 
     fn cancel_reject(cancel_id: UuidType) -> Vec<u8> {
         let mut buffer = vec![0u8; ENCODED_LENGTH + 43];
-        let encoder = OrderCancelRejectEncoder::default().wrap(WriteBuf::new(&mut buffer), ENCODED_LENGTH);
+        let encoder =
+            OrderCancelRejectEncoder::default().wrap(WriteBuf::new(&mut buffer), ENCODED_LENGTH);
         let mut encoder = encoder.header(0).parent().unwrap();
         encoder.cl_ord_id(&cancel_id);
         buffer
@@ -478,6 +679,7 @@ mod tests {
 
     fn term_marker(term: i64) -> Vec<u8> {
         let mut buffer = vec![0u8; 16];
+        buffer[0..2].copy_from_slice(&8u16.to_le_bytes());
         buffer[2..4].copy_from_slice(&TERM_MARKER_TEMPLATE.to_le_bytes());
         buffer[8..16].copy_from_slice(&term.to_le_bytes());
         buffer
@@ -491,13 +693,28 @@ mod tests {
         (PLAYER, [id, id])
     }
 
-    fn outbound(request: EngineRequest, tag: u8) -> (OutboundOrder, oneshot::Receiver<OrderOutcome>) {
+    fn outbound(
+        request: EngineRequest,
+        tag: u8,
+    ) -> (OutboundOrder, oneshot::Receiver<OrderOutcome>) {
         let (published, answer) = oneshot::channel();
         let send_by = Instant::now() + REQUEST_DEADLINE;
-        (OutboundOrder { request, message: vec![tag], send_by, published }, answer)
+        (
+            OutboundOrder {
+                request,
+                message: vec![tag],
+                send_by,
+                published,
+            },
+            answer,
+        )
     }
 
-    fn admit(tracker: &mut Tracker, request: EngineRequest, tag: u8) -> oneshot::Receiver<OrderOutcome> {
+    fn admit(
+        tracker: &mut Tracker,
+        request: EngineRequest,
+        tag: u8,
+    ) -> oneshot::Receiver<OrderOutcome> {
         let (order, answer) = outbound(request, tag);
         tracker.admit(order);
         answer
@@ -512,12 +729,157 @@ mod tests {
         sent
     }
 
+    const CONFIG_NAMES: [&str; 3] = [
+        "CLUSTER_INGRESS_ENDPOINTS",
+        "CLUSTER_RESPONSE_CHANNEL",
+        "CLUSTER_REPORT_CHANNELS",
+    ];
+    const CONFIG_VALUES: [&str; 3] = [
+        "core-0:9010,core-1:9010",
+        "aeron:udp?endpoint=gateway:9020",
+        "aeron:udp?endpoint=core-0:9030,aeron:udp?endpoint=core-1:9030",
+    ];
+
+    fn config(values: [Option<&str>; 3]) -> Result<Option<ClusterConfig>, String> {
+        ClusterConfig::from_lookup(|name| {
+            Ok(CONFIG_NAMES
+                .iter()
+                .position(|candidate| *candidate == name)
+                .and_then(|index| values[index].map(str::to_string)))
+        })
+    }
+
+    #[test]
+    fn standalone_requires_every_cluster_variable_to_be_absent() {
+        assert!(config([None; 3]).unwrap().is_none());
+        // Every nonempty, incomplete subset is an error, including each omitted variable.
+        for present in 1..7 {
+            let values = std::array::from_fn(|index| {
+                (present & (1 << index) != 0).then_some(CONFIG_VALUES[index])
+            });
+            assert!(config(values).is_err(), "present variables mask {present}");
+        }
+    }
+
+    #[test]
+    fn complete_cluster_configuration_is_preserved() {
+        let parsed = config(CONFIG_VALUES.map(Some)).unwrap().unwrap();
+        assert_eq!(parsed.ingress_endpoints, ["core-0:9010", "core-1:9010"]);
+        assert_eq!(parsed.response_channel, CONFIG_VALUES[1]);
+        assert_eq!(parsed.report_channels.len(), 2);
+    }
+
+    #[test]
+    fn empty_cluster_values_and_list_members_are_errors() {
+        assert!(config([Some(""); 3]).is_err());
+        for index in 0..3 {
+            for empty in ["", " ", "\t\n"] {
+                let mut values = CONFIG_VALUES.map(Some);
+                values[index] = Some(empty);
+                let error = config(values).unwrap_err();
+                assert!(error.contains(CONFIG_NAMES[index]), "{error}");
+            }
+        }
+        for index in [0, 2] {
+            for empty_entry in [",endpoint", "endpoint,", "endpoint, ,other", ","] {
+                let mut values = CONFIG_VALUES.map(Some);
+                values[index] = Some(empty_entry);
+                assert!(
+                    config(values).is_err(),
+                    "{}: {empty_entry}",
+                    CONFIG_NAMES[index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_cluster_environment_is_not_standalone() {
+        let parsed = ClusterConfig::from_lookup(|name| {
+            if name == CONFIG_NAMES[1] {
+                Err(format!("{name} must contain Unicode text"))
+            } else {
+                Ok(None)
+            }
+        });
+        assert!(parsed.unwrap_err().contains(CONFIG_NAMES[1]));
+    }
+
+    #[test]
+    fn every_truncated_known_report_is_ignored_without_affecting_pending_orders() {
+        let complete = [accepted(1, key(1)), cancel_reject([9, 9]), term_marker(2)];
+        let mut tracker = tracker();
+        let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
+        tracker.on_leader_change();
+        for frame in &complete {
+            for length in 0..frame.len() {
+                assert_eq!(decode(&frame[..length]), Decoded::Other, "length {length}");
+                tracker.on_report(&frame[..length]);
+            }
+        }
+        assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty));
+        assert_eq!(tracker.last_exec_id, 0);
+        assert_eq!(tracker.resolve_term(2, true), None);
+        tracker.on_report(&complete[0]);
+        assert_eq!(answer.try_recv(), Ok(OrderOutcome::Accepted));
+    }
+
+    #[test]
+    fn incompatible_envelopes_are_ignored_and_valid_reports_still_resolve() {
+        let frames = [accepted(1, key(1)), cancel_reject([9, 9]), term_marker(2)];
+        let mut tracker = tracker();
+        let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
+        let mut cancel = admit(
+            &mut tracker,
+            EngineRequest::Cancel {
+                order: key(2),
+                cancel_id: [9, 9],
+            },
+            2,
+        );
+        tracker.on_leader_change();
+        for frame in &frames {
+            // Both undersized and oversized declared blocks, foreign schema, future version,
+            // and unknown template IDs must be harmless even with a full physical buffer.
+            for (offset, value) in [(0, 0u16), (0, u16::MAX), (4, 999), (6, 1), (2, 999)] {
+                let mut invalid = frame.clone();
+                invalid[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+                assert_eq!(decode(&invalid), Decoded::Other);
+                tracker.on_report(&invalid);
+            }
+        }
+        assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty));
+        assert_eq!(cancel.try_recv(), Err(AnswerEmpty::Empty));
+        assert_eq!(tracker.last_exec_id, 0);
+        assert_eq!(tracker.resolve_term(2, true), None);
+        tracker.on_report(&frames[0]);
+        tracker.on_report(&frames[1]);
+        tracker.on_report(&frames[2]);
+        assert_eq!(answer.try_recv(), Ok(OrderOutcome::Accepted));
+        assert_eq!(cancel.try_recv(), Ok(OrderOutcome::NotOpen));
+        assert_eq!(tracker.resolve_term(2, true), Some(0));
+    }
+
+    #[test]
+    fn padded_tape_slots_keep_their_valid_report_layouts() {
+        for mut frame in [accepted(1, key(1)), cancel_reject([9, 9]), term_marker(2)] {
+            let expected = decode(&frame);
+            assert_ne!(expected, Decoded::Other);
+            frame.resize(256, 0);
+            assert_eq!(decode(&frame), expected);
+        }
+    }
+
     #[test]
     fn answers_with_the_engines_decision() {
         let mut tracker = tracker();
         let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
         assert_eq!(drain(&mut tracker), [1]);
-        assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty), "held until the first report");
+        assert_eq!(
+            answer.try_recv(),
+            Err(AnswerEmpty::Empty),
+            "held until the first report"
+        );
 
         tracker.on_report(&accepted(1, key(1)));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::Accepted));
@@ -527,7 +889,12 @@ mod tests {
     fn a_reject_is_final() {
         let mut tracker = tracker();
         let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        tracker.on_report(&report(1, key(1), ExecTypeEnum::Rejected, OrdRejReasonEnum::Other));
+        tracker.on_report(&report(
+            1,
+            key(1),
+            ExecTypeEnum::Rejected,
+            OrdRejReasonEnum::Other,
+        ));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::Rejected));
     }
 
@@ -542,9 +909,18 @@ mod tests {
         tracker.on_leader_change();
         tracker.on_report(&term_marker(1));
         assert_eq!(tracker.resolve_term(1, true), Some(1));
-        assert_eq!(drain(&mut tracker), [1], "the gateway's own resend goes out with no claim");
+        assert_eq!(
+            drain(&mut tracker),
+            [1],
+            "the gateway's own resend goes out with no claim"
+        );
 
-        tracker.on_report(&report(1, key(1), ExecTypeEnum::Rejected, OrdRejReasonEnum::DuplicateOrder));
+        tracker.on_report(&report(
+            1,
+            key(1),
+            ExecTypeEnum::Rejected,
+            OrdRejReasonEnum::DuplicateOrder,
+        ));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::Accepted));
     }
 
@@ -567,7 +943,10 @@ mod tests {
 
         tracker.on_leader_change();
         let mut late = admit(&mut tracker, EngineRequest::New(key(3)), 3);
-        assert!(drain(&mut tracker).is_empty(), "nothing is sent while the term is unresolved");
+        assert!(
+            drain(&mut tracker).is_empty(),
+            "nothing is sent while the term is unresolved"
+        );
         assert_eq!(tracker.resolve_term(1, true), None, "no marker yet");
 
         tracker.on_report(&accepted(1, key(1)));
@@ -576,7 +955,11 @@ mod tests {
         assert_eq!(tracker.resolve_term(1, true), Some(2));
 
         assert_eq!(landed.try_recv(), Ok(OrderOutcome::Accepted));
-        assert_eq!(drain(&mut tracker), [2, 3], "only what never reached the log is resent");
+        assert_eq!(
+            drain(&mut tracker),
+            [2, 3],
+            "only what never reached the log is resent"
+        );
         assert_eq!(lost.try_recv(), Err(AnswerEmpty::Empty));
         assert_eq!(late.try_recv(), Err(AnswerEmpty::Empty));
     }
@@ -595,7 +978,10 @@ mod tests {
         for id in 1..=8 {
             admit(&mut tracker, EngineRequest::New(key(id)), id as u8);
         }
-        let cancel = EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] };
+        let cancel = EngineRequest::Cancel {
+            order: key(1),
+            cancel_id: [9, 9],
+        };
         admit(&mut tracker, cancel, 9);
         drain(&mut tracker);
 
@@ -625,10 +1011,16 @@ mod tests {
     fn an_order_never_goes_out_past_its_deadline() {
         let mut tracker = tracker();
         let mut answer = admit(&mut tracker, EngineRequest::New(key(1)), 1);
-        assert!(!tracker.send_unsent(Instant::now(), |_| false), "back pressure keeps it queued");
+        assert!(
+            !tracker.send_unsent(Instant::now(), |_| false),
+            "back pressure keeps it queued"
+        );
 
         let late = Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1);
-        assert!(!tracker.send_unsent(late, |_| true), "the sweep hasn't run, and still nothing goes");
+        assert!(
+            !tracker.send_unsent(late, |_| true),
+            "the sweep hasn't run, and still nothing goes"
+        );
         tracker.expire(late);
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::TimedOut));
     }
@@ -660,7 +1052,10 @@ mod tests {
     #[test]
     fn a_repeated_cancel_after_expiry_goes_once() {
         let mut tracker = tracker();
-        let cancel = EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] };
+        let cancel = EngineRequest::Cancel {
+            order: key(1),
+            cancel_id: [9, 9],
+        };
         admit(&mut tracker, cancel, 1);
         assert!(!tracker.send_unsent(Instant::now(), |_| false));
         tracker.expire(Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1));
@@ -685,11 +1080,18 @@ mod tests {
     #[test]
     fn a_cancel_is_answered_by_the_orders_cancel_report() {
         let mut tracker = tracker();
-        let cancel = EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] };
+        let cancel = EngineRequest::Cancel {
+            order: key(1),
+            cancel_id: [9, 9],
+        };
         let mut answer = admit(&mut tracker, cancel, 1);
         tracker.on_report(&accepted(1, key(2)));
         tracker.on_report(&canceled(2, key(2)));
-        assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty), "another order's cancel");
+        assert_eq!(
+            answer.try_recv(),
+            Err(AnswerEmpty::Empty),
+            "another order's cancel"
+        );
 
         tracker.on_report(&canceled(3, key(1)));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::Canceled));
@@ -699,11 +1101,18 @@ mod tests {
     #[test]
     fn a_cancel_is_answered_by_its_reject() {
         let mut tracker = tracker();
-        let cancel = EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] };
+        let cancel = EngineRequest::Cancel {
+            order: key(1),
+            cancel_id: [9, 9],
+        };
         let mut answer = admit(&mut tracker, cancel, 1);
 
         tracker.on_report(&cancel_reject([8, 8]));
-        assert_eq!(answer.try_recv(), Err(AnswerEmpty::Empty), "another cancel's reject");
+        assert_eq!(
+            answer.try_recv(),
+            Err(AnswerEmpty::Empty),
+            "another cancel's reject"
+        );
 
         tracker.on_report(&cancel_reject([9, 9]));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::NotOpen));
@@ -712,8 +1121,22 @@ mod tests {
     #[test]
     fn repeated_cancels_share_one_message() {
         let mut tracker = tracker();
-        let mut first = admit(&mut tracker, EngineRequest::Cancel { order: key(1), cancel_id: [8, 8] }, 1);
-        let mut second = admit(&mut tracker, EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] }, 2);
+        let mut first = admit(
+            &mut tracker,
+            EngineRequest::Cancel {
+                order: key(1),
+                cancel_id: [8, 8],
+            },
+            1,
+        );
+        let mut second = admit(
+            &mut tracker,
+            EngineRequest::Cancel {
+                order: key(1),
+                cancel_id: [9, 9],
+            },
+            2,
+        );
         assert_eq!(drain(&mut tracker), [1]);
 
         tracker.on_report(&canceled(1, key(1)));
@@ -724,7 +1147,14 @@ mod tests {
     #[test]
     fn an_expired_cancel_forgets_its_id() {
         let mut tracker = tracker();
-        let mut answer = admit(&mut tracker, EngineRequest::Cancel { order: key(1), cancel_id: [9, 9] }, 1);
+        let mut answer = admit(
+            &mut tracker,
+            EngineRequest::Cancel {
+                order: key(1),
+                cancel_id: [9, 9],
+            },
+            1,
+        );
         tracker.expire(Instant::now() + REQUEST_DEADLINE + Duration::from_millis(1));
         assert_eq!(answer.try_recv(), Ok(OrderOutcome::TimedOut));
         assert!(tracker.cancels.is_empty());

@@ -59,6 +59,7 @@ COPY crates crates
 COPY services services
 COPY tools/Cargo.toml tools/Cargo.toml
 COPY tools/src tools/src
+COPY deploy/compose.yaml deploy/compose.yaml
 RUN cargo chef prepare --recipe-path /recipe.json
 
 # ---- Services and tools: the release profile, with features unified across the workspace ---------
@@ -84,6 +85,7 @@ COPY crates crates
 COPY services services
 COPY tools/Cargo.toml tools/Cargo.toml
 COPY tools/src tools/src
+COPY deploy/compose.yaml deploy/compose.yaml
 COPY --from=console-build /app/dist console/dist
 
 # Building the whole workspace once means one Cargo run per architecture however many images are
@@ -101,13 +103,15 @@ RUN --mount=type=cache,id=mmx-cargo-index-${TARGETARCH},target=/usr/local/cargo/
 RUN mkdir /out && find target/release -maxdepth 1 -type f -perm -u+x -exec cp {} /out/ \;
 
 FROM sources-release AS test
+RUN cargo fmt --all -- --check
 ARG TARGETARCH
 ARG CARGO_INCREMENTAL=1
 RUN --mount=type=cache,id=mmx-cargo-index-${TARGETARCH},target=/usr/local/cargo/registry/index,sharing=locked \
     --mount=type=cache,id=mmx-cargo-cache-${TARGETARCH},target=/usr/local/cargo/registry/cache,sharing=locked \
     --mount=type=cache,id=mmx-cargo-git-${TARGETARCH},target=/usr/local/cargo/git/db,sharing=locked \
     --mount=type=cache,id=mmx-incremental-${TARGETARCH},target=/src/target/release/incremental,sharing=locked \
-    env CARGO_INCREMENTAL=${CARGO_INCREMENTAL} cargo test --release --workspace --locked
+    env CARGO_INCREMENTAL=${CARGO_INCREMENTAL} cargo clippy --release --workspace --all-features --all-targets --locked \
+    && env CARGO_INCREMENTAL=${CARGO_INCREMENTAL} cargo test --release --workspace --all-features --locked
 
 # ---- Engine: built like the benchmark, with fat LTO and logging compiled out ---------------------
 
@@ -128,6 +132,7 @@ COPY crates crates
 COPY services services
 COPY tools/Cargo.toml tools/Cargo.toml
 COPY tools/src tools/src
+COPY deploy/compose.yaml deploy/compose.yaml
 RUN --mount=type=cache,id=mmx-cargo-index-${TARGETARCH},target=/usr/local/cargo/registry/index,sharing=locked \
     --mount=type=cache,id=mmx-cargo-cache-${TARGETARCH},target=/usr/local/cargo/registry/cache,sharing=locked \
     --mount=type=cache,id=mmx-cargo-git-${TARGETARCH},target=/usr/local/cargo/git/db,sharing=locked \
@@ -137,7 +142,7 @@ RUN --mount=type=cache,id=mmx-cargo-index-${TARGETARCH},target=/usr/local/cargo/
 
 FROM ${DEBIAN_IMAGE} AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libatomic1 libbsd0 libuuid1 \
+    && apt-get install -y --no-install-recommends ca-certificates curl libatomic1 libbsd0 libuuid1 \
         util-linux zlib1g \
     && rm -rf /var/lib/apt/lists/*
 COPY --chmod=755 deploy/docker/mmx-lib.sh /usr/local/lib/mmx/mmx-lib.sh
@@ -160,7 +165,7 @@ CMD ["/usr/local/bin/matching-engine"]
 # Every developer tool, for inspecting a running cluster.
 FROM runtime AS tools
 COPY --from=build-release /out/ /usr/local/bin/
-RUN if ldd /usr/local/bin/sbx-tap | grep "not found"; then exit 1; fi
+RUN if ldd /usr/local/bin/mmx-tap | grep "not found"; then exit 1; fi
 ENTRYPOINT []
 CMD ["sleep", "infinity"]
 
@@ -205,7 +210,7 @@ ARG VITE_DOCS_URL
 COPY ${APP}/ ./
 RUN npm run build && npm prune --omit=dev
 
-# `web` and `docs`.
+# The landing page and browser simulation (`web`).
 FROM ${NODE_IMAGE} AS remix
 ENV NODE_ENV=production PORT=3000
 WORKDIR /app
@@ -229,3 +234,18 @@ COPY --from=auth-build /app/node_modules ./node_modules
 COPY --from=auth-build /app/dist ./dist
 USER 10001:10001
 CMD ["node", "dist/main.js"]
+
+# Vocs produces a static site, including Markdown and llms.txt exports.
+FROM npm-deps AS docs-build
+ARG DOCS_BASE_URL=https://docs.mmx.exchange
+COPY docs/ ./
+RUN npm run build
+
+FROM ${NODE_IMAGE} AS docs
+ENV NODE_ENV=production PORT=3000
+WORKDIR /app
+COPY --from=docs-build /app/dist/public ./public
+COPY deploy/docker/serve-docs.mjs ./serve-docs.mjs
+USER 10001:10001
+EXPOSE 3000
+CMD ["node", "serve-docs.mjs"]

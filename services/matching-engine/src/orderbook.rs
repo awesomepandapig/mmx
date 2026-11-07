@@ -1,7 +1,7 @@
 use crate::types::{Order, OrderKey, SymbolType};
 
-use slab::Slab;
 use foldhash::{HashMap, HashMapExt};
+use slab::Slab;
 use std::collections::BTreeSet;
 
 use sbe::side_enum::SideEnum;
@@ -66,7 +66,11 @@ impl OrderBook {
         for i in 0..capacity {
             self.pool.insert(Order::empty());
             self.order_key_map.insert((i as u128, 0), 0);
-            let key = LevelKey { price: i as i64, symbol: [0; 6], is_bid: true };
+            let key = LevelKey {
+                price: i as i64,
+                symbol: [0; 6],
+                is_bid: true,
+            };
             self.price_map.insert(key, Limit::new());
         }
         self.pool.clear();
@@ -110,7 +114,11 @@ impl OrderBook {
 
         let order_idx = self.pool.insert(*order);
         self.order_key_map.insert(order_key, order_idx);
-        let key = LevelKey { price: order.price, symbol: order.symbol, is_bid: true };
+        let key = LevelKey {
+            price: order.price,
+            symbol: order.symbol,
+            is_bid: true,
+        };
 
         if let Some(limit) = self.price_map.get_mut(&key) {
             let tail_idx = limit
@@ -124,7 +132,11 @@ impl OrderBook {
             new_limit.head_order_idx = Some(order_idx);
             new_limit.tail_order_idx = Some(order_idx);
             self.price_map.insert(key, new_limit);
-            self.trees.entry(order.symbol).or_default().bids_price_tree.insert(order.price);
+            self.trees
+                .entry(order.symbol)
+                .or_default()
+                .bids_price_tree
+                .insert(order.price);
         }
     }
 
@@ -133,7 +145,11 @@ impl OrderBook {
         let order_key = order.key();
         let order_idx = self.pool.insert(*order);
         self.order_key_map.insert(order_key, order_idx);
-        let key = LevelKey { price: order.price, symbol: order.symbol, is_bid: false };
+        let key = LevelKey {
+            price: order.price,
+            symbol: order.symbol,
+            is_bid: false,
+        };
 
         if let Some(limit) = self.price_map.get_mut(&key) {
             let tail_idx = limit
@@ -147,7 +163,11 @@ impl OrderBook {
             new_limit.head_order_idx = Some(order_idx);
             new_limit.tail_order_idx = Some(order_idx);
             self.price_map.insert(key, new_limit);
-            self.trees.entry(order.symbol).or_default().asks_price_tree.insert(order.price);
+            self.trees
+                .entry(order.symbol)
+                .or_default()
+                .asks_price_tree
+                .insert(order.price);
         }
     }
 
@@ -162,7 +182,11 @@ impl OrderBook {
         let order = self.pool.remove(order_idx);
 
         let is_bid = order.side == SideEnum::Buy;
-        let key = LevelKey { price: order.price, symbol: order.symbol, is_bid };
+        let key = LevelKey {
+            price: order.price,
+            symbol: order.symbol,
+            is_bid,
+        };
 
         let limit = self
             .price_map
@@ -211,7 +235,11 @@ impl OrderBook {
     pub fn best_bid(&mut self, symbol: &SymbolType) -> Option<&mut Order> {
         let trees = self.trees.get(symbol)?;
         if let Some(&best_price) = trees.bids_price_tree.last() {
-            let key = LevelKey { price: best_price, symbol: *symbol, is_bid: true };
+            let key = LevelKey {
+                price: best_price,
+                symbol: *symbol,
+                is_bid: true,
+            };
             let head_idx = self
                 .price_map
                 .get(&key)
@@ -231,7 +259,11 @@ impl OrderBook {
     pub fn best_ask(&mut self, symbol: &SymbolType) -> Option<&mut Order> {
         let trees = self.trees.get(symbol)?;
         if let Some(&best_price) = trees.asks_price_tree.first() {
-            let key = LevelKey { price: best_price, symbol: *symbol, is_bid: false };
+            let key = LevelKey {
+                price: best_price,
+                symbol: *symbol,
+                is_bid: false,
+            };
             let head_idx = self
                 .price_map
                 .get(&key)

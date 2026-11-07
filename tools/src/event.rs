@@ -94,7 +94,9 @@ fn id(value: [u64; 2]) -> String {
 }
 
 fn symbol(value: [u8; 6]) -> String {
-    String::from_utf8_lossy(&value).trim_end_matches('\0').to_string()
+    String::from_utf8_lossy(&value)
+        .trim_end_matches('\0')
+        .to_string()
 }
 
 fn decimal(value: i64) -> Option<i64> {

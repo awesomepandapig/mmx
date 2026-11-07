@@ -4,7 +4,7 @@
 
 use super::*;
 
-use crate::auth::{self, CSRF_HEADER, SESSION_COOKIE};
+use crate::auth::{self, CSRF_HEADER, Managed, Role, SESSION_COOKIE};
 use crate::oidc;
 use crate::settings::webhook_fingerprint;
 use crate::store::{Doc, KubeStore, MARKETS_KEY, StoreError};
@@ -72,6 +72,15 @@ impl World {
 }
 
 impl Browser {
+    fn clone_session(&self, world: &World) -> Self {
+        Browser {
+            url: world.url.clone(),
+            http: world.http.clone(),
+            cookie: self.cookie.clone(),
+            csrf: self.csrf.clone(),
+        }
+    }
+
     async fn take(&mut self, response: reqwest::Response) -> (u16, Value) {
         if let Some(header) = session_cookie(&response) {
             self.cookie = cookie_pair(&header);
@@ -161,6 +170,7 @@ async fn a_restart_keeps_the_password_it_has() {
         Some(TOKEN),
         false,
         Some("other".to_string()),
+        Managed::default(),
     )
     .await
     .unwrap();
@@ -176,7 +186,9 @@ async fn with_no_password_set_one_is_generated() {
         markets_file: path,
         dir: dir.clone(),
     }));
-    Auth::start(store, Some(TOKEN), false, None).await.unwrap();
+    Auth::start(store, Some(TOKEN), false, None, Managed::default())
+        .await
+        .unwrap();
     let text = fs::read_to_string(dir.join("secrets.json")).unwrap();
     assert!(text.contains("$argon2id$"), "{text}");
 }
@@ -201,24 +213,26 @@ async fn a_session_cookie_is_http_only_and_same_site() {
 }
 
 #[tokio::test]
-async fn a_public_https_url_makes_cookies_secure() {
+async fn a_proxy_terminating_tls_makes_cookies_secure() {
     let world = plain_world().await;
-    let mut admin = world.admin().await;
-    let (code, body) = admin
-        .put(
-            "/settings",
-            json!({ "public_url": "https://console.example" }),
-        )
-        .await;
-    assert_eq!(code, 200, "{body}");
+    world.admin().await;
     let response = world
         .http
         .post(format!("{}/admin/v1/login", world.url))
+        .header("x-forwarded-proto", "https")
         .json(&json!({ "password": REAL_PASSWORD }))
         .send()
         .await
         .unwrap();
     assert!(session_cookie(&response).unwrap().contains("Secure"));
+}
+
+#[tokio::test]
+async fn a_public_url_can_not_be_set_any_more() {
+    let world = plain_world().await;
+    let mut admin = world.admin().await;
+    let body = json!({ "public_url": "https://console.example" });
+    assert_eq!(admin.put("/settings", body).await.0, 400);
 }
 
 #[tokio::test]
@@ -394,7 +408,9 @@ async fn insecure_local_refuses_browsers_without_a_session() {
         markets_file: path.clone(),
         dir: path.with_file_name("state"),
     }));
-    let auth = Auth::start(store.clone(), None, true, None).await.unwrap();
+    let auth = Auth::start(store.clone(), None, true, None, Managed::default())
+        .await
+        .unwrap();
     let targets = Targets {
         gateways: vec![dead_url().await],
         gateway_dns: None,
@@ -402,14 +418,22 @@ async fn insecure_local_refuses_browsers_without_a_session() {
         questdb: dead_url().await,
         nats: "127.0.0.1:1".to_string(),
         valkey: None,
+        websocket: None,
     };
+    let up = Arc::new(Upstreams::new(targets, None).unwrap());
     let state = Arc::new(AppState {
-        up: Arc::new(Upstreams::new(targets, None).unwrap()),
+        feeds: crate::feed::Feeds::new(up.clone()),
+        streams: Arc::new(tokio::sync::Semaphore::new(server::MAX_STREAMS)),
+        summary: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        monitor: crate::monitor::Monitor::new(up.clone()),
+        up,
         store,
         auth,
         poll_every: Duration::from_millis(100),
         edits: tokio::sync::Mutex::new(()),
         behind_since: Mutex::new(None),
+        outbox_kind: "deployment".to_string(),
+        outbox_deployment: "mmx-outbox".to_string(),
         outbox_restart: String::new(),
     });
     let url = spawn(server::router(state)).await;
@@ -448,12 +472,6 @@ async fn secrets_never_come_back() {
     let (_, secret) = admin.post("/webhooks/secret", None).await;
     let secret = secret["secret"].as_str().unwrap().to_string();
     assert_eq!(secret.len(), 64, "{secret}");
-    admin
-        .put(
-            "/settings",
-            json!({ "public_url": "http://localhost:8093" }),
-        )
-        .await;
     let oidc = json!({
         "enabled": false, "issuer": "", "client_id": "", "client_secret": "very-secret-value",
     });
@@ -691,6 +709,7 @@ async fn gateways_can_be_found_through_a_name() {
         questdb: String::new(),
         nats: String::new(),
         valkey: None,
+        websocket: None,
     };
     let up = Upstreams::new(targets, None).unwrap();
     let urls = up.gateway_urls().await;
@@ -770,6 +789,25 @@ async fn kube_route(State(kube): State<Arc<FakeKube>>, request: Request) -> Resp
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    if ["deployments", "statefulsets"]
+        .iter()
+        .any(|kind| path == format!("/apis/apps/v1/namespaces/{NAMESPACE}/{kind}/mmx-outbox"))
+    {
+        assert_eq!(method, Method::PATCH);
+        assert_eq!(content_type, "application/merge-patch+json");
+        let bytes = axum::body::to_bytes(request.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let patch: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            patch
+                .pointer("/spec/template/metadata/annotations/mmx.exchange~1restart-id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        );
+        *kube.writes.lock().unwrap() += 1;
+        return Json(json!({})).into_response();
+    }
     let prefix = format!("/api/v1/namespaces/{NAMESPACE}/");
     let Some(key) = path.strip_prefix(&prefix).map(str::to_string) else {
         return refuse(StatusCode::FORBIDDEN, "forbidden: wrong namespace");
@@ -909,8 +947,8 @@ async fn replicas_starting_together_agree_on_one_password() {
     let kube = FakeKube::new(json!({ MARKETS_KEY: FILE }));
     let store = Arc::new(kube_store(&kube).await);
     let (first, second) = tokio::join!(
-        Auth::start(store.clone(), Some(TOKEN), false, None),
-        Auth::start(store.clone(), Some(TOKEN), false, None),
+        Auth::start(store.clone(), Some(TOKEN), false, None, Managed::default()),
+        Auth::start(store.clone(), Some(TOKEN), false, None, Managed::default()),
     );
     first.unwrap();
     second.unwrap();
@@ -1011,6 +1049,11 @@ struct IdClaims {
     nonce: String,
     email: String,
     email_verified: bool,
+    groups: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_time: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    _claim_names: Option<Value>,
 }
 
 #[derive(Default)]
@@ -1019,6 +1062,10 @@ struct Issuer {
     /// The challenge and nonce a browser arrived with, by code.
     logins: Mutex<HashMap<String, (String, String)>>,
     email: Mutex<String>,
+    groups: Mutex<Vec<String>>,
+    /// Seconds since the person signed in. None leaves `auth_time` out.
+    signed_in_ago: Mutex<Option<u64>>,
+    overage: Mutex<bool>,
     wrong_nonce: Mutex<bool>,
     expired: Mutex<bool>,
     wrong_audience: Mutex<bool>,
@@ -1049,6 +1096,21 @@ fn sign_token(issuer: &Issuer, nonce: &str) -> String {
         },
         email: issuer.email.lock().unwrap().clone(),
         email_verified: true,
+        groups: if *issuer.overage.lock().unwrap() {
+            Vec::new()
+        } else {
+            issuer.groups.lock().unwrap().clone()
+        },
+        auth_time: issuer
+            .signed_in_ago
+            .lock()
+            .unwrap()
+            .map(|ago| crate::tests::console::unix_now() - ago),
+        _claim_names: issuer
+            .overage
+            .lock()
+            .unwrap()
+            .then(|| json!({ "groups": "src1" })),
     };
     if *issuer.no_signature.lock().unwrap() {
         let head = URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
@@ -1133,6 +1195,8 @@ async fn token(
 async fn fake_issuer() -> Arc<Issuer> {
     let issuer = Arc::new(Issuer::default());
     *issuer.email.lock().unwrap() = "admin@game.example".to_string();
+    *issuer.groups.lock().unwrap() = vec!["ops-admin".to_string()];
+    *issuer.signed_in_ago.lock().unwrap() = Some(0);
     let router = Router::new()
         .route("/.well-known/openid-configuration", get(discovery))
         .route("/jwks", get(jwks))
@@ -1152,15 +1216,13 @@ async fn with_provider() -> Login {
     let issuer = fake_issuer().await;
     let world = plain_world().await;
     let mut admin = world.admin().await;
-    let public = json!({ "public_url": world.url });
-    assert_eq!(admin.put("/settings", public).await.0, 200);
     let oidc = json!({
         "enabled": true,
         "issuer": *issuer.url.lock().unwrap(),
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "display_name": "Game SSO",
-        "allowed": ["admin@game.example"],
+        "roles": { "admin": ["ops-admin"], "operator": ["ops"], "viewer": ["support"] },
     });
     let (code, body) = admin.put("/settings/oidc", oidc).await;
     assert_eq!(code, 200, "{body}");
@@ -1174,10 +1236,16 @@ async fn with_provider() -> Login {
 impl Login {
     /// Follows the browser's whole journey, standing in for the provider's login page.
     async fn sign_in(&self) -> (Browser, String) {
+        let (browser, landed, _) = self.journey("/oidc/start", self.world.browser()).await;
+        (browser, landed)
+    }
+
+    /// A browser's trip to the provider and back, and what the provider was asked.
+    async fn journey(&self, path: &str, mut browser: Browser) -> (Browser, String, url::Url) {
         let world = &self.world;
         let started = world
             .http
-            .get(format!("{}/admin/v1/oidc/start", world.url))
+            .get(format!("{}/admin/v1{path}", world.url))
             .send()
             .await
             .unwrap();
@@ -1220,11 +1288,19 @@ impl Login {
             .await
             .unwrap();
         let landed = back.headers()["location"].to_str().unwrap().to_string();
-        let mut browser = world.browser();
         if let Some(header) = session_cookie(&back) {
             browser.cookie = cookie_pair(&header);
         }
-        (browser, landed)
+        browser.get("/session").await;
+        (browser, landed, url)
+    }
+
+    /// Someone in `groups`, signed in through the provider.
+    async fn person(&self, groups: &[&str]) -> Browser {
+        *self.issuer.groups.lock().unwrap() = groups.iter().map(ToString::to_string).collect();
+        let (browser, landed) = self.sign_in().await;
+        assert_eq!(landed, "/");
+        browser
     }
 }
 
@@ -1260,12 +1336,12 @@ async fn refused(setup: impl Fn(&Issuer)) -> String {
 }
 
 #[tokio::test]
-async fn someone_not_on_the_list_is_refused() {
+async fn someone_with_no_mapped_group_is_refused() {
     let landed = refused(|issuer| {
-        *issuer.email.lock().unwrap() = "player@game.example".to_string();
+        *issuer.groups.lock().unwrap() = vec!["players".to_string()];
     })
     .await;
-    assert!(landed.contains("allowed"), "{landed}");
+    assert!(landed.contains("role"), "{landed}");
 }
 
 #[tokio::test]
@@ -1377,23 +1453,367 @@ async fn the_provider_can_not_be_removed_while_it_is_the_only_way_in() {
 }
 
 #[tokio::test]
-async fn a_provider_needs_a_list_of_who_may_sign_in() {
+async fn a_provider_needs_a_group_for_the_admin_role() {
     let login = with_provider().await;
     let mut admin = login.admin;
     let oidc = json!({
         "enabled": true,
         "issuer": *login.issuer.url.lock().unwrap(),
         "client_id": CLIENT_ID,
-        "allowed": [],
+        "roles": { "viewer": ["support"] },
     });
     let (code, body) = admin.put("/settings/oidc", oidc).await;
     assert_eq!(code, 400, "{body}");
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap()
-            .contains("who may sign in")
+    assert!(body["message"].as_str().unwrap().contains("admin role"));
+}
+
+#[tokio::test]
+async fn groups_decide_what_someone_can_do() {
+    let login = with_provider().await;
+    let world = &login.world;
+    let oops = |path: &str| format!("{path} wrong");
+
+    let mut viewer = login.person(&["support"]).await;
+    assert_eq!(viewer.get("/session").await.1["role"], "viewer");
+    for path in [
+        "/status",
+        "/markets",
+        "/orders",
+        "/webhooks/config",
+        "/config/markets",
+    ] {
+        assert_eq!(viewer.get(path).await.0, 200, "{}", oops(path));
+    }
+    assert_eq!(viewer.get("/settings").await.0, 403);
+    assert_eq!(viewer.post("/markets/ITEM/halt", None).await.0, 403);
+    assert_eq!(viewer.post("/markets/reload", None).await.0, 403);
+    assert_eq!(
+        viewer
+            .put("/webhooks/config", json!({ "url": "http://x" }))
+            .await
+            .0,
+        403
     );
+
+    let mut operator = login.person(&["ops", "support"]).await;
+    assert_eq!(operator.get("/session").await.1["role"], "operator");
+    assert_eq!(operator.post("/markets/ITEM/halt", None).await.0, 200);
+    assert_eq!(operator.post("/markets/ITEM/resume", None).await.0, 200);
+    assert_eq!(operator.post("/webhooks/secret", None).await.0, 403);
+    assert_eq!(
+        operator
+            .put("/settings", json!({ "password_login": true }))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(operator.get("/settings").await.0, 403);
+
+    let mut admin = login.person(&["ops-admin", "support"]).await;
+    assert_eq!(admin.get("/session").await.1["role"], "admin");
+    assert_eq!(admin.get("/settings").await.0, 200);
+    let token = world.get("/settings").await.0;
+    assert_eq!(token, 200, "the token is an admin");
+}
+
+#[tokio::test]
+async fn the_groups_claim_can_be_renamed() {
+    let login = with_provider().await;
+    let mut admin = login.admin.clone_session(&login.world);
+    let oidc = json!({
+        "enabled": true,
+        "issuer": *login.issuer.url.lock().unwrap(),
+        "client_id": CLIENT_ID,
+        "groups_claim": "roles",
+        "roles": { "admin": ["ops-admin"] },
+    });
+    assert_eq!(admin.put("/settings/oidc", oidc).await.0, 200);
+    let (_, landed) = login.sign_in().await;
+    assert!(landed.contains("roles"), "{landed}");
+}
+
+#[tokio::test]
+async fn saying_which_groups_arrived_helps_fix_a_mapping() {
+    let login = with_provider().await;
+    *login.issuer.groups.lock().unwrap() = vec!["everyone".to_string()];
+    let (mut browser, landed) = login.sign_in().await;
+    assert!(landed.contains("everyone"), "{landed}");
+    assert_eq!(browser.get("/status").await.0, 401);
+}
+
+#[tokio::test]
+async fn too_many_groups_fails_by_name() {
+    let landed = refused(|issuer| *issuer.overage.lock().unwrap() = true).await;
+    assert!(landed.contains("too+many+groups"), "{landed}");
+}
+
+#[tokio::test]
+async fn the_redirect_uri_follows_the_request_and_is_shown() {
+    let login = with_provider().await;
+    let world = &login.world;
+    let started = world
+        .http
+        .get(format!("{}/admin/v1/oidc/start", world.url))
+        .header("x-forwarded-host", "mmx.ops.internal")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .unwrap();
+    let cookie = started.headers()["set-cookie"].to_str().unwrap();
+    assert!(cookie.contains("Secure"), "{cookie}");
+    let location = started.headers()["location"].to_str().unwrap();
+    let wanted = "redirect_uri=https%3A%2F%2Fmmx.ops.internal%2Fadmin%2Fv1%2Foidc%2Fcallback";
+    assert!(location.contains(wanted), "{location}");
+
+    let shown = world
+        .http
+        .get(format!("{}/admin/v1/settings", world.url))
+        .bearer_auth(TOKEN)
+        .header("x-forwarded-host", "mmx.ops.internal")
+        .header("x-forwarded-proto", "https")
+        .send()
+        .await
+        .unwrap();
+    let shown: Value = shown.json().await.unwrap();
+    assert_eq!(
+        shown["oidc"]["redirect_uri"],
+        "https://mmx.ops.internal/admin/v1/oidc/callback"
+    );
+}
+
+#[tokio::test]
+async fn a_change_to_the_provider_signs_everyone_else_out() {
+    let mut login = with_provider().await;
+    let mut other = login.person(&["support"]).await;
+    let oidc = json!({
+        "enabled": true,
+        "issuer": *login.issuer.url.lock().unwrap(),
+        "client_id": CLIENT_ID,
+        "roles": { "admin": ["ops-admin"] },
+    });
+    let (code, body) = login.admin.put("/settings/oidc", oidc.clone()).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(other.get("/status").await.0, 401);
+    assert_eq!(
+        login.admin.get("/status").await.0,
+        200,
+        "the one who asked stays"
+    );
+    // Saving the same thing again takes nothing away.
+    let mut stays = login.person(&["ops-admin"]).await;
+    assert_eq!(login.admin.put("/settings/oidc", oidc).await.0, 200);
+    assert_eq!(stays.get("/status").await.0, 200);
+}
+
+#[tokio::test]
+async fn a_stale_password_session_must_type_it_again() {
+    let world = plain_world().await;
+    let mut admin = world.admin().await;
+    admin.cookie = world.state.auth.aged(&admin.cookie, 3600);
+    let refused = admin.send(Method::DELETE, "/markets/ITEM", None).await;
+    assert_eq!(refused.0, 403);
+    assert_eq!(refused.1["code"], "reauth_required");
+    let cancel = admin.post("/markets/ITEM/cancel-all", None).await;
+    assert_eq!(cancel.1["code"], "reauth_required");
+    assert_eq!(
+        admin.post("/webhooks/secret", None).await.1["code"],
+        "reauth_required"
+    );
+    let off = json!({ "password_login": true });
+    assert_eq!(
+        admin.put("/settings", off).await.1["code"],
+        "reauth_required"
+    );
+    // Halting is urgent, and it can be undone.
+    assert_eq!(admin.post("/markets/ITEM/halt", None).await.0, 200);
+
+    let wrong = admin
+        .post("/reauth", Some(json!({ "password": "not it" })))
+        .await;
+    assert_eq!(wrong.0, 401);
+    let (code, session) = admin
+        .post("/reauth", Some(json!({ "password": REAL_PASSWORD })))
+        .await;
+    assert_eq!(code, 200, "{session}");
+    assert!(session["reauth_until"].as_u64().unwrap() > unix_now());
+    assert_eq!(admin.post("/webhooks/secret", None).await.0, 200);
+}
+
+#[tokio::test]
+async fn the_token_is_not_asked_to_sign_in_again() {
+    let world = plain_world().await;
+    let (code, _) = world.call(Method::POST, "/webhooks/secret", None).await;
+    assert_eq!(code, 200);
+    let (code, _) = world.call(Method::DELETE, "/markets/ITEM", None).await;
+    assert_eq!(code, 200);
+}
+
+#[tokio::test]
+async fn saving_a_file_that_drops_a_market_counts_as_deleting_it() {
+    let world = plain_world().await;
+    let mut admin = world.admin().await;
+    admin.cookie = world.state.auth.aged(&admin.cookie, 3600);
+    let added = format!("{FILE}  - symbol: MORE\n    tick_size: \"1\"\n");
+    let (code, body) = admin.put("/config/markets", json!({ "yaml": added })).await;
+    assert_eq!(code, 200, "adding is fine: {body}");
+    let (code, body) = admin.put("/config/markets", json!({ "yaml": FILE })).await;
+    assert_eq!(code, 403, "{body}");
+    assert_eq!(body["code"], "reauth_required");
+}
+
+#[tokio::test]
+async fn an_oidc_session_confirms_at_the_provider() {
+    let login = with_provider().await;
+    *login.issuer.signed_in_ago.lock().unwrap() = Some(3600);
+    let mut admin = login.person(&["ops-admin"]).await;
+    assert_eq!(
+        admin.post("/webhooks/secret", None).await.1["code"],
+        "reauth_required"
+    );
+    // Not with a password: there isn't one for this person.
+    let body = json!({ "password": REAL_PASSWORD });
+    assert_eq!(admin.post("/reauth", Some(body)).await.0, 400);
+
+    // A provider that ignores the prompt and reports the old sign-in doesn't pass.
+    let path = "/oidc/start?reauth=1&return=/webhooks";
+    let (_, landed, asked) = login.journey(path, login.world.browser()).await;
+    assert!(landed.starts_with("/webhooks?reauth_error="), "{landed}");
+    let pairs: HashMap<String, String> = asked.query_pairs().into_owned().collect();
+    assert_eq!(pairs["prompt"], "login");
+    assert_eq!(pairs["max_age"], auth::STEP_UP_SECS.to_string());
+
+    // So doesn't one that says nothing.
+    *login.issuer.signed_in_ago.lock().unwrap() = None;
+    let (_, landed, _) = login.journey(path, login.world.browser()).await;
+    assert!(landed.contains("auth_time"), "{landed}");
+
+    // A real one does.
+    *login.issuer.signed_in_ago.lock().unwrap() = Some(1);
+    let (mut admin, landed, _) = login.journey(path, admin).await;
+    assert_eq!(landed, "/webhooks?reauthed=1");
+    assert_eq!(admin.post("/webhooks/secret", None).await.0, 200);
+}
+
+#[tokio::test]
+async fn a_landing_page_can_not_be_another_site() {
+    let login = with_provider().await;
+    let path = "/oidc/start?return=//evil.example";
+    let (_, landed, _) = login.journey(path, login.world.browser()).await;
+    assert_eq!(landed, "/");
+}
+
+#[tokio::test]
+async fn a_provider_from_the_deployment_can_not_be_changed_here() {
+    let issuer = fake_issuer().await;
+    let world = plain_world().await;
+    let url = issuer.url.lock().unwrap().clone();
+    let managed = Managed::read(|name| match name {
+        "MMX_OIDC_ISSUER" => Some(url.clone()),
+        "MMX_OIDC_CLIENT_ID" => Some(CLIENT_ID.to_string()),
+        "MMX_OIDC_CLIENT_SECRET" => Some(CLIENT_SECRET.to_string()),
+        "MMX_OIDC_ADMIN_GROUPS" => Some("ops-admin".to_string()),
+        "MMX_PASSWORD_LOGIN" => Some("false".to_string()),
+        _ => None,
+    })
+    .unwrap();
+    let auth = Auth::start(world.state.store.clone(), Some(TOKEN), false, None, managed)
+        .await
+        .unwrap();
+    let keys = auth.keys();
+    assert!(
+        !keys.password_login,
+        "passwords stay off from the first start"
+    );
+    assert!(keys.settings.oidc_enabled().is_some());
+    assert!(auth.oidc_managed());
+
+    // Break-glass still works: a stored choice beats the deployment's.
+    let stored = auth::update_settings(&world.state.store, |settings| {
+        settings.password_login = Some(true);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(stored.password_login, Some(true));
+    auth.refresh().await.unwrap();
+    assert!(auth.keys().password_login);
+}
+
+#[tokio::test]
+async fn sessions_of_each_role_are_refused_past_their_role_by_cookie_too() {
+    let world = plain_world().await;
+    let mut viewer = world.browser();
+    viewer.cookie = world
+        .state
+        .auth
+        .session_for("watcher@game.example", Role::Viewer);
+    viewer.get("/session").await;
+    assert_eq!(
+        viewer.send(Method::DELETE, "/markets/ITEM", None).await.0,
+        403
+    );
+}
+
+#[tokio::test]
+async fn the_market_list_searches_and_pages_on_the_server() {
+    let mut text = "markets:\n".to_string();
+    for index in 0..3000 {
+        text.push_str(&format!("  - symbol: M{index:04}\n    tick_size: \"1\"\n"));
+    }
+    text.push_str("  - symbol: XM120\n    tick_size: \"1\"\n");
+    let world = world(&[FakeGateway::new(&temp_markets(&text))]).await;
+
+    let started = std::time::Instant::now();
+    let (code, body) = world.get("/markets?limit=50&offset=100").await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(body["markets"].as_array().unwrap().len(), 50);
+    assert_eq!(body["markets"][0]["symbol"], "M0100");
+    assert_eq!(body["total"], 3001);
+    assert_eq!(body["counts"]["open"], 3001);
+
+    let (_, body) = world.get("/markets?q=m120&limit=3").await;
+    assert_eq!(body["total"], 11, "M120, M1200 to M1209 and XM120");
+    assert_eq!(
+        body["markets"][0]["symbol"], "M1200",
+        "starts with it, ahead of contains it"
+    );
+
+    let (_, body) = world.get("/markets?state=halted&limit=3").await;
+    assert_eq!(body["total"], 0);
+    assert_eq!(
+        body["counts"]["all"], 3001,
+        "counts ignore the state filter"
+    );
+
+    let (_, body) = world.get("/markets?limit=1&sort=symbol&dir=desc").await;
+    assert_eq!(body["markets"][0]["symbol"], "XM120");
+
+    assert_eq!(world.get("/markets?state=odd").await.0, 400);
+    assert_eq!(world.get("/markets?limit=501").await.0, 400);
+    let (_, whole) = world.get("/markets").await;
+    assert_eq!(
+        whole["markets"].as_array().unwrap().len(),
+        3001,
+        "the CLI's whole list"
+    );
+}
+
+#[tokio::test]
+async fn streams_are_bounded() {
+    let world = plain_world().await;
+    let held: Vec<_> = (0..server::MAX_STREAMS)
+        .map(|_| server::stream_seat(&world.state).unwrap())
+        .collect();
+    let (code, body) = world.get("/events").await;
+    assert_eq!(code, 503, "{body}");
+    assert_eq!(body["code"], "too_many_streams");
+    drop(held);
+    assert!(server::stream_seat(&world.state).is_ok());
 }
 
 #[tokio::test]
@@ -1426,4 +1846,46 @@ async fn discovery_refuses_a_provider_with_another_name() {
 #[test]
 fn hints_never_hold_a_whole_short_secret_by_accident() {
     assert_eq!(auth::hint("abcd"), "...abcd");
+}
+
+#[tokio::test]
+async fn outbox_restart_patches_only_the_named_workload() {
+    let kube = FakeKube::new(json!({ MARKETS_KEY: FILE }));
+    let store = kube_store(&kube).await;
+    store
+        .restart_outbox("deployment", "mmx-outbox")
+        .await
+        .unwrap();
+    store
+        .restart_outbox("statefulset", "mmx-outbox")
+        .await
+        .unwrap();
+    assert_eq!(*kube.writes.lock().unwrap(), 2);
+    assert!(
+        store
+            .restart_outbox("deployment", "another-deployment")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .restart_outbox("deployment", "../other")
+            .await
+            .is_err()
+    );
+    assert_eq!(*kube.writes.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn privileged_operations_reject_unauthenticated_requests() {
+    let world = plain_world().await;
+    for path in ["/password/reset", "/webhooks/restart"] {
+        let reply = world
+            .http
+            .post(format!("{}/admin/v1{path}", world.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(reply.status(), StatusCode::UNAUTHORIZED);
+    }
 }

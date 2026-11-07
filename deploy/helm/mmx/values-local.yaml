@@ -1,23 +1,17 @@
 # A laptop or CI cluster with three workers. Nothing here is exclusive or pinned, and memory is far
 # below production. See "Local cluster" in deploy/README.md.
 
-image:
-  registry: mmx
-  tag: dev
-  # A rebuilt tag isn't picked up with IfNotPresent.
-  pullPolicy: Always
-
 cluster:
   guaranteed: false
   pinThreads: false
-  updateStrategy: RollingUpdate
+  updateStrategy: OnDelete
   # Shared CPUs stall for far longer than the production timeouts.
   leaderHeartbeatTimeout: 5s
   electionTimeout: 2s
   threadingMode: SHARED
   idleStrategy: ""
   sparseTermBuffers: true
-  socketBuffer: 2m
+  socketBuffer: 128k
   sharedMemory:
     sizeLimit: 1Gi
   persistence:
@@ -37,7 +31,7 @@ cluster:
 
 driver:
   heapMax: 128m
-  socketBuffer: 2m
+  socketBuffer: 128k
   resources:
     cpu: 100m
     memory: 768Mi
@@ -51,24 +45,12 @@ gateway:
     memory: 256Mi
 
 consumers:
-  level2:
+  market-data:
     persistence:
       size: 1Gi
     resources:
-      cpu: 250m
-      memory: 256Mi
-  ticker:
-    persistence:
-      size: 1Gi
-    resources:
-      cpu: 250m
-      memory: 256Mi
-  candles:
-    persistence:
-      size: 1Gi
-    resources:
-      cpu: 250m
-      memory: 256Mi
+      cpu: 750m
+      memory: 512Mi
   trade-reporter:
     resources:
       cpu: 250m

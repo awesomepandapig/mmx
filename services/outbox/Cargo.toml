@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 crc32fast = "1.4.2"
 hmac = "0.12.1"
+httpdate = "1.0.3"
 rusteron-archive = { version = "0.2.16", features = ["static"] }
 sbe = { workspace = true }
 serde = { version = "1.0.219", features = ["derive"] }

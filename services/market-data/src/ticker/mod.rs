@@ -23,11 +23,15 @@ impl Processor for Tickers {
     const REPLAY_STREAM: i32 = 3010;
 
     fn on_report(&mut self, report: &ExecutionReportMessage, updates: &mut Vec<Update>) {
-        let (book, ticker_state) = self
-            .markets
-            .entry(report.symbol)
-            .or_insert_with(|| (OrderBook::new(), TickerState::new(symbol_name(&report.symbol))));
-        if let Some(payload) = process_execution_report(book, &mut self.last_seen_id, ticker_state, report) {
+        let (book, ticker_state) = self.markets.entry(report.symbol).or_insert_with(|| {
+            (
+                OrderBook::new(),
+                TickerState::new(symbol_name(&report.symbol)),
+            )
+        });
+        if let Some(payload) =
+            process_execution_report(book, &mut self.last_seen_id, ticker_state, report)
+        {
             let subject = format!("ticker.{}", symbol_name(&report.symbol));
             updates.push(Update { subject, payload });
         }

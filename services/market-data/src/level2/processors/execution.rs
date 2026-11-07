@@ -45,7 +45,12 @@ mod tests {
     const PRICE: i64 = 150_000_000;
 
     fn new_order(order_id: u64, quantity: i64) -> ExecutionReportMessage {
-        ExecutionReportMessage { order_id, price: PRICE, ord_qty: quantity, ..sample_report() }
+        ExecutionReportMessage {
+            order_id,
+            price: PRICE,
+            ord_qty: quantity,
+            ..sample_report()
+        }
     }
 
     #[test]
@@ -73,7 +78,8 @@ mod tests {
             ..new_order(1, 100_000_000)
         };
 
-        let update = process_execution_report(&mut book, &mut last_seen, &fill).expect("the level changed");
+        let update =
+            process_execution_report(&mut book, &mut last_seen, &fill).expect("the level changed");
 
         assert!(update.contains(r#""new_quantity":"0""#), "{update}");
     }
@@ -82,11 +88,24 @@ mod tests {
     fn market_orders_and_rejects_publish_nothing() {
         let mut book = OrderBook::new();
         let mut last_seen = 0;
-        let market = ExecutionReportMessage { order_id: 1, price: NULL_DECIMAL, ..sample_report() };
-        let reject = ExecutionReportMessage { exec_type: ExecTypeEnum::Rejected, ..new_order(2, 1) };
+        let market = ExecutionReportMessage {
+            order_id: 1,
+            price: NULL_DECIMAL,
+            ..sample_report()
+        };
+        let reject = ExecutionReportMessage {
+            exec_type: ExecTypeEnum::Rejected,
+            ..new_order(2, 1)
+        };
 
-        assert_eq!(process_execution_report(&mut book, &mut last_seen, &market), None);
-        assert_eq!(process_execution_report(&mut book, &mut last_seen, &reject), None);
+        assert_eq!(
+            process_execution_report(&mut book, &mut last_seen, &market),
+            None
+        );
+        assert_eq!(
+            process_execution_report(&mut book, &mut last_seen, &reject),
+            None
+        );
         assert_eq!(last_seen, 2);
     }
 
@@ -101,7 +120,10 @@ mod tests {
             ..new_order(9, 1)
         };
 
-        assert_eq!(process_execution_report(&mut book, &mut last_seen, &fill), None);
+        assert_eq!(
+            process_execution_report(&mut book, &mut last_seen, &fill),
+            None
+        );
     }
 
     #[test]

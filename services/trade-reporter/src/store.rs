@@ -67,17 +67,54 @@ fn http_base(conf: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{addr}"))
 }
 
-/// The first column of the first row of a query's result.
-fn first_long(result: &Value) -> Option<i64> {
-    result["dataset"][0][0].as_i64()
+fn sql_response(body: &str) -> Result<Value, String> {
+    let result: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    if !result.is_object() {
+        return Err("QuestDB returned a non-object SQL response".to_string());
+    }
+    if let Some(error) = result.get("error").filter(|error| !error.is_null()) {
+        return Err(format!("QuestDB SQL error: {error}"));
+    }
+    Ok(result)
 }
 
-fn saved_candles(result: &Value) -> Vec<Candle> {
-    let Some(rows) = result["dataset"].as_array() else { return Vec::new() };
-    rows.iter().filter_map(saved_candle).collect()
+fn dataset(result: &Value) -> Result<&Vec<Value>, String> {
+    result["dataset"]
+        .as_array()
+        .ok_or_else(|| "QuestDB SQL response has no dataset".to_string())
+}
+
+fn saved_position(result: &Value) -> Result<i64, String> {
+    let rows = dataset(result)?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    if rows.len() != 1 || rows[0].as_array().is_none_or(|row| row.len() != 1) {
+        return Err("Invalid saved recorder position rows".to_string());
+    }
+    rows[0][0]
+        .as_i64()
+        .filter(|position| *position >= 0)
+        .ok_or_else(|| "Invalid saved recorder position".to_string())
+}
+
+fn saved_candles(result: &Value) -> Result<Vec<Candle>, String> {
+    let mut candles = Vec::new();
+    let mut symbols = std::collections::HashSet::new();
+    for row in dataset(result)? {
+        let candle = saved_candle(row).ok_or_else(|| "Invalid saved candle row".to_string())?;
+        if !symbols.insert(candle.symbol) {
+            return Err("Duplicate saved candle symbol".to_string());
+        }
+        candles.push(candle);
+    }
+    Ok(candles)
 }
 
 fn saved_candle(row: &Value) -> Option<Candle> {
+    if row.as_array()?.len() != 9 {
+        return None;
+    }
     Some(Candle {
         symbol: symbol_bytes(row[0].as_str()?)?,
         start: u64::try_from(row[1].as_i64()?).ok()? / MICROS_PER_SECOND,
@@ -91,12 +128,83 @@ fn saved_candle(row: &Value) -> Option<Candle> {
     })
 }
 
-/// Whether every one of our tables has applied everything it accepted.
+/// Every expected table must be present exactly once with valid, fully applied WAL metadata.
 fn wal_applied(result: &Value) -> bool {
-    let Some(rows) = result["dataset"].as_array() else { return false };
-    rows.iter()
-        .filter(|row| row[0].as_str().is_some_and(|name| TABLES.contains(&name)))
-        .all(|row| row[1].as_i64().is_some() && row[1] == row[2])
+    let Ok(rows) = dataset(result) else {
+        return false;
+    };
+    let mut seen = [false; TABLES.len()];
+    for row in rows {
+        let Some(index) = row[0]
+            .as_str()
+            .and_then(|name| TABLES.iter().position(|table| *table == name))
+        else {
+            continue;
+        };
+        let (Some(writer), Some(sequencer)) = (row[1].as_i64(), row[2].as_i64()) else {
+            return false;
+        };
+        if seen[index] || writer < 0 || writer != sequencer {
+            return false;
+        }
+        seen[index] = true;
+    }
+    seen.into_iter().all(|present| present)
+}
+
+/// Never read resume state until the independent WAL tables have all applied their accepted data.
+/// The caller retries this entire attempt on failure, including rechecking the barrier.
+fn await_applied(
+    query: &mut impl FnMut(&str) -> Result<Value, String>,
+    now: &mut impl FnMut() -> Duration,
+    wait: &mut impl FnMut(Duration),
+) -> Result<(), String> {
+    let started = now();
+    loop {
+        if now().saturating_sub(started) >= WAL_WAIT {
+            return Err("Timed out waiting for all recorder WAL tables to apply".to_string());
+        }
+        if wal_applied(&query(WAL_STATE)?) {
+            break;
+        }
+        wait(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+fn resume_attempt(
+    query: &mut impl FnMut(&str) -> Result<Value, String>,
+    now: &mut impl FnMut() -> Duration,
+    wait: &mut impl FnMut(Duration),
+) -> Result<(i64, CandleBook), String> {
+    await_applied(query, now, wait)?;
+    let position = saved_position(&query(SAVED_POSITION)?)?;
+    if position == 0 {
+        // Data may have been accepted before the first cursor. Replaying from zero dedupes it.
+        return Ok((0, CandleBook::default()));
+    }
+    // A prior process's outstanding cursor request might be accepted after the first barrier.
+    // Its data flush was accepted before that cursor was sent. Recheck after observing the cursor
+    // so the associated candle writes cannot still be waiting for WAL application.
+    await_applied(query, now, wait)?;
+    let candles = saved_candles(&query(SAVED_CANDLES)?)?;
+    Ok((position, CandleBook::resume(candles)))
+}
+
+fn resume_until_done(
+    mut query: impl FnMut(&str) -> Result<Value, String>,
+    mut now: impl FnMut() -> Duration,
+    mut wait: impl FnMut(Duration),
+) -> (i64, CandleBook) {
+    loop {
+        match resume_attempt(&mut query, &mut now, &mut wait) {
+            Ok(state) => return state,
+            Err(error) => {
+                warn!("QuestDB: Resume is blocked; retrying: {error}");
+                wait(RETRY_AFTER);
+            }
+        }
+    }
 }
 
 pub struct Store {
@@ -130,7 +238,7 @@ impl Store {
             }
             Err(e) => return Err(e.to_string()),
         };
-        serde_json::from_str(&body).map_err(|e| e.to_string())
+        sql_response(&body)
     }
 
     /// Runs a query, waiting for as long as QuestDB takes to come back.
@@ -160,35 +268,15 @@ impl Store {
         }
     }
 
-    /// Waits until saved state is visible. Tables apply writes independently, so a position can
-    /// otherwise be seen before the candles written ahead of it.
-    fn await_applied(&self) {
-        let started = Instant::now();
-        while started.elapsed() < WAL_WAIT {
-            match self.sql(WAL_STATE) {
-                Ok(result) if wal_applied(&result) => return,
-                Ok(_) => sleep(Duration::from_millis(100)),
-                Err(e) => {
-                    warn!("QuestDB: Failed to read the table state: {}", e);
-                    return;
-                }
-            }
-        }
-        warn!("QuestDB: Tables are still applying writes, so candles may be behind");
-    }
-
-    /// The position to resume from and the candles open at that point. With no position,
-    /// everything is rebuilt from the tape.
+    /// Waits for a verified WAL barrier and valid saved state before following the tape.
+    /// SQL failures, stalled WAL application and malformed checkpoints keep startup blocked.
+    /// This assumes one recorder writer and no concurrent external rebuild.
     pub fn resume(&self) -> (i64, CandleBook) {
-        self.await_applied();
-        let position = first_long(&self.sql_until_done(SAVED_POSITION)).unwrap_or(0);
-        if position == 0 {
-            info!("No saved position, so rebuilding from the start of the tape");
-            return (0, CandleBook::default());
-        }
-        let candles = saved_candles(&self.sql_until_done(SAVED_CANDLES));
-        info!("Resuming from position {} with {} candles", position, candles.len());
-        (position, CandleBook::resume(candles))
+        let started = Instant::now();
+        let (position, candles) =
+            resume_until_done(|query| self.sql(query), || started.elapsed(), sleep);
+        info!("Resuming from verified recorder position {position}");
+        (position, candles)
     }
 
     /// Queues a report's rows. Nothing goes out until `flush`.
@@ -225,13 +313,17 @@ impl Store {
         }
         // A term marker moves the position with no rows, and the client refuses an empty buffer.
         if self.rows.row_count() > 0 {
-            self.sender.flush(&mut self.rows).map_err(|e| e.to_string())?;
+            self.sender
+                .flush(&mut self.rows)
+                .map_err(|e| e.to_string())?;
         }
 
         if let Some(position) = position {
             self.position_row.clear();
             write_position(&mut self.position_row, position).map_err(|e| e.to_string())?;
-            self.sender.flush(&mut self.position_row).map_err(|e| e.to_string())?;
+            self.sender
+                .flush(&mut self.position_row)
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
@@ -255,7 +347,10 @@ mod tests {
         store.record(&sample_report());
         assert_eq!(store.queued_rows(), 1);
 
-        let trade = ExecutionReportMessage { exec_type: ExecTypeEnum::Trade, ..sample_report() };
+        let trade = ExecutionReportMessage {
+            exec_type: ExecTypeEnum::Trade,
+            ..sample_report()
+        };
         store.record(&trade);
         assert_eq!(store.queued_rows(), 3);
     }
@@ -264,7 +359,10 @@ mod tests {
     fn a_report_that_cannot_be_written_leaves_no_partial_row() {
         let mut store = store();
         store.record(&sample_report());
-        store.record(&ExecutionReportMessage { transact_time: u64::MAX, ..sample_report() });
+        store.record(&ExecutionReportMessage {
+            transact_time: u64::MAX,
+            ..sample_report()
+        });
         assert_eq!(store.queued_rows(), 1);
 
         store.record(&sample_report());
@@ -289,7 +387,10 @@ mod tests {
 
     #[test]
     fn finds_the_http_address() {
-        assert_eq!(http_base("http::addr=localhost:9000;").as_deref(), Ok("http://localhost:9000"));
+        assert_eq!(
+            http_base("http::addr=localhost:9000;").as_deref(),
+            Ok("http://localhost:9000")
+        );
         assert_eq!(
             http_base("https::retry_timeout=1000;addr=db:9000;").as_deref(),
             Ok("https://db:9000")
@@ -314,8 +415,16 @@ mod tests {
 
     #[test]
     fn reads_a_saved_position() {
-        assert_eq!(first_long(&json!({"dataset": [[4096]]})), Some(4096));
-        assert_eq!(first_long(&json!({"dataset": []})), None);
+        assert_eq!(saved_position(&json!({"dataset": [[4096]]})), Ok(4096));
+        assert_eq!(saved_position(&json!({"dataset": []})), Ok(0));
+        for invalid in [
+            json!({}),
+            json!({"dataset": [[null]]}),
+            json!({"dataset": [[-1]]}),
+            json!({"dataset": [[1], [2]]}),
+        ] {
+            assert!(saved_position(&invalid).is_err());
+        }
     }
 
     #[test]
@@ -325,7 +434,7 @@ mod tests {
             ["OTHER", 600_000_000i64, 9, 9, 9, 9, 1, 1, 8],
         ]});
 
-        let candles = saved_candles(&result);
+        let candles = saved_candles(&result).expect("valid candles");
 
         assert_eq!(candles.len(), 2);
         assert_eq!(candles[0].symbol, *b"ITEM\0\0");
@@ -336,18 +445,234 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_candles_are_skipped() {
-        let result = json!({"dataset": [["TOOLONGNAME", 0, 1, 1, 1, 1, 1, 1, 1], ["ITEM", null]]});
-        assert!(saved_candles(&result).is_empty());
+    fn unreadable_saved_candles_block_resume() {
+        for result in [
+            json!({"dataset": [["TOOLONGNAME", 0, 1, 1, 1, 1, 1, 1, 1]]}),
+            json!({"dataset": [["ITEM", null]]}),
+            json!({}),
+        ] {
+            assert!(saved_candles(&result).is_err());
+        }
+        assert!(
+            saved_candles(&json!({"dataset": []}))
+                .expect("no candles yet")
+                .is_empty()
+        );
+    }
+
+    fn applied() -> Value {
+        json!({"dataset": [
+            ["orders", 5, 5], ["trades", 2, 2],
+            ["candles", 2, 2], ["recorder_position", 1, 1],
+            ["unrelated", 1, 9],
+        ]})
     }
 
     #[test]
-    fn tables_are_applied_once_their_transactions_match() {
-        let applied = json!({"dataset": [["orders", 5, 5], ["candles", 2, 2], ["unrelated", 1, 9]]});
-        let pending = json!({"dataset": [["orders", 5, 6]]});
+    fn wal_barrier_requires_every_table_and_sane_transactions() {
+        assert!(wal_applied(&applied()));
+        for invalid in [
+            json!({"dataset": []}),
+            json!({"dataset": [["orders", 5, 5]]}),
+            json!({"error": "nope"}),
+        ] {
+            assert!(!wal_applied(&invalid));
+        }
+        for transactions in [
+            json!([2, 3]),
+            json!([null, 2]),
+            json!([-1, -1]),
+            json!([3, 2]),
+            json!(["2", "2"]),
+        ] {
+            let mut result = applied();
+            result["dataset"][2][1] = transactions[0].clone();
+            result["dataset"][2][2] = transactions[1].clone();
+            assert!(!wal_applied(&result));
+        }
+        let mut duplicate = applied();
+        duplicate["dataset"]
+            .as_array_mut()
+            .expect("rows")
+            .push(json!(["orders", 5, 5]));
+        assert!(!wal_applied(&duplicate));
+    }
 
-        assert!(wal_applied(&applied));
-        assert!(!wal_applied(&pending));
-        assert!(!wal_applied(&json!({"error": "nope"})));
+    #[test]
+    fn sql_errors_are_errors_even_in_successful_http_bodies() {
+        assert!(sql_response(r#"{"error":"invalid query","position":0}"#).is_err());
+        assert!(sql_response("[]").is_err());
+        assert!(sql_response("not json").is_err());
+        assert!(sql_response(r#"{"ddl":"OK"}"#).is_ok());
+        assert!(sql_response(r#"{"dataset":[]}"#).is_ok());
+    }
+
+    #[test]
+    fn resume_retries_error_timeout_and_missing_tables_before_reading_state() {
+        use std::cell::Cell;
+        use std::collections::VecDeque;
+
+        let mut replies = VecDeque::from([
+            (WAL_STATE, Err("WAL query unavailable".to_string())),
+            (WAL_STATE, Ok(json!({"dataset": [["orders", 5, 6]]}))),
+            (WAL_STATE, Ok(json!({"dataset": []}))),
+            (WAL_STATE, Ok(applied())),
+            (SAVED_POSITION, Ok(json!({"dataset": [[4096]]}))),
+            (WAL_STATE, Ok(applied())),
+            (
+                SAVED_CANDLES,
+                Ok(json!({"dataset": [["ITEM", 300_000_000i64, 1, 4, 1, 2, 5, 2, 7]]})),
+            ),
+        ]);
+        let clock = Cell::new(Duration::ZERO);
+        let mut blocked_polls = 0;
+        let (position, _) = resume_until_done(
+            |query| {
+                let (expected, reply) = replies.pop_front().expect("unexpected query");
+                assert_eq!(
+                    query, expected,
+                    "state must not be read before verified WAL"
+                );
+                reply
+            },
+            || clock.get(),
+            |delay| {
+                // A fake clock reaches the attempt deadline without any real sleeping.
+                if delay == Duration::from_millis(100) {
+                    blocked_polls += 1;
+                    clock.set(clock.get() + WAL_WAIT);
+                } else {
+                    clock.set(clock.get() + delay);
+                }
+            },
+        );
+        assert_eq!(position, 4096);
+        assert_eq!(blocked_polls, 2);
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn malformed_durable_state_rechecks_barrier_instead_of_becoming_empty() {
+        use std::collections::VecDeque;
+        let mut replies = VecDeque::from([
+            (WAL_STATE, Ok(applied())),
+            (SAVED_POSITION, Ok(json!({"dataset": [[null]]}))),
+            (WAL_STATE, Ok(applied())),
+            (SAVED_POSITION, Ok(json!({"dataset": [[4096]]}))),
+            (WAL_STATE, Ok(applied())),
+            (SAVED_CANDLES, Ok(json!({"dataset": [["ITEM", null]]}))),
+            (WAL_STATE, Ok(applied())),
+            (SAVED_POSITION, Ok(json!({"dataset": [[4096]]}))),
+            (WAL_STATE, Ok(applied())),
+            (SAVED_CANDLES, Ok(json!({"dataset": []}))),
+        ]);
+        let mut waits = 0;
+        let (position, _) = resume_until_done(
+            |query| {
+                let (expected, reply) = replies.pop_front().expect("unexpected query");
+                assert_eq!(query, expected);
+                reply
+            },
+            || Duration::ZERO,
+            |_| waits += 1,
+        );
+        assert_eq!(position, 4096);
+        assert_eq!(waits, 2);
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn accepted_candle_ahead_of_cursor_replays_without_counting_it_twice() {
+        use sbe::side_enum::SideEnum;
+        use std::collections::VecDeque;
+        // Data through match 2 was accepted before a crash, but the cursor still covers match 1.
+        let mut replies = VecDeque::from([
+            (WAL_STATE, Ok(applied())),
+            (SAVED_POSITION, Ok(json!({"dataset": [[4096]]}))),
+            (WAL_STATE, Ok(applied())),
+            (
+                SAVED_CANDLES,
+                Ok(json!({"dataset": [["ITEM", 300_000_000i64, 100, 100, 100, 100, 5, 2, 2]]})),
+            ),
+        ]);
+        let (_, mut candles) = resume_until_done(
+            |query| {
+                let (expected, reply) = replies.pop_front().expect("unexpected query");
+                assert_eq!(query, expected);
+                reply
+            },
+            || Duration::ZERO,
+            |_| panic!("valid applied state must not wait"),
+        );
+        let trade = |match_id, quantity| ExecutionReportMessage {
+            symbol: *b"ITEM\0\0",
+            exec_type: ExecTypeEnum::Trade,
+            side: SideEnum::Buy,
+            transact_time: 301_000_000_000,
+            trd_match_id: Some(match_id),
+            last_px: 100,
+            last_qty: quantity,
+            ..sample_report()
+        };
+        candles.apply(&trade(2, 3));
+        assert!(
+            candles.take_changed().is_empty(),
+            "accepted replay already counted"
+        );
+        candles.apply(&trade(3, 2));
+        let rows = candles.take_changed();
+        assert_eq!(rows[0].volume, 7);
+        assert_eq!(rows[0].trades, 3);
+        assert!(replies.is_empty());
+    }
+
+    #[test]
+    fn cursor_observed_after_initial_barrier_requires_another_barrier_before_candles() {
+        use std::collections::VecDeque;
+        let mut replies = VecDeque::from([
+            (WAL_STATE, Ok(applied())),
+            (SAVED_POSITION, Ok(json!({"dataset": [[4096]]}))),
+            (WAL_STATE, Ok(json!({"dataset": [["candles", 1, 2]]}))),
+            (WAL_STATE, Ok(applied())),
+            (SAVED_CANDLES, Ok(json!({"dataset": []}))),
+        ]);
+        let mut waits = 0;
+        let (position, _) = resume_until_done(
+            |query| {
+                let (expected, reply) = replies.pop_front().expect("unexpected query");
+                assert_eq!(
+                    query, expected,
+                    "candles must wait for the observed cursor's data"
+                );
+                reply
+            },
+            || Duration::ZERO,
+            |delay| {
+                assert_eq!(delay, Duration::from_millis(100));
+                waits += 1;
+            },
+        );
+        assert_eq!(position, 4096);
+        assert_eq!(waits, 1);
+        assert!(replies.is_empty());
+    }
+    #[test]
+    fn accepted_data_without_any_cursor_replays_from_zero() {
+        let mut calls = Vec::new();
+        let (position, mut candles) = resume_until_done(
+            |query| {
+                calls.push(query.to_string());
+                match query {
+                    WAL_STATE => Ok(applied()),
+                    SAVED_POSITION => Ok(json!({"dataset": []})),
+                    _ => panic!("a missing cursor requires full replay, not saved candle state"),
+                }
+            },
+            || Duration::ZERO,
+            |_| panic!("valid applied state must not wait"),
+        );
+        assert_eq!(position, 0);
+        assert!(candles.take_changed().is_empty());
+        assert_eq!(calls, [WAL_STATE, SAVED_POSITION]);
     }
 }

@@ -24,7 +24,12 @@ pub struct Checkpoint<T> {
 
 impl<T> Checkpoint<T> {
     pub fn new(position: i64, caught_up: bool, state: T) -> Self {
-        Self { version: VERSION, position, caught_up, state }
+        Self {
+            version: VERSION,
+            position,
+            caught_up,
+            state,
+        }
     }
 }
 
@@ -62,7 +67,11 @@ pub fn load<T: DeserializeOwned>(path: &Path) -> Option<Checkpoint<T>> {
     match serde_json::from_slice::<Checkpoint<T>>(&bytes) {
         Ok(checkpoint) if checkpoint.version == VERSION => Some(checkpoint),
         Ok(checkpoint) => {
-            error!("Ignoring {}: version {}", path.display(), checkpoint.version);
+            error!(
+                "Ignoring {}: version {}",
+                path.display(),
+                checkpoint.version
+            );
             None
         }
         Err(e) => {
@@ -142,7 +151,11 @@ mod tests {
     fn another_version_means_no_checkpoint() {
         let dir = TempDir::new();
         save(&dir.file(), &Checkpoint::new(1, false, &1u64)).expect("saves");
-        fs::write(dir.file(), b"{\"version\":0,\"position\":1,\"caught_up\":false,\"state\":1}").expect("writes");
+        fs::write(
+            dir.file(),
+            b"{\"version\":0,\"position\":1,\"caught_up\":false,\"state\":1}",
+        )
+        .expect("writes");
         assert!(load::<u64>(&dir.file()).is_none());
     }
 }

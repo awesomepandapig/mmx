@@ -18,7 +18,9 @@ pub fn parse(text: &str) -> Result<i64, String> {
 
     let too_large = || format!("'{text}' is too large");
     let whole: i64 = whole.parse().map_err(|_| too_large())?;
-    let fraction: i64 = format!("{fraction:0<DECIMALS$}").parse().map_err(|_| too_large())?;
+    let fraction: i64 = format!("{fraction:0<DECIMALS$}")
+        .parse()
+        .map_err(|_| too_large())?;
     whole
         .checked_mul(SCALE)
         .and_then(|value| value.checked_add(fraction))
@@ -57,7 +59,19 @@ mod tests {
 
     #[test]
     fn refuses_what_it_cannot_hold_exactly() {
-        for text in ["", ".", "1.", ".5", "-1", "+1", "1e3", "NaN", "1,5", " 1", "0.000000001"] {
+        for text in [
+            "",
+            ".",
+            "1.",
+            ".5",
+            "-1",
+            "+1",
+            "1e3",
+            "NaN",
+            "1,5",
+            " 1",
+            "0.000000001",
+        ] {
             assert!(parse(text).is_err(), "{text:?} should be refused");
         }
         assert!(parse("92233720368.54775808").is_err());
@@ -82,6 +96,9 @@ mod tests {
 
     #[test]
     fn notional_is_scaled() {
-        assert_eq!(format(notional(parse("3").unwrap(), parse("0.5").unwrap())), "1.5");
+        assert_eq!(
+            format(notional(parse("3").unwrap(), parse("0.5").unwrap())),
+            "1.5"
+        );
     }
 }

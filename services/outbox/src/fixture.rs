@@ -68,7 +68,8 @@ impl Default for Report {
 
 pub fn report(report: Report) -> Vec<u8> {
     let mut slot = vec![0u8; SLOT];
-    let mut encoder = ExecutionReportEncoder::default().wrap(WriteBuf::new(&mut slot), ENCODED_LENGTH);
+    let mut encoder =
+        ExecutionReportEncoder::default().wrap(WriteBuf::new(&mut slot), ENCODED_LENGTH);
     let mut header = encoder.header(0);
     encoder = header.parent().expect("header");
 
@@ -86,7 +87,18 @@ pub fn report(report: Report) -> Vec<u8> {
     let mut time = encoder.transact_time_encoder();
     time.time(1_700_000_000_000_000_000 + report.exec_id);
     encoder = time.parent().expect("time");
-    for (index, value) in [report.price, report.ord_qty, report.last_qty, report.last_px, report.leaves_qty, report.cum_qty, report.last_px].iter().enumerate() {
+    for (index, value) in [
+        report.price,
+        report.ord_qty,
+        report.last_qty,
+        report.last_px,
+        report.leaves_qty,
+        report.cum_qty,
+        report.last_px,
+    ]
+    .iter()
+    .enumerate()
+    {
         let mut decimal = match index {
             0 => encoder.price_encoder(),
             1 => encoder.order_qty_encoder(),
@@ -104,7 +116,8 @@ pub fn report(report: Report) -> Vec<u8> {
 
 pub fn cancel_reject(cl_ord_id: Id, orig_cl_ord_id: Id) -> Vec<u8> {
     let mut slot = vec![0u8; SLOT];
-    let mut encoder = OrderCancelRejectEncoder::default().wrap(WriteBuf::new(&mut slot), ENCODED_LENGTH);
+    let mut encoder =
+        OrderCancelRejectEncoder::default().wrap(WriteBuf::new(&mut slot), ENCODED_LENGTH);
     let mut header = encoder.header(0);
     encoder = header.parent().expect("header");
     encoder.cl_ord_id(&cl_ord_id);
@@ -141,15 +154,41 @@ pub fn tape(rounds: u64) -> Vec<(i64, Vec<u8>)> {
     };
 
     for round in 0..rounds {
-        let buyer = Report { account: [1, round + 1], cl_ord_id: [10, round + 1], side: SideEnum::Buy, ..Report::default() };
-        let seller = Report { account: [2, round + 1], cl_ord_id: [20, round + 1], side: SideEnum::Sell, ord_qty: 4 * QTY, leaves_qty: 4 * QTY, ..Report::default() };
+        let buyer = Report {
+            account: [1, round + 1],
+            cl_ord_id: [10, round + 1],
+            side: SideEnum::Buy,
+            ..Report::default()
+        };
+        let seller = Report {
+            account: [2, round + 1],
+            cl_ord_id: [20, round + 1],
+            side: SideEnum::Sell,
+            ord_qty: 4 * QTY,
+            leaves_qty: 4 * QTY,
+            ..Report::default()
+        };
         let buy_order = next_order();
         let sell_order = next_order();
 
-        frames.push(report(Report { exec_id: next_exec(), order_id: buy_order, ..buyer }));
-        frames.push(report(Report { exec_id: next_exec(), order_id: sell_order, ..seller }));
+        frames.push(report(Report {
+            exec_id: next_exec(),
+            order_id: buy_order,
+            ..buyer
+        }));
+        frames.push(report(Report {
+            exec_id: next_exec(),
+            order_id: sell_order,
+            ..seller
+        }));
 
-        let fill = Report { exec_type: ExecTypeEnum::Trade, match_id: round + 1, last_qty: 4 * QTY, last_px: 100 * QTY, ..Report::default() };
+        let fill = Report {
+            exec_type: ExecTypeEnum::Trade,
+            match_id: round + 1,
+            last_qty: 4 * QTY,
+            last_px: 100 * QTY,
+            ..Report::default()
+        };
         frames.push(report(Report {
             exec_id: next_exec(),
             order_id: sell_order,
@@ -168,7 +207,11 @@ pub fn tape(rounds: u64) -> Vec<(i64, Vec<u8>)> {
             ord_status: OrdStatusEnum::PartiallyFilled,
             leaves_qty: 6 * QTY,
             cum_qty: 4 * QTY,
-            ..Report { account: buyer.account, cl_ord_id: buyer.cl_ord_id, ..fill }
+            ..Report {
+                account: buyer.account,
+                cl_ord_id: buyer.cl_ord_id,
+                ..fill
+            }
         }));
 
         // A repeat of the working buy order, on a full book. Its escrow must stay held.
@@ -208,7 +251,11 @@ pub fn tape(rounds: u64) -> Vec<(i64, Vec<u8>)> {
         }
     }
 
-    frames.into_iter().enumerate().map(|(index, frame)| ((index as i64 + 1) * FRAME_STRIDE, frame)).collect()
+    frames
+        .into_iter()
+        .enumerate()
+        .map(|(index, frame)| ((index as i64 + 1) * FRAME_STRIDE, frame))
+        .collect()
 }
 
 /// One request as the fake game saw it.
@@ -218,6 +265,7 @@ pub struct Request {
     pub body: Vec<u8>,
     /// Whether the game applied the events, whatever it answered.
     pub accepted: bool,
+    pub received_at: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -228,6 +276,9 @@ struct GameState {
     /// committing or the answer was lost.
     lose_answer_next: AtomicUsize,
     redirect_next: AtomicUsize,
+    retry_next: AtomicUsize,
+    retry_status: AtomicUsize,
+    retry_after: Mutex<String>,
 }
 
 /// A webhook endpoint on an ephemeral port.
@@ -257,7 +308,12 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Option<Request> {
     let length: usize = headers.get("content-length")?.parse().ok()?;
     let mut body = vec![0; length];
     reader.read_exact(&mut body).ok()?;
-    Some(Request { headers, body, accepted: false })
+    Some(Request {
+        headers,
+        body,
+        accepted: false,
+        received_at: std::time::Instant::now(),
+    })
 }
 
 fn take(counter: &AtomicUsize) -> bool {
@@ -280,7 +336,16 @@ fn serve_connection(stream: TcpStream, state: &GameState) {
             state.requests.lock().expect("requests").push(request);
             return;
         }
-        let answer: &[u8] = if take(&state.fail_next) {
+        let retry = take(&state.retry_next).then(|| {
+            format!(
+                "HTTP/1.1 {} Retry\r\nRetry-After: {}\r\nContent-Length: 0\r\n\r\n",
+                state.retry_status.load(Ordering::SeqCst),
+                state.retry_after.lock().expect("retry hint")
+            )
+        });
+        let answer: &[u8] = if let Some(answer) = &retry {
+            answer.as_bytes()
+        } else if take(&state.fail_next) {
             b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
         } else if take(&state.redirect_next) {
             b"HTTP/1.1 301 Moved Permanently\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n"
@@ -298,7 +363,10 @@ fn serve_connection(stream: TcpStream, state: &GameState) {
 impl FakeGame {
     pub fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
-        let url = format!("http://{}/webhook", listener.local_addr().expect("local address"));
+        let url = format!(
+            "http://{}/webhook",
+            listener.local_addr().expect("local address")
+        );
         let state = Arc::new(GameState::default());
         let accepting = Arc::clone(&state);
         std::thread::spawn(move || {
@@ -322,6 +390,14 @@ impl FakeGame {
         self.state.redirect_next.store(count, Ordering::SeqCst);
     }
 
+    pub fn retry_next(&self, count: usize, status: u16, after: &str) {
+        *self.state.retry_after.lock().expect("retry hint") = after.to_string();
+        self.state
+            .retry_status
+            .store(usize::from(status), Ordering::SeqCst);
+        self.state.retry_next.store(count, Ordering::SeqCst);
+    }
+
     pub fn requests(&self) -> Vec<Request> {
         self.state.requests.lock().expect("requests").clone()
     }
@@ -332,7 +408,8 @@ impl FakeGame {
             .iter()
             .filter(|request| request.accepted)
             .flat_map(|request| {
-                let body: serde_json::Value = serde_json::from_slice(&request.body).expect("a JSON body");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request.body).expect("a JSON body");
                 body["events"].as_array().expect("an events array").clone()
             })
             .collect()
@@ -346,7 +423,8 @@ impl TestDir {
     pub fn new(name: &str) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let unique = NEXT.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("outbox-{name}-{}-{unique}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("outbox-{name}-{}-{unique}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create the test directory");
         Self(dir)

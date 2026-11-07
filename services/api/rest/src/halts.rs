@@ -59,7 +59,10 @@ pub trait HaltStore: Send + Sync {
 
 fn snapshot(mut fields: HashMap<String, String>) -> Snapshot {
     let epoch = fields.remove(EPOCH_FIELD);
-    Snapshot { epoch, halted: fields.into_keys().collect() }
+    Snapshot {
+        epoch,
+        halted: fields.into_keys().collect(),
+    }
 }
 
 pub struct ValkeyHalts {
@@ -68,17 +71,25 @@ pub struct ValkeyHalts {
 
 impl ValkeyHalts {
     pub fn new(url: &str) -> Result<Self, String> {
-        Ok(Self { link: ValkeyLink::new(url)? })
+        Ok(Self {
+            link: ValkeyLink::new(url)?,
+        })
     }
 
     async fn limited<T>(call: impl Future<Output = Result<T, String>>) -> Result<T, String> {
-        timeout(CHECK_TIMEOUT, call).await.map_err(|_| "timed out".to_string()).and_then(|result| result)
+        timeout(CHECK_TIMEOUT, call)
+            .await
+            .map_err(|_| "timed out".to_string())
+            .and_then(|result| result)
     }
 
     async fn run<T: redis::FromRedisValue>(&self, command: redis::Cmd) -> Result<T, String> {
         Self::limited(async {
             let mut connection = self.link.connection().await?;
-            command.query_async(&mut connection).await.map_err(|err| err.to_string())
+            command
+                .query_async(&mut connection)
+                .await
+                .map_err(|err| err.to_string())
         })
         .await
     }
@@ -132,7 +143,10 @@ struct State {
 
 /// Folds a read into the state. Returns an epoch to claim if the list has none.
 fn apply(state: &mut State, snapshot: Snapshot) -> Option<String> {
-    let Snapshot { epoch, halted: mut shared } = snapshot;
+    let Snapshot {
+        epoch,
+        halted: mut shared,
+    } = snapshot;
 
     // Nothing changes yet. The new epoch makes the next read restore what this gateway knows.
     let Some(epoch) = epoch else {
@@ -177,7 +191,10 @@ impl Halts {
             changes: 0,
             store_healthy: true,
         };
-        Self { store, state: RwLock::new(state) }
+        Self {
+            store,
+            state: RwLock::new(state),
+        }
     }
 
     fn read_state(&self) -> RwLockReadGuard<'_, State> {
@@ -259,7 +276,9 @@ impl Halts {
                 error!("Halts: Valkey is unreachable, keeping {halted:?}: {err}");
             }
             (Err(err), None) if was_healthy => {
-                error!("Halts: Valkey is unreachable and no halt list was ever read, so new orders are refused: {err}");
+                error!(
+                    "Halts: Valkey is unreachable and no halt list was ever read, so new orders are refused: {err}"
+                );
             }
             (Ok(()), _) if !was_healthy => info!("Halts: Valkey is reachable again"),
             _ => {}
@@ -333,7 +352,11 @@ pub mod testing {
         }
 
         fn up(&self) -> Result<(), String> {
-            if self.down.load(Ordering::Relaxed) { Err("down".to_string()) } else { Ok(()) }
+            if self.down.load(Ordering::Relaxed) {
+                Err("down".to_string())
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -346,13 +369,21 @@ pub mod testing {
 
         async fn claim_epoch(&self, epoch: &str) -> Result<(), String> {
             self.up()?;
-            self.snapshot.lock().unwrap().epoch.get_or_insert_with(|| epoch.to_string());
+            self.snapshot
+                .lock()
+                .unwrap()
+                .epoch
+                .get_or_insert_with(|| epoch.to_string());
             Ok(())
         }
 
         async fn halt(&self, symbol: &str) -> Result<(), String> {
             self.up()?;
-            self.snapshot.lock().unwrap().halted.insert(symbol.to_string());
+            self.snapshot
+                .lock()
+                .unwrap()
+                .halted
+                .insert(symbol.to_string());
             Ok(())
         }
 
@@ -473,11 +504,19 @@ mod tests {
 
         store.set_down(true);
         assert!(mine.halt("ITEM").await.is_err());
-        assert_eq!(mine.check("ITEM"), Err(Refusal::Halted), "in force here regardless");
+        assert_eq!(
+            mine.check("ITEM"),
+            Err(Refusal::Halted),
+            "in force here regardless"
+        );
 
         store.set_down(false);
         mine.refresh().await;
-        assert_eq!(mine.check("ITEM"), Err(Refusal::Halted), "a read of the old list mustn't reopen it");
+        assert_eq!(
+            mine.check("ITEM"),
+            Err(Refusal::Halted),
+            "a read of the old list mustn't reopen it"
+        );
         assert!(store.holds("ITEM"));
         other.refresh().await;
         assert_eq!(other.check("ITEM"), Err(Refusal::Halted));
@@ -617,7 +656,11 @@ mod tests {
         assert_eq!(mine.check("ITEM"), Ok(()));
         let epoch = store.read().await.unwrap().epoch.unwrap();
         store.claim_epoch("late").await.unwrap();
-        assert_eq!(store.read().await.unwrap().epoch.unwrap(), epoch, "the first claim wins");
+        assert_eq!(
+            store.read().await.unwrap().epoch.unwrap(),
+            epoch,
+            "the first claim wins"
+        );
 
         mine.halt("ITEM").await.unwrap();
         other.refresh().await;
@@ -626,8 +669,15 @@ mod tests {
         let _: i64 = wipe().query_async(&mut admin).await.unwrap();
         mine.refresh().await;
         mine.refresh().await;
-        assert_eq!(mine.check("ITEM"), Err(Refusal::Halted), "survives losing the hash");
-        assert!(store.read().await.unwrap().halted.contains("ITEM"), "and restores it");
+        assert_eq!(
+            mine.check("ITEM"),
+            Err(Refusal::Halted),
+            "survives losing the hash"
+        );
+        assert!(
+            store.read().await.unwrap().halted.contains("ITEM"),
+            "and restores it"
+        );
 
         other.resume("ITEM").await.unwrap();
         mine.refresh().await;
@@ -642,7 +692,11 @@ mod tests {
         let started = std::time::Instant::now();
         halts.refresh().await;
         assert_eq!(halts.check("ITEM"), Err(Refusal::Unknown));
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

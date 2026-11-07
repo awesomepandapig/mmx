@@ -15,7 +15,7 @@ context=${CONTEXT:-/tmp/mmx-image-context}
 
 rm -rf "$context"
 mkdir -p "$context"
-git ls-files -z --cached --others --exclude-standard | rsync -a --from0 --files-from=- ./ "$context/"
+git ls-files -z --cached --others --exclude-standard | python3 -c 'import os,sys; sys.stdout.buffer.write(b"\0".join(p for p in sys.stdin.buffer.read().split(b"\0") if p and os.path.isfile(p)) + b"\0")' | rsync -a --from0 --files-from=- ./ "$context/"
 
 # BuildKit sets this under Bake, but `container build` doesn't, and the toolchain stage needs it.
 case "$(uname -m)" in
@@ -40,14 +40,17 @@ for image in "$@"; do
         node | matching-engine | tools)
             build "$image" --target "$image"
             ;;
-        web | docs)
-            build "$image" --target remix --build-arg "APP=$image"
+        web)
+            build web --target remix --build-arg APP=web
+            ;;
+        docs)
+            build docs --target docs --build-arg APP=docs --build-arg "DOCS_BASE_URL=${DOCS_BASE_URL:-https://docs.mmx.exchange}"
             ;;
         auth)
             build auth --target auth --build-arg APP=auth
             ;;
         observer)
-            build observer --target service --build-arg SERVICE=sbx-observer
+            build observer --target service --build-arg SERVICE=mmx-observer
             ;;
         *)
             build "$image" --target service --build-arg "SERVICE=$image"

@@ -94,7 +94,9 @@ pub fn validate_order(
             price
         }
         (_, Some(_)) => {
-            return Err(validation_error("Price should not be provided for market orders."));
+            return Err(validation_error(
+                "Price should not be provided for market orders.",
+            ));
         }
         (_, None) => i64::MIN, // Sentinel for market orders or when price is not applicable
     };
@@ -139,11 +141,16 @@ markets:
   - {symbol: ITEM, tick_size: "0.05", min_size: "1", max_size: "100"}
 "#;
 
-    const RULES: OrderIdRules =
-        OrderIdRules { window: Duration::from_secs(60), session_timeout: Duration::from_secs(30) };
+    const RULES: OrderIdRules = OrderIdRules {
+        window: Duration::from_secs(60),
+        session_timeout: Duration::from_secs(30),
+    };
 
     fn now_ms() -> u64 {
-        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
     }
 
     fn limit(price: &str, size: &str) -> CreateOrder {
@@ -173,27 +180,47 @@ markets:
 
     #[test]
     fn refuses_a_price_off_the_tick() {
-        assert!(check(&limit("1.01", "2")).unwrap_err().contains("tick size, 0.05"));
+        assert!(
+            check(&limit("1.01", "2"))
+                .unwrap_err()
+                .contains("tick size, 0.05")
+        );
     }
 
     #[test]
     fn the_account_is_the_player() {
         let player = Player(Uuid::new_v4());
         let markets = Markets::parse(MARKETS).unwrap();
-        let order = validate_order(&limit("1", "1"), player, &markets, Some(&RULES), now_ms()).unwrap();
+        let order =
+            validate_order(&limit("1", "1"), player, &markets, Some(&RULES), now_ms()).unwrap();
         assert_eq!(order.account, uuid_to_u64s(player.0));
     }
 
     #[test]
     fn enforces_size_bounds() {
-        assert!(check(&limit("1", "0.5")).unwrap_err().contains("at least 1"));
-        assert!(check(&limit("1", "100.5")).unwrap_err().contains("at most 100"));
+        assert!(
+            check(&limit("1", "0.5"))
+                .unwrap_err()
+                .contains("at least 1")
+        );
+        assert!(
+            check(&limit("1", "100.5"))
+                .unwrap_err()
+                .contains("at most 100")
+        );
         assert!(check(&limit("1", "100")).is_ok());
     }
 
     #[test]
     fn refuses_zero_and_malformed_decimals() {
-        for (price, size) in [("0", "1"), ("1", "0"), ("-1", "1"), ("1", "-1"), ("1e2", "1"), ("1", "x")] {
+        for (price, size) in [
+            ("0", "1"),
+            ("1", "0"),
+            ("-1", "1"),
+            ("1", "-1"),
+            ("1e2", "1"),
+            ("1", "x"),
+        ] {
             assert!(check(&limit(price, size)).is_err(), "{price} {size}");
         }
     }
@@ -209,7 +236,11 @@ markets:
     fn market_orders_have_no_price() {
         let mut order = limit("1", "1");
         order.r#type = "market".to_string();
-        assert!(check(&order).unwrap_err().contains("should not be provided"));
+        assert!(
+            check(&order)
+                .unwrap_err()
+                .contains("should not be provided")
+        );
         order.price = None;
         assert_eq!(check(&order).unwrap().price_mantissa, i64::MIN);
     }

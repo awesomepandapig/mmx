@@ -156,7 +156,7 @@ impl LocalStore {
         Ok(Doc::new(data, revision))
     }
 
-    /// What `sbx.py` gives the outbox on its next start, because the outbox only reads its
+    /// What `mmx.py` gives the outbox on its next start, because the outbox only reads its
     /// environment. It's written whole, so a half-configured webhook can't look complete.
     fn write_outbox_env(&self, config: &Data, secrets: &Data) -> io::Result<()> {
         let (Some(url), Some(secret)) =
@@ -417,6 +417,57 @@ pub enum ConfigStore {
 }
 
 impl ConfigStore {
+    pub async fn restart_outbox(&self, kind: &str, deployment: &str) -> Result<(), StoreError> {
+        let Self::Kube(store) = self else {
+            return Err(StoreError::Failed(
+                "The local store does not supervise processes. Run `mmx local restart outbox` for Docker Compose, or restart mmx-outbox with your service manager.".to_string(),
+            ));
+        };
+        if deployment.is_empty()
+            || !deployment
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'.')
+        {
+            return Err(StoreError::Failed(
+                "Invalid outbox Deployment name".to_string(),
+            ));
+        }
+        let resource = match kind {
+            "deployment" => "deployments",
+            "statefulset" => "statefulsets",
+            _ => {
+                return Err(StoreError::Failed(
+                    "Invalid outbox workload kind".to_string(),
+                ));
+            }
+        };
+        let url = format!(
+            "{}/apis/apps/v1/namespaces/{}/{resource}/{deployment}",
+            store.api, store.namespace
+        );
+        let patch = json!({ "spec": { "template": { "metadata": { "annotations": {
+            "mmx.exchange/restart-id": uuid::Uuid::new_v4().to_string()
+        }}}}});
+        let response = store
+            .authorized(
+                store
+                    .http
+                    .patch(url)
+                    .header("content-type", "application/merge-patch+json")
+                    .json(&patch),
+            )?
+            .send()
+            .await
+            .map_err(|err| StoreError::Failed(err.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(StoreError::Failed(format!(
+                "Restarting outbox Deployment {deployment}: HTTP {status}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn info(&self) -> StoreInfo {
         match self {
             Self::Local(store) => StoreInfo {

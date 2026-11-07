@@ -28,7 +28,19 @@ pub enum AdminCommand {
     TapeSwept { position: i64 },
 }
 
+pub const fn block_length(template: u16) -> Option<u16> {
+    match template {
+        REBUILD_TEMPLATE => Some(16),
+        CANCEL_ALL_TEMPLATE => Some(0),
+        TAPE_SWEPT_TEMPLATE => Some(8),
+        _ => None,
+    }
+}
+
 pub const fn is_admin(message: &[u8]) -> bool {
+    if message.len() < HEADER_LENGTH {
+        return false;
+    }
     let template = u16::from_le_bytes([message[2], message[3]]);
     template >= REBUILD_TEMPLATE && template <= TAPE_SWEPT_TEMPLATE
 }
@@ -52,19 +64,30 @@ impl AdminCommand {
     pub fn decode(message: &[u8]) -> Option<Self> {
         let value = |index: usize| {
             let at = HEADER_LENGTH + index * 8;
-            Some(i64::from_le_bytes(message.get(at..at + 8)?.try_into().ok()?))
+            Some(i64::from_le_bytes(
+                message.get(at..at + 8)?.try_into().ok()?,
+            ))
         };
         match u16::from_le_bytes([*message.get(2)?, *message.get(3)?]) {
-            REBUILD_TEMPLATE => Some(Self::Rebuild { expected: value(0)?, position: value(1)? }),
+            REBUILD_TEMPLATE => Some(Self::Rebuild {
+                expected: value(0)?,
+                position: value(1)?,
+            }),
             CANCEL_ALL_TEMPLATE => Some(Self::CancelAll),
-            TAPE_SWEPT_TEMPLATE => Some(Self::TapeSwept { position: value(0)? }),
+            TAPE_SWEPT_TEMPLATE => Some(Self::TapeSwept {
+                position: value(0)?,
+            }),
             _ => None,
         }
     }
 }
 
 fn parse(args: &[String]) -> Result<AdminCommand, String> {
-    let position = |value: &String| value.parse::<i64>().map_err(|_| format!("{value} isn't a position"));
+    let position = |value: &String| {
+        value
+            .parse::<i64>()
+            .map_err(|_| format!("{value} isn't a position"))
+    };
     match args {
         [command, expected, target] if command == "rebuild" => {
             Ok(AdminCommand::Rebuild { expected: position(expected)?, position: position(target)? })
@@ -84,12 +107,20 @@ fn on_error(code: i32, message: &str) {
 }
 
 fn send(command: AdminCommand) -> Result<(), String> {
-    let endpoints: Vec<String> =
-        required("CLUSTER_INGRESS_ENDPOINTS")?.split(',').map(str::to_string).collect();
+    let endpoints: Vec<String> = required("CLUSTER_INGRESS_ENDPOINTS")?
+        .split(',')
+        .map(str::to_string)
+        .collect();
     let response_channel = required("CLUSTER_RESPONSE_CHANNEL")?;
     let aeron = transport::connect(on_error).map_err(|error| format!("{error:?}"))?;
-    let mut client = ClusterClient::connect(&aeron, &endpoints, INGRESS_STREAM, &response_channel, EGRESS_STREAM)
-        .map_err(|error| format!("{error:?}"))?;
+    let mut client = ClusterClient::connect(
+        &aeron,
+        &endpoints,
+        INGRESS_STREAM,
+        &response_channel,
+        EGRESS_STREAM,
+    )
+    .map_err(|error| format!("{error:?}"))?;
 
     let message = command.encode();
     let deadline = Instant::now() + OFFER_DEADLINE;
@@ -120,7 +151,10 @@ mod tests {
     #[test]
     fn commands_survive_the_wire() {
         for command in [
-            AdminCommand::Rebuild { expected: 192, position: 1_920 },
+            AdminCommand::Rebuild {
+                expected: 192,
+                position: 1_920,
+            },
             AdminCommand::CancelAll,
             AdminCommand::TapeSwept { position: 384 },
         ] {
@@ -132,7 +166,11 @@ mod tests {
 
     #[test]
     fn block_length_lets_a_batch_step_over_a_command() {
-        let message = AdminCommand::Rebuild { expected: 1, position: 2 }.encode();
+        let message = AdminCommand::Rebuild {
+            expected: 1,
+            position: 2,
+        }
+        .encode();
         let block_length = usize::from(u16::from_le_bytes([message[0], message[1]]));
         assert_eq!(HEADER_LENGTH + block_length, message.len());
     }
@@ -145,7 +183,11 @@ mod tests {
 
     #[test]
     fn a_truncated_command_decodes_to_nothing() {
-        let message = AdminCommand::Rebuild { expected: 1, position: 2 }.encode();
+        let message = AdminCommand::Rebuild {
+            expected: 1,
+            position: 2,
+        }
+        .encode();
         assert_eq!(AdminCommand::decode(&message[..message.len() - 1]), None);
     }
 
@@ -153,10 +195,16 @@ mod tests {
     fn the_command_line_parses_each_command() {
         assert_eq!(
             parse(&args(&["rebuild", "192", "1920"])),
-            Ok(AdminCommand::Rebuild { expected: 192, position: 1_920 })
+            Ok(AdminCommand::Rebuild {
+                expected: 192,
+                position: 1_920
+            })
         );
         assert_eq!(parse(&args(&["cancel-all"])), Ok(AdminCommand::CancelAll));
-        assert_eq!(parse(&args(&["tape-swept", "384"])), Ok(AdminCommand::TapeSwept { position: 384 }));
+        assert_eq!(
+            parse(&args(&["tape-swept", "384"])),
+            Ok(AdminCommand::TapeSwept { position: 384 })
+        );
     }
 
     #[test]

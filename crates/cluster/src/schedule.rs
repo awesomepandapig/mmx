@@ -18,13 +18,19 @@ pub(crate) struct SnapshotSchedule {
 
 impl SnapshotSchedule {
     pub(crate) const fn new(policy: SnapshotPolicy, log_position: i64, cluster_time: i64) -> Self {
-        Self { policy, last_position: log_position, last_time: cluster_time }
+        Self {
+            policy,
+            last_position: log_position,
+            last_time: cluster_time,
+        }
     }
 
     pub(crate) const fn is_due(&self, log_position: i64, cluster_time: i64) -> bool {
         let grown = log_position - self.last_position;
         let by_size = self.policy.log_bytes > 0 && grown >= self.policy.log_bytes;
-        let by_time = self.policy.interval > 0 && grown > 0 && cluster_time - self.last_time >= self.policy.interval;
+        let by_time = self.policy.interval > 0
+            && grown > 0
+            && cluster_time - self.last_time >= self.policy.interval;
         by_size || by_time
     }
 
@@ -41,7 +47,14 @@ mod tests {
     use super::*;
 
     fn schedule(log_bytes: i64, interval: i64) -> SnapshotSchedule {
-        SnapshotSchedule::new(SnapshotPolicy { log_bytes, interval }, 1_000, 5_000)
+        SnapshotSchedule::new(
+            SnapshotPolicy {
+                log_bytes,
+                interval,
+            },
+            1_000,
+            5_000,
+        )
     }
 
     #[test]

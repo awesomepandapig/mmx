@@ -86,7 +86,8 @@ mod tests {
     }
 
     fn id_at(ms: u64) -> Uuid {
-        let time = uuid::Timestamp::from_unix(uuid::NoContext, ms / 1000, (ms % 1000) as u32 * 1_000_000);
+        let time =
+            uuid::Timestamp::from_unix(uuid::NoContext, ms / 1000, (ms % 1000) as u32 * 1_000_000);
         Uuid::new_v7(time)
     }
 
@@ -128,7 +129,10 @@ mod tests {
     #[test]
     fn a_claim_outlives_every_id_that_could_repeat_it() {
         for window in [1, 60, 3600] {
-            let rules = OrderIdRules { window: Duration::from_secs(window), ..rules() };
+            let rules = OrderIdRules {
+                window: Duration::from_secs(window),
+                ..rules()
+            };
             assert!(rules.claim_ttl() >= rules.window + FUTURE_SKEW);
             assert!(rules.recovery_hold() >= rules.window + FUTURE_SKEW);
         }

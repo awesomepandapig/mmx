@@ -13,7 +13,7 @@ if [ -n "${AERON_DIR:-}" ]; then
 fi
 
 # Environment variables can't do arithmetic, so a member's ports are worked out here. The offsets
-# match tools/scripts/cluster.py, and the sbx-cluster-* tools depend on them.
+# match tools/scripts/cluster.py, and the mmx-cluster-* tools depend on them.
 if [ -n "${CLUSTER_ID:-}" ] && [ -n "${CLUSTER_NAME:-}" ]; then
     id=$(node_id)
     me=$(member_host "$id")

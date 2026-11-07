@@ -1,0 +1,61 @@
+# Optional peak-throughput profile. Prepare static CPU management and Linux socket buffers first.
+cluster:
+  guaranteed: true
+  pinThreads: true
+  leaderHeartbeatTimeout: 500ms
+  electionTimeout: 500ms
+  threadingMode: DEDICATED
+  idleStrategy: org.agrona.concurrent.BusySpinIdleStrategy
+  sparseTermBuffers: false
+  socketBuffer: 4m
+  sharedMemory:
+    sizeLimit: 4Gi
+  persistence:
+    size: 200Gi
+  node:
+    heapMin: 512m
+    heapMax: 2g
+    resources:
+      cpu: "6"
+      memory: 8Gi
+  engine:
+    maxOrders: 1000000
+    reportTermLength: 64m
+    resources:
+      cpu: "2"
+      memory: 3Gi
+driver:
+  heapMax: 256m
+  socketBuffer: 4m
+  resources:
+    cpu: 500m
+    memory: 1536Mi
+gateway:
+  sharedMemory:
+    sizeLimit: 2Gi
+  resources:
+    cpu: "1"
+    memory: 512Mi
+consumers:
+  market-data:
+    persistence:
+      size: 5Gi
+    resources:
+      cpu: "3"
+      memory: 1536Mi
+  trade-reporter:
+    resources:
+      cpu: "1"
+      memory: 512Mi
+  outbox:
+    persistence:
+      size: 20Gi
+    resources:
+      cpu: "1"
+      memory: 1Gi
+questdb:
+  persistence:
+    size: 50Gi
+  resources:
+    cpu: "2"
+    memory: 4Gi

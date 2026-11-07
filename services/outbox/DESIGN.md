@@ -114,6 +114,22 @@ Comparing positions alone isn't enough to rebuild safely. Frames between the tap
 without them could fill those orders again. `GET /journal?from=<tape end>&limit=<n>` returns exactly those
 frames, in the journal format described in `src/journal.rs`, and the book rebuild has to apply them.
 
+Exports are paginated: `limit` must be between 1 and 10,000 (default 10,000), and each response holds
+at most 1 MiB of complete records. Continue with `from` equal to the last returned record's position;
+a short page does not prove the durable journal has ended. Invalid/repeated arguments return 400.
+Two exports may be assembled concurrently, within a 16-connection server limit; excess exports
+return 503, and excess connections close. Socket reads/writes have timeouts. Export scans still start
+at the journal's beginning, so large-history seek performance remains an optimization to measure.
+
+Webhook batches default to 100 events and must contain between 1 and 10,000. Malformed explicit
+numeric settings refuse startup. Delivery honors valid `Retry-After` seconds or HTTP-date hints on
+non-success responses, including 429 and 503; the receiver's wait is not shortened by the local
+30-second exponential-backoff cap. Waiting can be interrupted by stop or a safety halt, and no failed
+attempt advances the delivery cursor. Event bodies/IDs remain identical across attempts. Sender
+panics or unexpected termination stop the process rather than leave a ready process without delivery.
+This does not implement poison-batch pausing, rate limiting, replication, or corruption repair.
+The supported header forms follow [RFC 9110, section 10.2.3](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3).
+
 Both endpoints are unauthenticated and `/journal` exposes trades, so keep the port inside the cluster.
 
 ## Replication

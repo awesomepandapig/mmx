@@ -61,7 +61,10 @@ pub type OrderKey = (UuidType, UuidType);
 pub enum EngineRequest {
     New(OrderKey),
     /// `cancel_id` is this attempt's own ID, which the engine echoes in a reject.
-    Cancel { order: OrderKey, cancel_id: UuidType },
+    Cancel {
+        order: OrderKey,
+        cancel_id: UuidType,
+    },
 }
 
 pub struct OutboundOrder {
@@ -124,7 +127,10 @@ pub fn spawn_order_publisher(
                     return;
                 }
             };
-            info!("Aeron: Created publication {} on stream {}", channel, stream_id);
+            info!(
+                "Aeron: Created publication {} on stream {}",
+                channel, stream_id
+            );
 
             loop {
                 link.set(publication.is_connected());

@@ -100,7 +100,10 @@ pub enum Frame {
     TermMarker,
     Execution(Box<Execution>),
     /// Spends an exec ID but doesn't carry it, and names no account.
-    CancelReject { cl_ord_id: Id, orig_cl_ord_id: Id },
+    CancelReject {
+        cl_ord_id: Id,
+        orig_cl_ord_id: Id,
+    },
     Unknown(u16),
 }
 
@@ -155,12 +158,17 @@ pub fn decode(buffer: &[u8]) -> Frame {
     let Some(template_id) = template_id(buffer) else {
         return Frame::Unknown(0);
     };
-    let header: MessageHeaderDecoder<ReadBuf<'_>> = MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
+    let header: MessageHeaderDecoder<ReadBuf<'_>> =
+        MessageHeaderDecoder::default().wrap(ReadBuf::new(buffer), 0);
 
     match template_id {
         TERM_MARKER_TEMPLATE => Frame::TermMarker,
-        execution_report_codec::SBE_TEMPLATE_ID if buffer.len() >= ENCODED_LENGTH + execution_report_codec::SBE_BLOCK_LENGTH as usize => {
-            let report: ExecutionReportDecoder<'_> = ExecutionReportDecoder::default().header(header, 0);
+        execution_report_codec::SBE_TEMPLATE_ID
+            if buffer.len()
+                >= ENCODED_LENGTH + execution_report_codec::SBE_BLOCK_LENGTH as usize =>
+        {
+            let report: ExecutionReportDecoder<'_> =
+                ExecutionReportDecoder::default().header(header, 0);
             Frame::Execution(Box::new(Execution {
                 exec_id: report.exec_id(),
                 order_id: report.order_id(),
@@ -168,7 +176,9 @@ pub fn decode(buffer: &[u8]) -> Frame {
                 ord_status: ord_status(report.ord_status()),
                 reject_reason: reject_reason(report.ord_rej_reason()),
                 side: side(report.side()),
-                symbol: String::from_utf8_lossy(&report.symbol()).trim_end_matches('\0').to_string(),
+                symbol: String::from_utf8_lossy(&report.symbol())
+                    .trim_end_matches('\0')
+                    .to_string(),
                 account: report.account(),
                 cl_ord_id: report.cl_ord_id(),
                 transact_time: report.transact_time_decoder().time(),
@@ -182,9 +192,16 @@ pub fn decode(buffer: &[u8]) -> Frame {
                 match_id: report.trd_match_id(),
             }))
         }
-        order_cancel_reject_codec::SBE_TEMPLATE_ID if buffer.len() >= ENCODED_LENGTH + order_cancel_reject_codec::SBE_BLOCK_LENGTH as usize => {
-            let reject: OrderCancelRejectDecoder<'_> = OrderCancelRejectDecoder::default().header(header, 0);
-            Frame::CancelReject { cl_ord_id: reject.cl_ord_id(), orig_cl_ord_id: reject.orig_cl_ord_id() }
+        order_cancel_reject_codec::SBE_TEMPLATE_ID
+            if buffer.len()
+                >= ENCODED_LENGTH + order_cancel_reject_codec::SBE_BLOCK_LENGTH as usize =>
+        {
+            let reject: OrderCancelRejectDecoder<'_> =
+                OrderCancelRejectDecoder::default().header(header, 0);
+            Frame::CancelReject {
+                cl_ord_id: reject.cl_ord_id(),
+                orig_cl_ord_id: reject.orig_cl_ord_id(),
+            }
         }
         template_id => Frame::Unknown(template_id),
     }

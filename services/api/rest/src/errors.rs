@@ -31,16 +31,24 @@ pub enum AppError {
     /// The claim couldn't be confirmed, so the order wasn't sent.
     ClaimUnavailable(Uuid),
     /// The claim store lost its data, so new orders wait until no lost claim can matter.
-    ClaimsRecovering { id: Uuid, retry_after_ms: u64 },
+    ClaimsRecovering {
+        id: Uuid,
+        retry_after_ms: u64,
+    },
     OrderOutcomeUnknown(Uuid),
-    RateLimited { retry_after_ms: u64 },
+    RateLimited {
+        retry_after_ms: u64,
+    },
     /// The recorder hasn't caught up, so a check that relies on it can't be trusted yet.
     RecorderBehind,
     OrderNotFound,
     /// The markets file wasn't applied, and the gateway keeps the markets it had.
     MarketsNotReloaded(String),
     /// Operators stopped this market. Nothing reached the engine, so any escrow can be released.
-    MarketHalted { symbol: String, id: Uuid },
+    MarketHalted {
+        symbol: String,
+        id: Uuid,
+    },
     /// This gateway has never read the halt list, so it can't tell whether the market is open.
     HaltStateUnknown,
     /// `MMX_ADMIN_TOKEN` isn't set.
@@ -71,7 +79,13 @@ struct ErrorBody {
 }
 
 fn body(status: StatusCode, code: &'static str, message: impl Into<String>) -> ErrorBody {
-    ErrorBody { status, code, message: message.into(), details: None, id: None }
+    ErrorBody {
+        status,
+        code,
+        message: message.into(),
+        details: None,
+        id: None,
+    }
 }
 
 impl ErrorBody {
@@ -90,7 +104,8 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let retry_after = match &self {
             // Retry-After is in whole seconds, so round up.
-            AppError::RateLimited { retry_after_ms } | AppError::ClaimsRecovering { retry_after_ms, .. } => {
+            AppError::RateLimited { retry_after_ms }
+            | AppError::ClaimsRecovering { retry_after_ms, .. } => {
                 Some(retry_after_ms.div_ceil(1000).max(1))
             }
             _ => None,
@@ -201,7 +216,9 @@ impl IntoResponse for AppError {
 
         let mut reply = (response.status, payload).into_response();
         if let Some(seconds) = retry_after {
-            reply.headers_mut().insert(RETRY_AFTER, HeaderValue::from(seconds));
+            reply
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
         }
         reply
     }

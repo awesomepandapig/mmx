@@ -6,7 +6,9 @@ mod client;
 mod console;
 mod decimal;
 mod events;
+mod feed;
 mod markets;
+mod monitor;
 mod oidc;
 mod output;
 mod server;
@@ -25,6 +27,7 @@ use server::AppState;
 use store::{ConfigStore, KubeStore, LocalStore};
 use upstream::{Targets, Upstreams};
 
+use std::collections::HashMap;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -34,14 +37,13 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 use uuid::Uuid;
 
 const DEFAULT_URL: &str = "http://127.0.0.1:8093";
 const TOKEN_ENV: &str = "MMX_ADMIN_TOKEN";
 const PASSWORD_ENV: &str = "MMX_ADMIN_PASSWORD";
-const LOCAL_OUTBOX_RESTART: &str = "tools/scripts/sbx.py restart outbox";
 const NATS_PORT: u16 = 4222;
 const VALKEY_PORT: u16 = 6379;
 
@@ -116,6 +118,10 @@ struct Services {
     #[arg(long, global = true, env = "VALKEY_URL", hide_env_values = true)]
     valkey: Option<String>,
 
+    /// The websocket service's address. Left out, it isn't listed
+    #[arg(long, global = true, env = "MMX_WEBSOCKET_URL")]
+    websocket: Option<String>,
+
     /// The markets file, which must be the one gateways read
     #[arg(
         long,
@@ -128,8 +134,18 @@ struct Services {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage the local exchange with Docker Compose
+    Local {
+        /// Compose manifest installed with MMX, or the repository manifest
+        #[arg(long, env = "MMX_COMPOSE_FILE")]
+        file: Option<PathBuf>,
+        #[command(subcommand)]
+        command: LocalCommand,
+    },
     /// Run the control-plane server
     Serve(ServeArgs),
+    /// Generate a UUIDv7 for a player, order or request
+    Id,
     /// Show every service and an overall verdict
     Status,
     /// Show whether `mmx serve` itself is up
@@ -158,7 +174,7 @@ enum Command {
         #[command(subcommand)]
         command: OrderCommand,
     },
-    /// Recent order reports across all players, from QuestDB
+    /// Recent order events across all players, from QuestDB
     Orders(ActivityArgs),
     /// Recent trades across all players, from QuestDB, with one row per side
     Trades(ActivityArgs),
@@ -167,7 +183,7 @@ enum Command {
         #[command(subcommand)]
         command: WebhookCommand,
     },
-    /// Follow markets, orders, trades and webhook delivery as they change
+    /// Follow markets, webhook delivery and a sample of orders and trades as they change
     Watch,
 }
 
@@ -181,7 +197,7 @@ struct ServeArgs {
     #[arg(long)]
     insecure_local: bool,
 
-    /// How often `/events` polls, in milliseconds
+    /// How often `/events` reads the tape, in milliseconds
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(100..))]
     poll_ms: u64,
 
@@ -202,8 +218,16 @@ struct ServeArgs {
     secret: String,
 
     /// What an operator runs to restart the outbox, shown in the console
-    #[arg(long, env = "MMX_OUTBOX_RESTART", default_value = LOCAL_OUTBOX_RESTART)]
-    outbox_restart: String,
+    #[arg(long, env = "MMX_OUTBOX_RESTART")]
+    outbox_restart: Option<String>,
+
+    /// Kubernetes Deployment to roll when restarting webhook delivery
+    #[arg(long, env = "MMX_OUTBOX_DEPLOYMENT", default_value = "mmx-outbox")]
+    outbox_deployment: String,
+
+    /// Kubernetes workload kind for the outbox
+    #[arg(long, env = "MMX_OUTBOX_KIND", default_value = "deployment", value_parser = ["deployment", "statefulset"])]
+    outbox_kind: String,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -321,15 +345,223 @@ enum OrderCommand {
 }
 
 #[derive(Subcommand)]
+enum LocalCommand {
+    /// Start the exchange in the background
+    Up {
+        /// Build images from the source checkout
+        #[arg(long)]
+        build: bool,
+    },
+    /// Stop the exchange, preserving data volumes
+    Down,
+    /// Show container status
+    Status,
+    /// Show the first-run console password from local container logs
+    Credentials,
+    /// Restart one service (for example, outbox)
+    Restart { service: String },
+}
+
+fn local_directory() -> Result<PathBuf, String> {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|dir| dir.join("mmx"))
+        .ok_or_else(|| "Set XDG_CONFIG_HOME or HOME, or pass `mmx local --file ...`".to_string())
+}
+
+fn write_new_private(path: &std::path::Path, contents: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => file
+            .write_all(contents.as_bytes())
+            .map_err(|err| format!("{}: {err}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(format!("{}: {err}", path.display())),
+    }
+}
+
+fn initialize_local_config(dir: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir.join("config")).map_err(|err| err.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.join("config"), std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| err.to_string())?;
+    }
+    let mut dotenv = format!("MMX_ADMIN_TOKEN={}\n", auth::random_hex()?);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(dir).map_err(|err| err.to_string())?;
+        dotenv.push_str(&format!(
+            "MMX_UID={}\nMMX_GID={}\n",
+            owner.uid(),
+            owner.gid()
+        ));
+    }
+    write_new_private(&dir.join(".env"), &dotenv)?;
+    write_new_private(&dir.join("config/outbox.env"), "")?;
+    write_new_private(&dir.join("config/markets.yaml"), "markets: []\n")?;
+    Ok(())
+}
+
+fn install_local_manifest(dir: &std::path::Path) -> Result<PathBuf, String> {
+    initialize_local_config(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|err| err.to_string())?;
+    }
+    let file = dir.join("compose.yaml");
+    write_new_private(&file, include_str!("../../../deploy/compose.yaml"))?;
+    Ok(file)
+}
+
+fn local_admin_token() -> Option<String> {
+    let directory = match env::var_os("MMX_COMPOSE_FILE") {
+        Some(file) => PathBuf::from(file).parent()?.to_path_buf(),
+        None => local_directory().ok()?,
+    };
+    let contents = std::fs::read_to_string(directory.join(".env")).ok()?;
+    contents
+        .lines()
+        .find_map(|line| line.strip_prefix("MMX_ADMIN_TOKEN=").map(str::to_string))
+        .filter(|token| !token.is_empty())
+}
+
+fn run_local(
+    file: Option<&std::path::Path>,
+    command: &LocalCommand,
+    json: bool,
+) -> Result<(), String> {
+    let installed;
+    let file = match file {
+        Some(file) => file,
+        None => {
+            if matches!(command, LocalCommand::Up { build: true }) {
+                return Err("Source builds need the checkout manifest: `mmx local --file deploy/compose.yaml up --build`".to_string());
+            }
+            installed = install_local_manifest(&local_directory()?)?;
+            &installed
+        }
+    };
+    if !file.is_file() {
+        return Err(format!(
+            "Compose manifest {} does not exist; use --file or MMX_COMPOSE_FILE to select the installed manifest",
+            file.display()
+        ));
+    }
+    if matches!(command, LocalCommand::Up { .. }) {
+        initialize_local_config(
+            file.parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new(".")),
+        )?;
+    }
+    let mut process = std::process::Command::new("docker");
+    process.arg("compose").arg("--file").arg(file);
+    if let Some(parent) = file.parent() {
+        let dotenv = parent.join(".env");
+        if dotenv.is_file() {
+            process.arg("--env-file").arg(dotenv);
+        }
+    }
+    match command {
+        LocalCommand::Up { build } => {
+            process.args(["up", "--detach", "--wait"]);
+            if *build {
+                process.arg("--build");
+            } else {
+                process.args(["--pull", "always", "--no-build"]);
+            }
+        }
+        LocalCommand::Down => {
+            process.arg("down");
+        }
+        LocalCommand::Status => {
+            process.arg("ps");
+            if json {
+                process.args(["--format", "json"]);
+            }
+        }
+        LocalCommand::Credentials => {
+            let output = process
+                .args(["logs", "--no-color", "console"])
+                .output()
+                .map_err(|err| format!("Reading Docker Compose logs: {err}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "Docker Compose logs failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            let logs = String::from_utf8_lossy(&output.stdout);
+            let password = logs
+                .lines()
+                .filter_map(|line| {
+                    line.split_once("Console: first-run admin password: ")
+                        .map(|(_, value)| value)
+                })
+                .next_back();
+            match password {
+                Some(password) => line(&format!("first-run admin password: {password}")),
+                None => return Err("No first-run password in retained console logs. If already configured, use your chosen password or `mmx auth reset-password`.".to_string()),
+            }
+            return Ok(());
+        }
+        LocalCommand::Restart { service } => {
+            if ![
+                "outbox",
+                "gateway",
+                "trade-reporter",
+                "market-data",
+                "console",
+                "websocket",
+            ]
+            .contains(&service.as_str())
+            {
+                return Err("Restart an application service: outbox, gateway, trade-reporter, market-data, console, or websocket. Recreate node/driver pairs together with `mmx local down` then `mmx local up`.".to_string());
+            }
+            process
+                .args(["up", "--detach", "--force-recreate", "--no-deps"])
+                .arg(service);
+        }
+    }
+    let status = process.status().map_err(|err| format!("Starting Docker Compose: {err}. Install Docker with the Compose plugin and start its daemon."))?;
+    if !status.success() {
+        return Err(format!("Docker Compose exited with {status}"));
+    }
+    Ok(())
+}
+
+#[derive(Subcommand)]
 enum WebhookCommand {
     /// Show outbox delivery status
     Status,
     /// Show the configured URL and whether the outbox has picked it up
     Config,
     /// Set the webhook URL. The outbox needs a restart to use it
-    SetUrl { url: String },
+    SetUrl {
+        #[arg(value_name = "URL")]
+        destination: String,
+    },
     /// Generate a new signing secret, printed once. The outbox needs a restart to use it
-    RotateSecret,
+    RotateSecret {
+        /// Print only the secret, for shell assignment
+        #[arg(long)]
+        raw: bool,
+    },
+    /// Restart the Kubernetes outbox Deployment to apply saved webhook settings
+    Restart,
     /// Act as a game: receive webhooks, verify them, dedupe and print them
     Listen {
         #[arg(long)]
@@ -375,6 +607,7 @@ impl Services {
             questdb: base_url("questdb", &self.questdb)?,
             nats: self.nats.clone(),
             valkey: self.valkey.clone(),
+            websocket: self.websocket.clone(),
         })
     }
 }
@@ -432,18 +665,34 @@ async fn serve(cli: &Cli, args: &ServeArgs, token: Option<String>) -> Result<(),
         token.as_deref(),
         args.insecure_local,
         password,
+        auth::Managed::read(|name| env::var(name).ok())?,
     )
     .await?;
     auth.spawn_refresh();
 
+    let up = Arc::new(Upstreams::new(cli.services.targets()?, token.clone())?);
+    let monitor = monitor::Monitor::new(up.clone());
+    monitor.spawn();
     let state = Arc::new(AppState {
-        up: Arc::new(Upstreams::new(cli.services.targets()?, token.clone())?),
+        feeds: feed::Feeds::new(up.clone()),
+        monitor: monitor.clone(),
+        up,
         store,
         auth,
         poll_every: Duration::from_millis(args.poll_ms),
         edits: Mutex::new(()),
         behind_since: StdMutex::new(None),
-        outbox_restart: args.outbox_restart.clone(),
+        outbox_restart: args
+            .outbox_restart
+            .clone()
+            .unwrap_or_else(|| match args.store {
+                StoreKind::Local => "mmx local restart outbox".to_string(),
+                StoreKind::Kubernetes => "mmx webhook restart".to_string(),
+            }),
+        outbox_deployment: args.outbox_deployment.clone(),
+        outbox_kind: args.outbox_kind.clone(),
+        streams: Arc::new(Semaphore::new(server::MAX_STREAMS)),
+        summary: Mutex::new(HashMap::new()),
     });
     server::spawn_reconciler(state.clone());
     server::serve(state, address).await
@@ -540,7 +789,10 @@ async fn run_order(cli: &Cli, player: Option<Uuid>, command: &OrderCommand) -> R
 }
 
 async fn run(cli: Cli) -> Result<(), String> {
-    let token = env::var(TOKEN_ENV).ok().filter(|token| !token.is_empty());
+    let token = env::var(TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.is_empty())
+        .or_else(|| (cli.url == DEFAULT_URL).then(local_admin_token).flatten());
     let admin = || Admin::new(base_url("url", &cli.url)?, token.clone(), cli.json);
     let activity = |args: &ActivityArgs| ActivityQuery {
         symbol: args.symbol.clone(),
@@ -549,7 +801,12 @@ async fn run(cli: Cli) -> Result<(), String> {
     };
 
     match &cli.command {
+        Command::Local { file, command } => run_local(file.as_deref(), command, cli.json),
         Command::Serve(args) => serve(&cli, args, token.clone()).await,
+        Command::Id => {
+            line(&Uuid::now_v7().to_string());
+            Ok(())
+        }
         Command::Status => admin()?.status().await,
         Command::Health => admin()?.health().await,
         Command::Markets { command } => run_markets(&admin()?, command).await,
@@ -567,11 +824,14 @@ async fn run(cli: Cli) -> Result<(), String> {
             command: WebhookCommand::Config,
         } => admin()?.webhook_config().await,
         Command::Webhook {
-            command: WebhookCommand::SetUrl { url },
-        } => admin()?.set_webhook_url(url).await,
+            command: WebhookCommand::SetUrl { destination },
+        } => admin()?.set_webhook_url(destination).await,
         Command::Webhook {
-            command: WebhookCommand::RotateSecret,
-        } => admin()?.rotate_webhook_secret().await,
+            command: WebhookCommand::RotateSecret { raw },
+        } => admin()?.rotate_webhook_secret(*raw).await,
+        Command::Webhook {
+            command: WebhookCommand::Restart,
+        } => admin()?.restart_webhook().await,
         Command::Webhook {
             command: WebhookCommand::Listen { port, secret, bind },
         } => webhook::listen(*bind, *port, secret, cli.json).await,

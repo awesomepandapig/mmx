@@ -79,7 +79,7 @@ def shell(*command):
 
 
 def preflight():
-    busy = [name for name in ("aeronmd", "matching-engine", "sbx-bench")
+    busy = [name for name in ("aeronmd", "matching-engine", "mmx-bench")
             if shell("pgrep", "-x", name)]
     if shell("pgrep", "-f", "[C]lusteredMediaDriver"):
         busy.append("a cluster node")
@@ -117,7 +117,7 @@ def tape_for(config):
         return path
     TAPES.mkdir(parents=True, exist_ok=True)
     print(f"  generating {path.name}", flush=True)
-    run_quiet([TOOLS / "sbx-tape", "--out", path, "--orders", config["orders"], "--seed", config["seed"],
+    run_quiet([TOOLS / "mmx-tape", "--out", path, "--orders", config["orders"], "--seed", config["seed"],
                "--accounts", config["accounts"], "--symbol", "ITEM", "--spread", config["spread"],
                "--market-pct", config["market_pct"], "--symbols", config["symbols"],
                "--cancel-pct", config["cancel_pct"], "--unknown-cancel-pct", config["unknown_cancel_pct"],
@@ -168,7 +168,7 @@ def measure(config, mode, tape, rate=LATENCY_RATE, limit=None):
     try:
         wait_until_booted(engine.pid)
         boot_kb = memory_kb(engine.pid)
-        command = [TOOLS / "sbx-bench", "--tape", tape, "--mode", mode, "--rate", rate]
+        command = [TOOLS / "mmx-bench", "--tape", tape, "--mode", mode, "--rate", rate]
         if limit:
             command += ["--limit", limit]
         load = os.getloadavg()[0]
@@ -182,7 +182,7 @@ def measure(config, mode, tape, rate=LATENCY_RATE, limit=None):
         except subprocess.TimeoutExpired:
             return {"failed": f"no answer after {RUN_TIMEOUT}s"}
         except subprocess.CalledProcessError as err:
-            return {"failed": (err.stderr or "sbx-bench failed").strip()[-300:]}
+            return {"failed": (err.stderr or "mmx-bench failed").strip()[-300:]}
         if engine.poll() is not None:
             return {"failed": f"the engine exited with status {engine.returncode}"}
         result = json.loads(output.splitlines()[-1])

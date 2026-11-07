@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { api, messageOf, setCsrfToken, setSignedOutHandler } from "./api";
-import type { Session } from "./api";
+import type { Role, Session } from "./api";
 
 interface SessionState {
   session: Session | null;
@@ -43,4 +43,12 @@ export function useSession(): SessionState {
   const state = useContext(Context);
   if (!state) throw new Error("useSession needs a SessionProvider");
   return state;
+}
+
+const order: Role[] = ["viewer", "operator", "admin"];
+
+/** Whether the signed-in person holds at least this role. The server checks again regardless. */
+export function useCan(role: Role) {
+  const { session } = useSession();
+  return !!session?.role && order.indexOf(session.role) >= order.indexOf(role);
 }

@@ -3,14 +3,18 @@
 
 mod console;
 
-use crate::auth::Auth;
+use crate::{Cli, install_local_manifest};
+use clap::Parser;
+
+use crate::auth::{Auth, Managed};
 use crate::events::{Activity, Poller};
+use crate::feed::Feeds;
 use crate::markets::MarketsFile;
 use crate::server::{self, AppState};
 use crate::store::{ConfigStore, LocalStore};
-use crate::upstream::{Targets, Upstreams};
+use crate::upstream::{Filter, Targets, Upstreams};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -270,6 +274,9 @@ async fn quest_route(State(quest): State<Arc<FakeQuest>>, Query(params): Query<V
     } else {
         &quest.trades
     };
+    if query.contains("sample by") || query.contains("group by") || query.contains("first(") {
+        return Json(json!({ "dataset": [] })).into_response();
+    }
     let rows = source.lock().unwrap().clone();
     let start = query
         .split("ts >= '")
@@ -284,8 +291,17 @@ async fn quest_route(State(quest): State<Arc<FakeQuest>>, Query(params): Query<V
                 .is_none_or(|start| row[0].as_str().unwrap() >= start)
         })
         .collect();
+    if query.contains("select count()") {
+        return Json(json!({ "dataset": [[rows.len()]] })).into_response();
+    }
     if query.contains("desc") {
         rows.reverse();
+    }
+    if let Some(limit) = query
+        .rsplit_once(" limit ")
+        .and_then(|(_, limit)| limit.parse::<usize>().ok())
+    {
+        rows.truncate(limit);
     }
     Json(json!({ "dataset": rows })).into_response()
 }
@@ -357,20 +373,33 @@ async fn world_on(store: ConfigStore, gateways: Vec<String>, quest: Arc<FakeQues
         questdb,
         nats: nats_address,
         valkey: None,
+        websocket: None,
     };
     let up = Arc::new(Upstreams::new(targets, Some(TOKEN.to_string())).unwrap());
     let store = Arc::new(store);
     let password = Some(console::FIRST_PASSWORD.to_string());
-    let auth = Auth::start(store.clone(), Some(TOKEN), false, password)
-        .await
-        .unwrap();
+    let auth = Auth::start(
+        store.clone(),
+        Some(TOKEN),
+        false,
+        password,
+        Managed::default(),
+    )
+    .await
+    .unwrap();
     let state = Arc::new(AppState {
+        feeds: Feeds::new(up.clone()),
+        streams: Arc::new(tokio::sync::Semaphore::new(server::MAX_STREAMS)),
+        summary: tokio::sync::Mutex::new(HashMap::new()),
+        monitor: crate::monitor::Monitor::new(up.clone()),
         up: up.clone(),
         store,
         auth,
         poll_every: Duration::from_millis(100),
         edits: tokio::sync::Mutex::new(()),
         behind_since: Mutex::new(None),
+        outbox_kind: "deployment".to_string(),
+        outbox_deployment: "mmx-outbox".to_string(),
         outbox_restart: "restart-the-outbox".to_string(),
     });
     let url = spawn(server::router(state.clone())).await;
@@ -509,10 +538,25 @@ async fn status_reports_each_service_and_a_verdict() {
         .iter()
         .map(|service| service["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["gateway", "outbox", "questdb", "nats"]);
-    assert_eq!(services[0]["checks"]["engine"], true);
-    assert_eq!(services[2]["version"], "8.2.3");
-    assert_eq!(services[3]["version"], "2.10.0");
+    assert_eq!(
+        names,
+        [
+            "matching-engine",
+            "gateway",
+            "outbox",
+            "trade-reporter",
+            "market-data",
+            "questdb",
+            "nats"
+        ]
+    );
+    assert_eq!(services[0]["ready"], true);
+    assert_eq!(services[1]["checks"]["engine"], true);
+    assert_eq!(services[5]["version"], "8.2.3");
+    assert_eq!(services[6]["version"], "2.10.0");
+    assert_eq!(body["can_trade"], true);
+    assert_eq!(body["cluster"]["mode"], "unknown");
+    assert_eq!(body["conditions"], json!([]));
     assert_eq!(
         gateway.calls_to("/readyz")[0].auth.as_deref(),
         Some("Bearer test-token")
@@ -523,11 +567,17 @@ async fn status_reports_each_service_and_a_verdict() {
     let partial = world_with(gateway.file.clone(), vec![live, dead_url().await], quest()).await;
     let (_, body) = partial.get("/status").await;
     assert_eq!(body["verdict"], "degraded");
-    assert_eq!(body["services"][1]["reachable"], false);
-    assert!(body["services"][1]["error"].is_string());
+    assert_eq!(body["services"][2]["reachable"], false);
+    assert!(body["services"][2]["error"].is_string());
+    assert_eq!(body["conditions"][0]["check"], "reachable");
+    assert!(body["conditions"][0]["since"].is_string());
 
     let none = world_with(gateway.file.clone(), vec![dead_url().await], quest()).await;
-    assert_eq!(none.get("/status").await.1["verdict"], "down");
+    let body = none.get("/status").await.1;
+    assert_eq!(body["verdict"], "down");
+    assert_eq!(body["can_trade"], false);
+    assert_eq!(body["services"][0]["name"], "matching-engine");
+    assert_eq!(body["services"][0]["ready"], false);
 }
 
 #[tokio::test]
@@ -885,6 +935,11 @@ async fn filters_cannot_reach_sql_unchecked() {
         "/orders?limit=0",
         "/orders?limit=1001",
         "/orders?limit=1;drop",
+        "/orders?side=x'",
+        "/orders?event=x'",
+        "/orders?order=x'",
+        "/orders?before=x'",
+        "/events?side=sideways",
         "/trades?surprise=1",
     ] {
         assert_eq!(world.get(path).await.0, 400, "{path}");
@@ -935,7 +990,12 @@ fn kinds(activity: &[Activity]) -> Vec<&'static str> {
 async fn polling_reports_the_current_state_then_only_changes() {
     let gateway = FakeGateway::new(&temp_markets(FILE));
     let world = world(std::slice::from_ref(&gateway)).await;
-    let mut poller = Poller::new(world.up.clone());
+    let mut poller = Poller::new(
+        world.up.clone(),
+        Filter::default(),
+        false,
+        Duration::from_secs(1),
+    );
 
     let first = poller.poll().await;
     for kind in ["service", "market", "webhook", "order", "trade"] {
@@ -968,21 +1028,109 @@ async fn polling_reports_the_current_state_then_only_changes() {
     let changes = poller.poll().await;
     assert_eq!(
         kinds(&changes),
-        ["market", "webhook", "order", "trade"],
+        ["market", "webhook", "order", "sample", "trade", "sample"],
         "{changes:?}"
     );
     assert_eq!(changes[0].data["market"]["halted"], true);
     assert_eq!(changes[1].data["state"], "idle");
     assert_eq!(changes[2].data["exec_id"], 3);
+    assert_eq!(
+        changes[3].data,
+        json!({ "table": "orders", "seen": 1, "sent": 1 })
+    );
 
+    // The rate falling to zero is news once, and silence after that.
+    assert_eq!(kinds(&poller.poll().await), ["sample", "sample"]);
     assert_eq!(poller.poll().await, Vec::new());
+}
+
+fn poller(world: &World, filter: Filter) -> Poller {
+    Poller::new(world.up.clone(), filter, true, Duration::from_secs(1))
+}
+
+#[tokio::test]
+async fn the_tape_is_sampled_at_a_fixed_rate_however_fast_it_arrives() {
+    let world = world(&[FakeGateway::new(&temp_markets(FILE))]).await;
+    let mut poller = poller(&world, Filter::default());
+    poller.poll().await;
+
+    // Fifty thousand reports in a second, against a cap of a hundred.
+    let burst: Vec<Value> = (10..50_010)
+        .map(|id| order_row(&format!("2026-01-01T00:00:01.{id:06}Z"), id))
+        .collect();
+    world.quest.orders.lock().unwrap().extend(burst);
+    let changes = poller.poll().await;
+
+    let orders: Vec<&Activity> = changes.iter().filter(|item| item.kind == "order").collect();
+    assert_eq!(orders.len(), crate::events::RATE_CAP);
+    assert_eq!(orders.last().unwrap().data["exec_id"], 50_009, "the newest");
+    let sample = changes.iter().find(|item| item.kind == "sample").unwrap();
+    assert_eq!(sample.data["sent"], crate::events::RATE_CAP);
+    assert_eq!(sample.data["seen"], 50_000);
+
+    // It skipped ahead, so the next poll isn't behind.
+    world
+        .quest
+        .orders
+        .lock()
+        .unwrap()
+        .push(order_row("2026-01-01T00:00:02.000000Z", 60_000));
+    let next = poller.poll().await;
+    let sample = next.iter().find(|item| item.kind == "sample").unwrap();
+    assert_eq!(
+        sample.data,
+        json!({ "table": "orders", "seen": 1, "sent": 1 })
+    );
+}
+
+#[tokio::test]
+async fn a_tape_stream_reads_nothing_but_the_tape() {
+    let world = world(&[FakeGateway::new(&temp_markets(FILE))]).await;
+    let first = poller(&world, Filter::default()).poll().await;
+    assert_eq!(kinds(&first), ["order", "trade"], "{first:?}");
+}
+
+#[tokio::test]
+async fn filters_reach_every_read_of_the_tape() {
+    let world = world(&[FakeGateway::new(&temp_markets(FILE))]).await;
+    let player = "00000000-0000-0000-0000-000000000001";
+    let id = "00000000-0000-0000-0000-00000000000a";
+    let path = format!(
+        "/orders?symbol=item&player={player}&side=buy&event=trade&order={id}\
+         &before=2026-01-01T00:00:00Z&limit=5"
+    );
+    assert_eq!(world.get(&path).await.0, 200);
+    let query = world.quest.queries.lock().unwrap().last().unwrap().clone();
+    assert!(
+        query.ends_with(&format!(
+            "where symbol = 'ITEM' and account = '{player}' and side = 'buy' \
+             and exec_type = 'trade' and cl_ord_id = '{id}' \
+             and ts < '2026-01-01T00:00:00Z' order by ts desc limit 5"
+        )),
+        "{query}"
+    );
+    assert_eq!(world.get("/orders?order=42").await.0, 200);
+    let query = world.quest.queries.lock().unwrap().last().unwrap().clone();
+    assert!(query.contains("order_id = 42"), "{query}");
+
+    // Trades have one event, so asking for another finds nothing without a query.
+    let before = world.quest.queries.lock().unwrap().len();
+    let (code, body) = world.get("/trades?event=canceled").await;
+    assert_eq!(code, 200);
+    assert_eq!(body["trades"], json!([]));
+    assert_eq!(world.quest.queries.lock().unwrap().len(), before);
 }
 
 #[tokio::test]
 async fn polling_reports_a_failure_once_and_its_recovery() {
     let gateway = FakeGateway::new(&temp_markets(FILE));
     let world = world(&[gateway]).await;
-    let mut poller = Poller::new(world.up.clone());
+    let mut poller = Poller::new(
+        world.up.clone(),
+        Filter::default(),
+        false,
+        Duration::from_secs(1),
+    );
     poller.poll().await;
 
     *world.position.lock().unwrap() = "not json".to_string();
@@ -1000,7 +1148,12 @@ async fn polling_notices_a_market_leaving() {
     let path = temp_markets(FILE);
     let gateway = FakeGateway::new(&path);
     let world = world(std::slice::from_ref(&gateway)).await;
-    let mut poller = Poller::new(world.up.clone());
+    let mut poller = Poller::new(
+        world.up.clone(),
+        Filter::default(),
+        false,
+        Duration::from_secs(1),
+    );
     poller.poll().await;
 
     fs::write(&path, "markets: []\n").unwrap();
@@ -1216,4 +1369,72 @@ async fn the_listener_takes_a_signed_delivery_over_http() {
 
     let tally = listener.tally.lock().unwrap();
     assert_eq!((tally.events, tally.duplicates, tally.refused), (1, 1, 3));
+}
+
+#[test]
+fn native_operations_parse_without_repository_scripts() {
+    for args in [
+        vec!["mmx", "id"],
+        vec!["mmx", "webhook", "restart"],
+        vec!["mmx", "webhook", "rotate-secret", "--raw"],
+        vec!["mmx", "local", "--file", "compose.yaml", "up", "--build"],
+        vec!["mmx", "local", "restart", "outbox"],
+    ] {
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+    assert!(Cli::try_parse_from(["mmx", "--json", "webhook", "rotate-secret", "--raw"]).is_ok());
+}
+
+#[test]
+fn installing_a_local_manifest_preserves_credentials_and_settings() {
+    let dir = std::env::temp_dir().join(format!("mmx-install-{}", uuid::Uuid::new_v4()));
+    let file = install_local_manifest(&dir).unwrap();
+    assert!(file.is_file());
+    let env = std::fs::read_to_string(dir.join(".env")).unwrap();
+    let token = env
+        .lines()
+        .find_map(|line| line.strip_prefix("MMX_ADMIN_TOKEN="))
+        .unwrap();
+    assert_eq!(token.len(), 64);
+    assert!(dir.join("config/outbox.env").is_file());
+    std::fs::write(dir.join("config/markets.yaml"), "markets: [custom]").unwrap();
+    install_local_manifest(&dir).unwrap();
+    assert_eq!(std::fs::read_to_string(dir.join(".env")).unwrap(), env);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config/markets.yaml")).unwrap(),
+        "markets: [custom]"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(dir.join(".env"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+}
+
+#[test]
+fn setting_a_webhook_url_keeps_the_control_plane_url() {
+    let cli = Cli::try_parse_from([
+        "mmx",
+        "--url",
+        "http://control:8093",
+        "webhook",
+        "set-url",
+        "https://game.example/fills",
+    ])
+    .unwrap();
+    assert_eq!(cli.url, "http://control:8093");
+    assert!(
+        matches!(cli.command, crate::Command::Webhook { command: crate::WebhookCommand::SetUrl { destination } } if destination == "https://game.example/fills")
+    );
 }

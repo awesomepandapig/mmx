@@ -4,7 +4,7 @@
 //! fields and the same `fill_id`, however batches fall, whichever replica sends it, and even if the
 //! journal is rebuilt from the tape.
 
-use crate::frame::{self, Execution, ExecType, Frame, Id, OrdStatus, Side};
+use crate::frame::{self, ExecType, Execution, Frame, Id, OrdStatus, Side};
 use crate::journal::Record;
 use crate::ledger::REPEAT_OF_OPEN_ORDER;
 
@@ -136,7 +136,8 @@ fn execution_event(record: &Record, report: &Execution) -> Option<Event> {
 
     // Taken from the fills, so it holds whatever a report says about leaves on a dead order.
     let unfilled = report.ord_qty - report.cum_qty;
-    let closes_with_release = matches!(event_type, EventType::Canceled | EventType::Rejected) && !repeat;
+    let closes_with_release =
+        matches!(event_type, EventType::Canceled | EventType::Rejected) && !repeat;
 
     Some(Event {
         fill_id: fill_id(record.position, &record.frame),
@@ -152,7 +153,10 @@ fn execution_event(record: &Record, report: &Execution) -> Option<Event> {
         symbol: Some(report.symbol.clone()),
         side: Some(report.side),
         status: Some(report.ord_status),
-        reason: report.reject_reason.filter(|_| event_type == EventType::Rejected).map(|reason| reason.as_str()),
+        reason: report
+            .reject_reason
+            .filter(|_| event_type == EventType::Rejected)
+            .map(|reason| reason.as_str()),
         order_qty: Some(decimal(report.ord_qty)),
         filled_qty: Some(decimal(report.cum_qty)),
         leaves_qty: Some(decimal(report.leaves_qty)),
@@ -169,7 +173,10 @@ fn execution_event(record: &Record, report: &Execution) -> Option<Event> {
 pub fn event(record: &Record) -> Option<Event> {
     match frame::decode(&record.frame) {
         Frame::Execution(report) => execution_event(record, &report),
-        Frame::CancelReject { cl_ord_id, orig_cl_ord_id } => Some(Event {
+        Frame::CancelReject {
+            cl_ord_id,
+            orig_cl_ord_id,
+        } => Some(Event {
             fill_id: fill_id(record.position, &record.frame),
             event_type: EventType::CancelRejected,
             tape_position: record.position,
@@ -210,7 +217,10 @@ pub fn hmac_hex(secret: &[u8], message: &[&[u8]]) -> String {
 /// The value of the signature header. The timestamp is signed with the exact body bytes, and it's
 /// fresh on every attempt, so a game can refuse old replays without refusing long retries.
 pub fn signature(secret: &[u8], timestamp: u64, body: &[u8]) -> String {
-    format!("v1={}", hmac_hex(secret, &[timestamp.to_string().as_bytes(), b".", body]))
+    format!(
+        "v1={}",
+        hmac_hex(secret, &[timestamp.to_string().as_bytes(), b".", body])
+    )
 }
 
 #[cfg(test)]
@@ -220,6 +230,9 @@ mod config_tests {
     // From Python's hashlib, and the same value is checked in `services/mmx`.
     #[test]
     fn config_id_matches_what_mmx_computes() {
-        assert_eq!(config_id("https://game.example/fills", "secret"), "7beb90646192c9b7");
+        assert_eq!(
+            config_id("https://game.example/fills", "secret"),
+            "7beb90646192c9b7"
+        );
     }
 }

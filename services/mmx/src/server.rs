@@ -1,15 +1,20 @@
 //! `mmx serve`: the admin API under `/admin/v1`. The CLI and the console are both clients of this.
 
-use crate::auth::{self, Auth};
+use crate::auth::{self, Auth, Caller};
 use crate::console;
 use crate::events;
+use crate::feed::{self, Feeds};
 use crate::markets::{self, MarketEntry, MarketsFile, Problem, normalize_symbol};
+use crate::monitor::{MarketStats, Monitor};
 use crate::settings;
 use crate::store::{ConfigStore, Delivery, MARKETS_KEY, StoreError, text_revision};
 use crate::upstream::{
-    Filter, GatewayResult, LiveMarket, ORDERS, TRADES, Table, Upstreams, reloaded_symbols, verdict,
+    Filter, GatewayResult, LiveMarket, ORDERS, Range, Side, TRADES, Table, Upstreams,
+    parse_time_ms, reloaded_symbols,
 };
 
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,11 +25,11 @@ use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -37,6 +42,15 @@ const RECONCILE_EVERY: Duration = Duration::from_secs(5);
 const DELIVERY_STALLED: Duration = Duration::from_secs(180);
 /// Shown to operators as what to expect.
 const DELIVERY_EXPECTED_SECS: u64 = 90;
+/// Open streams across every browser. Each one costs a few queries a second, so this is what keeps
+/// the load on QuestDB bounded.
+pub const MAX_STREAMS: usize = 64;
+/// One page of the market list.
+const MAX_PAGE: usize = 500;
+/// `/activity/summary` scans a window of the tape, so every viewer shares one reading.
+const SUMMARY_FRESH: Duration = Duration::from_secs(4);
+/// The most lines `/activity/log` gives at once.
+const MAX_LOG: usize = 500;
 
 pub struct AppState {
     pub up: Arc<Upstreams>,
@@ -50,6 +64,25 @@ pub struct AppState {
     pub behind_since: std::sync::Mutex<Option<Instant>>,
     /// What an operator runs to restart the outbox here.
     pub outbox_restart: String,
+    pub outbox_deployment: String,
+    pub outbox_kind: String,
+    /// Live market data, one subscription per market being watched.
+    pub feeds: Arc<Feeds>,
+    pub streams: Arc<Semaphore>,
+    /// One reading per window, shared by every viewer.
+    pub summary: Mutex<HashMap<&'static str, (Instant, Value)>>,
+    pub monitor: Arc<Monitor>,
+}
+
+/// One seat for one open stream. It's held for as long as the stream is.
+pub fn stream_seat(state: &AppState) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    state.streams.clone().try_acquire_owned().map_err(|_| {
+        error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too_many_streams",
+            "Too many live views are open. Close some and try again.",
+        )
+    })
 }
 
 /// Works out the listen address and whether a token is required. No token is only allowed on the
@@ -144,6 +177,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let admin = Router::new()
         .route("/status", get(status))
         .route("/markets", get(list_markets))
+        .route("/activity/summary", get(activity_summary))
+        .route("/activity/log", get(activity_log))
         .route("/markets/reload", post(reload_markets))
         .route(
             "/markets/{symbol}",
@@ -152,6 +187,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/markets/{symbol}/halt", post(halt))
         .route("/markets/{symbol}/resume", post(resume))
         .route("/markets/{symbol}/cancel-all", post(cancel_all))
+        .route("/markets/{symbol}/history", get(market_history))
+        .route("/markets/{symbol}/stream", get(market_stream))
         .route(
             "/config/markets",
             get(get_markets_file).put(put_markets_file),
@@ -165,6 +202,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(settings::webhook_config).put(settings::put_webhook_config),
         )
         .route("/webhooks/secret", post(settings::rotate_webhook_secret))
+        .route("/webhooks/restart", post(settings::restart_webhook))
         .route("/events", get(activity))
         .route(
             "/settings",
@@ -176,11 +214,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/password/reset", post(auth::reset_password))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            auth::require_admin,
+            auth::require_role,
         ));
     // Open to someone holding only the temporary password.
     let setup = Router::new()
         .route("/password", post(auth::change_password))
+        .route("/reauth", post(auth::reauth))
         .route("/logout", post(auth::logout))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -216,10 +255,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let services = state.up.status().await;
-    Json(
-        json!({ "verdict": verdict(&services), "version": env!("CARGO_PKG_VERSION"), "services": services }),
-    )
+    Json(state.monitor.status().await.as_ref().clone())
 }
 
 #[derive(Serialize, Debug)]
@@ -249,6 +285,8 @@ struct MarketView {
     /// Whether every gateway matches the file, which is false until a reload lands everywhere.
     in_sync: bool,
     gateways: Vec<GatewayView>,
+    #[serde(flatten)]
+    stats: MarketStats,
 }
 
 /// Compares mantissas, because `0.10` and `0.1` are the same market, and a gateway reports the
@@ -276,31 +314,81 @@ fn gateway_matches(entry: Option<&MarketEntry>, market: Option<&LiveMarket>) -> 
 
 type Live = Vec<(String, Result<Vec<LiveMarket>, String>)>;
 
-/// Whether one gateway holds exactly what the file says.
-fn gateway_in_sync(file: &MarketsFile, markets: &[LiveMarket]) -> bool {
-    let listed = file.markets.iter().all(|entry| {
-        let market = markets.iter().find(|market| market.symbol == entry.symbol);
-        gateway_matches(Some(entry), market)
-    });
-    listed
-        && markets
-            .iter()
-            .all(|market| gateway_matches(file.get(&market.symbol), Some(market)))
+type LiveByName<'a> = HashMap<&'a str, &'a LiveMarket>;
+
+/// Each gateway's markets by symbol, and the file by symbol, because every view of every market
+/// looks them up. With thousands of symbols, scanning the lists each time is too slow.
+struct LiveIndex<'a> {
+    gateways: Vec<(&'a str, Result<LiveByName<'a>, &'a str>)>,
+    file: HashMap<&'a str, &'a MarketEntry>,
 }
 
-fn market_view(symbol: &str, file: &MarketsFile, live: &Live) -> MarketView {
-    let entry = file.get(symbol);
-    let gateways: Vec<GatewayView> = live
+impl<'a> LiveIndex<'a> {
+    fn new(file: &'a MarketsFile, live: &'a Live) -> Self {
+        let gateways = live
+            .iter()
+            .map(|(gateway, markets)| {
+                let markets = match markets {
+                    Ok(markets) => Ok(markets
+                        .iter()
+                        .map(|market| (market.symbol.as_str(), market))
+                        .collect()),
+                    Err(error) => Err(error.as_str()),
+                };
+                (gateway.as_str(), markets)
+            })
+            .collect();
+        let file = file
+            .markets
+            .iter()
+            .map(|entry| (entry.symbol.as_str(), entry))
+            .collect();
+        Self { gateways, file }
+    }
+
+    /// Whether one gateway holds exactly what the file says.
+    fn in_sync(&self, markets: &HashMap<&str, &LiveMarket>) -> bool {
+        self.file
+            .iter()
+            .all(|(symbol, entry)| gateway_matches(Some(entry), markets.get(symbol).copied()))
+            && markets.iter().all(|(symbol, market)| {
+                gateway_matches(self.file.get(symbol).copied(), Some(market))
+            })
+    }
+
+    /// The gateways that don't hold what the file says, or can't say.
+    fn behind(&self) -> Vec<&str> {
+        self.gateways
+            .iter()
+            .filter(|(_, markets)| !markets.as_ref().is_ok_and(|markets| self.in_sync(markets)))
+            .map(|(gateway, _)| *gateway)
+            .collect()
+    }
+}
+
+/// Whether one gateway holds exactly what the file says.
+fn gateway_in_sync(file: &MarketsFile, gateway: &str, markets: &[LiveMarket]) -> bool {
+    let live = vec![(gateway.to_string(), Ok(markets.to_vec()))];
+    LiveIndex::new(file, &live).behind().is_empty()
+}
+
+fn market_view(
+    symbol: &str,
+    index: &LiveIndex,
+    stats: &HashMap<String, MarketStats>,
+) -> MarketView {
+    let entry = index.file.get(symbol).copied();
+    let gateways: Vec<GatewayView> = index
+        .gateways
         .iter()
         .map(|(gateway, markets)| {
             let (markets, error) = match markets {
                 Ok(markets) => (Some(markets), None),
-                Err(error) => (None, Some(error.clone())),
+                Err(error) => (None, Some(error.to_string())),
             };
-            let market =
-                markets.and_then(|markets| markets.iter().find(|market| market.symbol == symbol));
+            let market = markets.and_then(|markets| markets.get(symbol).copied());
             GatewayView {
-                gateway: gateway.clone(),
+                gateway: gateway.to_string(),
                 reachable: markets.is_some(),
                 in_sync: markets.is_some() && gateway_matches(entry, market),
                 market: market.cloned(),
@@ -338,6 +426,7 @@ fn market_view(symbol: &str, file: &MarketsFile, live: &Live) -> MarketView {
         in_file: entry.is_some(),
         in_sync: gateways.iter().all(|view| view.in_sync),
         gateways,
+        stats: stats.get(symbol).cloned().unwrap_or_default(),
     }
 }
 
@@ -376,16 +465,8 @@ where
 
 /// How far the stored file has got. In Kubernetes a gap is normal for a minute or so, and only
 /// becomes a problem if it lasts.
-fn delivery_view(state: &AppState, file: &MarketsFile, live: &Live) -> Value {
-    let behind: Vec<&str> = live
-        .iter()
-        .filter(|(_, markets)| {
-            !markets
-                .as_ref()
-                .is_ok_and(|markets| gateway_in_sync(file, markets))
-        })
-        .map(|(gateway, _)| gateway.as_str())
-        .collect();
+fn delivery_view(state: &AppState, index: &LiveIndex) -> Value {
+    let behind = index.behind();
     let mode = state.store.info().delivery;
     let mut since = state
         .behind_since
@@ -414,9 +495,81 @@ fn symbol(raw: &str) -> Result<String, ApiError> {
     normalize_symbol(raw).map_err(invalid)
 }
 
-async fn list_markets(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct MarketQuery {
+    /// Part of a symbol.
+    q: Option<String>,
+    /// `open`, `halted`, `disabled` or `out_of_sync`.
+    state: Option<String>,
+    /// `symbol`, `state`, `last`, `volume`, `trades`, `last_trade`, `spread` or `open_orders`.
+    /// Symbol is the default.
+    sort: Option<String>,
+    /// `asc` or `desc`.
+    dir: Option<String>,
+    /// Left out, the whole list comes back.
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// What a market's numbers sort by. A market with no number comes last in either direction, so
+/// markets that never traded don't bury the ones that did.
+fn stat_key(view: &MarketView, sort: &str) -> Option<f64> {
+    let stats = &view.stats;
+    let number = |text: &Option<String>| text.as_deref()?.parse::<f64>().ok();
+    match sort {
+        "last" => number(&stats.last),
+        "volume" => number(&stats.volume_24h),
+        "spread" => number(&stats.spread),
+        "trades" => stats.trades_24h.map(|count| count as f64),
+        "open_orders" => stats.open_orders.map(|count| count as f64),
+        "last_trade" => stats
+            .last_time
+            .as_deref()
+            .and_then(parse_time_ms)
+            .map(|time| time as f64),
+        _ => None,
+    }
+}
+
+const STAT_SORTS: [&str; 6] = [
+    "last",
+    "volume",
+    "spread",
+    "trades",
+    "open_orders",
+    "last_trade",
+];
+
+fn state_of(view: &MarketView) -> &'static str {
+    if view.halted {
+        "halted"
+    } else if view.enabled {
+        "open"
+    } else {
+        "disabled"
+    }
+}
+
+/// Searches and pages on the server, because a browser shouldn't hold thousands of markets, or a
+/// gateway's copy of each, to show fifty.
+async fn list_markets(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<MarketQuery>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(query) = query.map_err(|rejection| invalid(rejection.body_text()))?;
+    if let Some(wanted) = query.state.as_deref()
+        && !["open", "halted", "disabled", "out_of_sync"].contains(&wanted)
+    {
+        return Err(invalid(format!("Unknown state {wanted}.")));
+    }
+    if query.limit.is_some_and(|limit| limit > MAX_PAGE) {
+        return Err(invalid(format!("limit must be at most {MAX_PAGE}.")));
+    }
     let (file, _) = read_file(&state).await?;
     let live = state.up.live_markets().await;
+    let index = LiveIndex::new(&file, &live);
+    let stats = state.monitor.stats();
 
     // A market can be on a gateway and not in the file, which is what's worth seeing here.
     let mut symbols: Vec<&str> = file
@@ -432,12 +585,66 @@ async fn list_markets(State(state): State<Arc<AppState>>) -> Result<Json<Value>,
     symbols.sort_unstable();
     symbols.dedup();
 
-    let views: Vec<MarketView> = symbols
+    let needle = query.q.as_deref().unwrap_or("").trim().to_uppercase();
+    let mut views: Vec<MarketView> = symbols
         .iter()
-        .map(|symbol| market_view(symbol, &file, &live))
+        .filter(|symbol| symbol.contains(&needle))
+        .map(|symbol| market_view(symbol, &index, &stats))
         .collect();
-    let delivery = delivery_view(&state, &file, &live);
-    Ok(Json(json!({ "markets": views, "delivery": delivery })))
+
+    // Counted before the state filter, so the filter's own buttons can show them.
+    let count = |test: &dyn Fn(&MarketView) -> bool| views.iter().filter(|view| test(view)).count();
+    let counts = json!({
+        "all": views.len(),
+        "open": count(&|view| state_of(view) == "open"),
+        "halted": count(&|view| view.halted),
+        "disabled": count(&|view| state_of(view) == "disabled"),
+        "out_of_sync": count(&|view| !view.in_sync),
+    });
+    let delivery = delivery_view(&state, &index);
+
+    if let Some(wanted) = query.state.as_deref() {
+        views.retain(|view| match wanted {
+            "out_of_sync" => !view.in_sync,
+            other => state_of(view) == other,
+        });
+    }
+    let descending = query.dir.as_deref() == Some("desc");
+    let sort = query.sort.as_deref().unwrap_or("symbol");
+    if STAT_SORTS.contains(&sort) {
+        views.sort_by(
+            |left, right| match (stat_key(left, sort), stat_key(right, sort)) {
+                (Some(left), Some(right)) if descending => right.total_cmp(&left),
+                (Some(left), Some(right)) => left.total_cmp(&right),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            },
+        );
+    } else {
+        if sort == "state" {
+            views.sort_by(|left, right| state_of(left).cmp(state_of(right)));
+        } else if !needle.is_empty() {
+            // What someone typed the start of comes first, then what merely contains it.
+            views.sort_by_key(|view| !view.symbol.starts_with(&needle));
+        }
+        if descending {
+            views.reverse();
+        }
+    }
+    let total = views.len();
+    let offset = query.offset.unwrap_or(0);
+    let page: Vec<MarketView> = views
+        .into_iter()
+        .skip(offset)
+        .take(query.limit.unwrap_or(usize::MAX))
+        .collect();
+    Ok(Json(json!({
+        "markets": page,
+        "total": total,
+        "counts": counts,
+        "delivery": delivery,
+    })))
 }
 
 async fn get_market(
@@ -447,7 +654,11 @@ async fn get_market(
     let symbol = symbol(&raw)?;
     let (file, _) = read_file(&state).await?;
     let live = state.up.live_markets().await;
-    let view = market_view(&symbol, &file, &live);
+    let view = market_view(
+        &symbol,
+        &LiveIndex::new(&file, &live),
+        &state.monitor.stats(),
+    );
     if !view.in_file && view.gateways.iter().all(|gateway| gateway.market.is_none()) {
         return Err(error(
             StatusCode::NOT_FOUND,
@@ -456,6 +667,85 @@ async fn get_market(
         ));
     }
     Ok(Json(view))
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct HistoryParams {
+    range: Option<String>,
+}
+
+/// Prices for the chart, and the day's numbers, from the tape.
+async fn market_history(
+    State(state): State<Arc<AppState>>,
+    Path(raw): Path<String>,
+    params: Result<Query<HistoryParams>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let symbol = symbol(&raw)?;
+    let Query(params) = params.map_err(|rejection| invalid(rejection.body_text()))?;
+    let range = Range::parse(params.range.as_deref().unwrap_or("1h"))
+        .ok_or_else(|| invalid("range must be 15m, 1h, 6h or 24h."))?;
+    let (candles, day) = tokio::join!(
+        state.up.candles(&symbol, range),
+        state.up.day_summary(&symbol)
+    );
+    let candles = candles.map_err(upstream_failed)?;
+    Ok(Json(json!({
+        "range": range.name(),
+        "bucket_secs": range.bucket_secs(),
+        "candles": candles,
+        "day": day.map_err(upstream_failed)?,
+    })))
+}
+
+async fn market_stream(
+    State(state): State<Arc<AppState>>,
+    Path(raw): Path<String>,
+) -> Result<Response, ApiError> {
+    let symbol = symbol(&raw)?;
+    let seat = stream_seat(&state)?;
+    Ok(feed::sse(state.feeds.clone(), symbol, seat).into_response())
+}
+
+/// How busy the exchange is, for the overview.
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct SummaryParams {
+    range: Option<String>,
+}
+
+async fn activity_summary(
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<SummaryParams>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(params) = params.map_err(|rejection| invalid(rejection.body_text()))?;
+    let wanted = params.range.as_deref().unwrap_or("1h");
+    let range = Range::parse(wanted).ok_or_else(|| invalid(format!("Unknown range {wanted}.")))?;
+    let mut cached = state.summary.lock().await;
+    if let Some((at, value)) = cached.get(range.name())
+        && at.elapsed() < SUMMARY_FRESH
+    {
+        return Ok(Json(value.clone()));
+    }
+    let value = state.up.summary(range).await.map_err(upstream_failed)?;
+    cached.insert(range.name(), (Instant::now(), value.clone()));
+    Ok(Json(value))
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+struct LogParams {
+    limit: Option<usize>,
+}
+
+/// What `mmx serve` has seen happen, newest first.
+async fn activity_log(
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<LogParams>, QueryRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Query(params) = params.map_err(|rejection| invalid(rejection.body_text()))?;
+    let limit = params.limit.unwrap_or(MAX_LOG).min(MAX_LOG);
+    Ok(Json(state.monitor.log(limit)))
 }
 
 /// Checks that a reload really changed what the gateway serves. A gateway reads its own copy of the
@@ -503,12 +793,7 @@ async fn reload_everywhere(state: &AppState, expected: &[(String, bool)]) -> (St
 
     let (file, _) = read_file(state).await.unwrap_or_default();
     let live = state.up.live_markets().await;
-    let applied = live.iter().all(|(_, markets)| {
-        markets
-            .as_ref()
-            .is_ok_and(|markets| gateway_in_sync(&file, markets))
-    });
-    if applied {
+    if LiveIndex::new(&file, &live).behind().is_empty() {
         let body =
             json!({ "written": true, "applied": true, "state": "applied", "gateways": gateways });
         return (StatusCode::OK, body);
@@ -543,7 +828,7 @@ pub fn spawn_reconciler(state: Arc<AppState>) {
             for (gateway, markets) in state.up.live_markets().await {
                 let in_sync = markets
                     .as_ref()
-                    .is_ok_and(|markets| gateway_in_sync(&file, markets));
+                    .is_ok_and(|markets| gateway_in_sync(&file, &gateway, markets));
                 if !in_sync {
                     let path = "/api/v1/admin/markets/reload";
                     let result = state.up.gateway_call(Method::POST, &gateway, path).await;
@@ -695,6 +980,7 @@ async fn validate_markets_file(
 /// Saves the text exactly as written, comments included, if nothing has changed since it was read.
 async fn put_markets_file(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<auth::Caller>,
     body: Result<Json<MarketsFileBody>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|rejection| invalid(rejection.body_text()))?;
@@ -714,6 +1000,10 @@ async fn put_markets_file(
         ));
     }
     let old = MarketsFile::parse(&current).unwrap_or_default();
+    // Dropping a line from the file deletes a market, just as the delete route does.
+    if !markets::changes(&old, &new).removed.is_empty() {
+        auth::check_recent(&caller)?;
+    }
     doc.data.insert(MARKETS_KEY.to_string(), body.yaml.clone());
     state.store.put_config(&doc).await.map_err(store_failed)?;
     info!("Markets: Saved the whole file");
@@ -753,27 +1043,51 @@ fn rollup(gateways: &[GatewayResult]) -> StatusCode {
     }
 }
 
-async fn forward(state: &AppState, raw: &str, action: &str) -> Result<Response, ApiError> {
+async fn forward(
+    state: &AppState,
+    raw: &str,
+    action: &str,
+    caller: &Caller,
+) -> Result<Response, ApiError> {
     let symbol = symbol(raw)?;
     let path = format!("/api/v1/admin/markets/{symbol}/{action}");
     let gateways = state.up.each_gateway(Method::POST, &path).await;
     let code = rollup(&gateways);
+    let level = if action == "halt" { "warn" } else { "info" };
+    let done = if code.is_success() {
+        ""
+    } else {
+        " (not on every gateway)"
+    };
+    let verb = if action == "halt" {
+        "Halted"
+    } else {
+        "Resumed"
+    };
+    state.monitor.note(
+        level,
+        format!("market {symbol}"),
+        format!("{verb}{done}"),
+        Some(caller.name().to_string()),
+    );
     let body = json!({ "symbol": symbol, "action": action, "ok": code.is_success(), "gateways": gateways });
     Ok((code, Json(body)).into_response())
 }
 
 async fn halt(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(raw): Path<String>,
 ) -> Result<Response, ApiError> {
-    forward(&state, &raw, "halt").await
+    forward(&state, &raw, "halt", &caller).await
 }
 
 async fn resume(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(raw): Path<String>,
 ) -> Result<Response, ApiError> {
-    forward(&state, &raw, "resume").await
+    forward(&state, &raw, "resume", &caller).await
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -787,10 +1101,17 @@ struct CancelCounts {
 /// `complete` is false if an order may be left open, in which case the request can be repeated.
 async fn cancel_all(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<Caller>,
     Path(raw): Path<String>,
 ) -> Result<Response, ApiError> {
     let symbol = symbol(&raw)?;
     let gateways = state.up.cancel_all(&symbol).await;
+    state.monitor.note(
+        "warn",
+        format!("market {symbol}"),
+        "Canceled all open orders".to_string(),
+        Some(caller.name().to_string()),
+    );
     let answer = gateways.last().filter(|result| result.ok);
     let counts = answer.map(|result| serde_json::from_value::<CancelCounts>(result.body.clone()));
     let code = match (&counts, gateways.last().and_then(|result| result.status)) {
@@ -814,12 +1135,63 @@ async fn cancel_all(
     Ok((code, Json(body)).into_response())
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 #[serde(deny_unknown_fields)]
-struct ActivityParams {
+pub struct ActivityParams {
     symbol: Option<String>,
     player: Option<String>,
+    side: Option<String>,
+    /// An execution type, such as `new`, `trade` or `canceled`.
+    event: Option<String>,
+    /// A client order ID, or the engine's order number.
+    order: Option<String>,
+    /// Pages back through older rows, as the `time` of the last row seen.
+    before: Option<String>,
     limit: Option<usize>,
+    /// For `/events`: `tape` leaves out markets, services and webhooks.
+    scope: Option<String>,
+}
+
+/// Every value reaches SQL parsed or from a fixed list, so none can contain a quote.
+pub fn tape_filter(params: &ActivityParams) -> Result<Filter, ApiError> {
+    let player = params.player.as_deref().filter(|text| !text.is_empty());
+    let side = params.side.as_deref().filter(|text| !text.is_empty());
+    let event = params.event.as_deref().filter(|text| !text.is_empty());
+    let order = params
+        .order
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    Ok(Filter {
+        symbol: params
+            .symbol
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .map(symbol)
+            .transpose()?,
+        player: player
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| invalid("player must be a UUID."))?,
+        side: side.map(Side::parse).transpose().map_err(invalid)?,
+        event: event
+            .map(crate::upstream::event_name)
+            .transpose()
+            .map_err(invalid)?,
+        order: order
+            .map(crate::upstream::OrderKey::parse)
+            .transpose()
+            .map_err(invalid)?,
+        before: params
+            .before
+            .as_deref()
+            .map(|time| {
+                events::is_timestamp(time)
+                    .then(|| time.to_string())
+                    .ok_or_else(|| invalid("before must be a timestamp."))
+            })
+            .transpose()?,
+    })
 }
 
 async fn recent(
@@ -833,11 +1205,7 @@ async fn recent(
     if limit == 0 || limit > MAX_LIMIT {
         return Err(invalid(format!("limit must be between 1 and {MAX_LIMIT}.")));
     }
-    let player = params.player.as_deref().map(Uuid::parse_str).transpose();
-    let filter = Filter {
-        symbol: params.symbol.as_deref().map(symbol).transpose()?,
-        player: player.map_err(|_| invalid("player must be a UUID."))?,
-    };
+    let filter = tape_filter(&params)?;
     let rows = state
         .up
         .recent(table, &filter, limit)
@@ -869,8 +1237,16 @@ async fn webhooks(State(state): State<Arc<AppState>>) -> Result<Json<Value>, Api
     Ok(Json(position.view()))
 }
 
-async fn activity(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    events::sse(state.up.clone(), state.poll_every)
+async fn activity(
+    State(state): State<Arc<AppState>>,
+    params: Result<Query<ActivityParams>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(params) = params.map_err(|rejection| invalid(rejection.body_text()))?;
+    let filter = tape_filter(&params)?;
+    let tape_only = params.scope.as_deref() == Some("tape");
+    let seat = stream_seat(&state)?;
+    let poller = events::Poller::new(state.up.clone(), filter, tape_only, state.poll_every);
+    Ok(events::sse(poller, state.poll_every, seat).into_response())
 }
 
 /// Kubernetes stops a pod with SIGTERM.

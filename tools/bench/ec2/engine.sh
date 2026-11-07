@@ -21,7 +21,7 @@ hugepages() {
 
 # The machine alone: if this shows the same stalls, the tail isn't the engine's.
 for cpu in 1 2; do
-    taskset -c $cpu target/release/sbx-jitter --seconds 30 > "$out/jitter-cpu$cpu.json"
+    taskset -c $cpu target/release/mmx-jitter --seconds 30 > "$out/jitter-cpu$cpu.json"
 done
 
 for mode in never always; do

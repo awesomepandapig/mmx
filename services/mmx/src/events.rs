@@ -1,6 +1,11 @@
 //! Activity for `GET /admin/v1/events`. Nothing here pushes changes, so this polls the same sources
 //! as the other routes and reports what's different. The first poll reports everything, so a new
 //! watcher starts with the current state and the last few orders and trades.
+//!
+//! The tape is sampled. Each poll reads only the newest rows, up to a fixed rate per table, however
+//! fast orders arrive, and skips ahead over the rest, so a watcher never falls behind and the load
+//! on QuestDB, this server and the browser doesn't grow with the order rate. A `sample` event says
+//! how many rows arrived and how many were sent, so a view can say what it's showing.
 
 use crate::upstream::{
     Filter, LiveMarket, ORDERS, Position, ServiceStatus, TRADES, Table, Upstreams,
@@ -12,14 +17,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt, stream};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
-use tokio::time::{Interval, MissedTickBehavior, interval};
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::{Interval, MissedTickBehavior, interval, sleep};
 
 /// Probing every service is the most expensive source, and it changes the least.
 const STATUS_EVERY: u64 = 5;
 const TAIL_ROWS: usize = 10;
+/// The most rows a watcher is sent per second, per table.
+pub const RATE_CAP: usize = 100;
+/// How long a stream lasts. A client reconnects by itself, and that checks its session again, so
+/// a revoked session can't keep watching.
+pub const STREAM_LIFETIME: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct Activity {
@@ -38,10 +49,12 @@ struct Cursor {
     primed: bool,
     after: Option<String>,
     seen: HashSet<i64>,
+    /// Whether the last poll found rows, so a view hears when the rate falls to zero.
+    active: bool,
 }
 
 /// Timestamps come back from QuestDB and go into SQL, so nothing else is let through.
-fn is_timestamp(text: &str) -> bool {
+pub fn is_timestamp(text: &str) -> bool {
     !text.is_empty()
         && text
             .bytes()
@@ -75,6 +88,11 @@ impl Cursor {
 
 pub struct Poller {
     up: Arc<Upstreams>,
+    filter: Filter,
+    /// Leaves out markets, services and webhooks, which a tape view has no use for.
+    tape_only: bool,
+    /// The most rows to send per poll, per table.
+    cap: usize,
     polls: u64,
     orders: Cursor,
     trades: Cursor,
@@ -86,9 +104,15 @@ pub struct Poller {
 }
 
 impl Poller {
-    pub fn new(up: Arc<Upstreams>) -> Self {
+    pub fn new(up: Arc<Upstreams>, filter: Filter, tape_only: bool, every: Duration) -> Self {
+        let per_poll = RATE_CAP as u128 * every.as_millis() / 1000;
         Self {
             up,
+            filter,
+            tape_only,
+            cap: usize::try_from(per_poll)
+                .unwrap_or(RATE_CAP)
+                .clamp(1, RATE_CAP),
             polls: 0,
             orders: Cursor::default(),
             trades: Cursor::default(),
@@ -202,87 +226,147 @@ impl Poller {
         self.polls += 1;
 
         let up = self.up.clone();
+        let tape_only = self.tape_only;
         let services = async {
-            if status_due {
+            if status_due && !tape_only {
                 up.status().await
             } else {
                 Vec::new()
             }
         };
+        let live = async {
+            if tape_only {
+                Vec::new()
+            } else {
+                up.live_markets().await
+            }
+        };
+        let position = async {
+            if tape_only {
+                None
+            } else {
+                Some(up.position().await)
+            }
+        };
+        let cap = self.cap;
         let (live, orders, trades, position, services) = tokio::join!(
-            up.live_markets(),
-            read_rows(&up, &ORDERS, &self.orders),
-            read_rows(&up, &TRADES, &self.trades),
-            up.position(),
+            live,
+            read_rows(&up, &ORDERS, &self.filter, &self.orders, cap),
+            read_rows(&up, &TRADES, &self.filter, &self.trades, cap),
+            position,
             services,
         );
 
         self.note_services(services, &mut out);
         self.note_markets(live, &mut out);
-        self.note_position(position, &mut out);
+        if let Some(position) = position {
+            self.note_position(position, &mut out);
+        }
 
         // Orders first, so that a fill reads after the order it fills.
-        if let Some(rows) = self.outcome("questdb orders", orders, &mut out) {
-            self.orders.primed = true;
-            out.extend(
-                self.orders
-                    .advance(rows)
-                    .into_iter()
-                    .map(|row| activity("order", Value::Object(row))),
-            );
+        if let Some(read) = self.outcome("questdb orders", orders, &mut out) {
+            take_rows("orders", "order", &mut self.orders, read, &mut out);
         }
-        if let Some(rows) = self.outcome("questdb trades", trades, &mut out) {
-            self.trades.primed = true;
-            out.extend(
-                self.trades
-                    .advance(rows)
-                    .into_iter()
-                    .map(|row| activity("trade", Value::Object(row))),
-            );
+        if let Some(read) = self.outcome("questdb trades", trades, &mut out) {
+            take_rows("trades", "trade", &mut self.trades, read, &mut out);
         }
         out
     }
 }
 
-/// A new watcher gets the tail of the table rather than all of it, then follows from there.
+/// One poll of a table: the rows read, oldest first, and how many matched in all.
+struct Read {
+    rows: Vec<Map<String, Value>>,
+    matched: u64,
+}
+
+/// A new watcher gets the tail of the table rather than all of it, then follows from there. If the
+/// read comes back full there are more rows than were read, and only then is it worth counting.
 async fn read_rows(
     up: &Upstreams,
     table: &Table,
+    filter: &Filter,
     cursor: &Cursor,
-) -> Result<Vec<Map<String, Value>>, String> {
-    if cursor.primed {
-        return up.follow(table, cursor.after.as_deref()).await;
-    }
-    let mut rows = up.recent(table, &Filter::default(), TAIL_ROWS).await?;
+    cap: usize,
+) -> Result<Read, String> {
+    let (since, limit) = match (cursor.primed, cursor.after.as_deref()) {
+        (true, Some(after)) => (Some(after), cap),
+        _ => (None, TAIL_ROWS),
+    };
+    let mut rows = up.newest(table, filter, since, limit).await?;
+    let matched = match since {
+        Some(after) if rows.len() >= limit => up.count_since(table, filter, after).await?,
+        _ => rows.len() as u64,
+    };
     rows.reverse();
-    Ok(rows)
+    Ok(Read { rows, matched })
 }
 
-type Pending = (Poller, VecDeque<Activity>, Interval);
+fn take_rows(
+    name: &'static str,
+    kind: &'static str,
+    cursor: &mut Cursor,
+    read: Read,
+    out: &mut Vec<Activity>,
+) {
+    let first = !cursor.primed;
+    cursor.primed = true;
+    let repeats = if first { 0 } else { cursor.seen.len() as u64 };
+    let fresh = cursor.advance(read.rows);
+    let sent = fresh.len() as u64;
+    out.extend(
+        fresh
+            .into_iter()
+            .map(|row| activity(kind, Value::Object(row))),
+    );
+    // The tail a new watcher starts with isn't a measure of anything.
+    let seen = read.matched.saturating_sub(repeats).max(sent);
+    if !first && (seen > 0 || cursor.active) {
+        out.push(activity(
+            "sample",
+            json!({ "table": name, "seen": seen, "sent": sent }),
+        ));
+    }
+    cursor.active = !first && seen > 0;
+}
 
-/// One poller per watcher, which stops when the watcher disconnects and drops the stream.
+type Pending = (Poller, VecDeque<Activity>, Interval, OwnedSemaphorePermit);
+
+/// One poller per watcher, which stops when the watcher disconnects and drops the stream. A client
+/// that reads slowly holds up its own next poll, which then skips ahead, so nothing piles up here.
 pub fn sse(
-    up: Arc<Upstreams>,
+    poller: Poller,
     every: Duration,
+    seat: OwnedSemaphorePermit,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut ticks = interval(every);
     // A slow poll just delays the next one, rather than causing a burst to catch up.
     ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let start: Pending = (Poller::new(up), VecDeque::new(), ticks);
+    let start: Pending = (poller, VecDeque::new(), ticks, seat);
 
-    let events = stream::unfold(start, |(mut poller, mut queue, mut ticks)| async move {
-        loop {
-            if let Some(item) = queue.pop_front() {
-                let event = Event::default()
-                    .event(item.kind)
-                    .data(item.data.to_string());
-                return Some((Ok(event), (poller, queue, ticks)));
+    let events = stream::unfold(
+        start,
+        |(mut poller, mut queue, mut ticks, seat)| async move {
+            loop {
+                if let Some(item) = queue.pop_front() {
+                    let event = Event::default()
+                        .event(item.kind)
+                        .data(item.data.to_string());
+                    return Some((Ok(event), (poller, queue, ticks, seat)));
+                }
+                ticks.tick().await;
+                queue.extend(poller.poll().await);
             }
-            ticks.tick().await;
-            queue.extend(poller.poll().await);
-        }
-    });
-    Sse::new(events).keep_alive(KeepAlive::default())
+        },
+    )
+    .take_until(sleep(STREAM_LIFETIME));
+    Sse::new(ready().chain(events)).keep_alive(KeepAlive::default())
+}
+
+/// Sent first. A quiet filter can go a long time without a row, and until something is written the
+/// browser can't tell this stream is open.
+pub fn ready() -> impl Stream<Item = Result<Event, Infallible>> {
+    stream::once(async { Ok(Event::default().event("ready").data("{}")) })
 }
 
 #[cfg(test)]

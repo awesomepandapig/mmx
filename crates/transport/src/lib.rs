@@ -68,7 +68,9 @@ pub fn connect(on_error: fn(i32, &str)) -> Result<Aeron, AeronCError> {
     let dir = aeron_dir();
     let context = AeronContext::new()?;
     context.set_dir(&cformat!("{dir}"))?;
-    context.set_error_handler(Some(move |code: i32, message: &str| on_error(code, message)))?;
+    context.set_error_handler(Some(move |code: i32, message: &str| {
+        on_error(code, message)
+    }))?;
     context.set_pre_touch_mapped_memory(true)?;
 
     let aeron = Aeron::new(&context)?;
@@ -92,6 +94,11 @@ pub fn subscription(
     stream_id: i32,
 ) -> Result<AeronSubscription, AeronCError> {
     aeron
-        .async_add_subscription(&cformat!("{channel}"), stream_id, Handlers::NONE, Handlers::NONE)?
+        .async_add_subscription(
+            &cformat!("{channel}"),
+            stream_id,
+            Handlers::NONE,
+            Handlers::NONE,
+        )?
         .poll_blocking(RESOURCE_TIMEOUT)
 }

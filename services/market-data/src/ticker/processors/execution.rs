@@ -53,8 +53,13 @@ mod tests {
         let mut state = TickerState::new("ITEM".to_string());
         let mut last_seen = 0;
 
-        assert_eq!(process_execution_report(&mut book, &mut last_seen, &mut state, &sample_report()), None);
-        assert!(process_execution_report(&mut book, &mut last_seen, &mut state, &trade()).is_some());
+        assert_eq!(
+            process_execution_report(&mut book, &mut last_seen, &mut state, &sample_report()),
+            None
+        );
+        assert!(
+            process_execution_report(&mut book, &mut last_seen, &mut state, &trade()).is_some()
+        );
     }
 
     #[test]
@@ -63,9 +68,13 @@ mod tests {
         let mut state = TickerState::new("ITEM".to_string());
         let mut last_seen = 0;
         process_execution_report(&mut book, &mut last_seen, &mut state, &sample_report());
-        let market = ExecutionReportMessage { price: NULL_DECIMAL, ..trade() };
+        let market = ExecutionReportMessage {
+            price: NULL_DECIMAL,
+            ..trade()
+        };
 
-        let update = process_execution_report(&mut book, &mut last_seen, &mut state, &market).expect("traded");
+        let update = process_execution_report(&mut book, &mut last_seen, &mut state, &market)
+            .expect("traded");
 
         assert!(update.contains(r#""price":"0.000001""#), "{update}");
         assert_eq!(book.bids.get(&100), Some(&10));
@@ -77,6 +86,8 @@ mod tests {
         let mut state = TickerState::new("ITEM".to_string());
         let mut last_seen = 0;
 
-        assert!(process_execution_report(&mut book, &mut last_seen, &mut state, &trade()).is_some());
+        assert!(
+            process_execution_report(&mut book, &mut last_seen, &mut state, &trade()).is_some()
+        );
     }
 }

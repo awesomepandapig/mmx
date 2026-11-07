@@ -45,7 +45,12 @@ impl TapeConfig {
         Self::new(&archives, &reports, client_host, replay_stream).map(Some)
     }
 
-    pub fn new(archives: &str, reports: &str, client_host: String, replay_stream: i32) -> Result<Self, String> {
+    pub fn new(
+        archives: &str,
+        reports: &str,
+        client_host: String,
+        replay_stream: i32,
+    ) -> Result<Self, String> {
         let archives = endpoints(archives);
         let reports = endpoints(reports);
         if archives.is_empty() || archives.len() != reports.len() {
@@ -55,7 +60,12 @@ impl TapeConfig {
                 reports.len()
             ));
         }
-        Ok(Self { archives, reports, client_host, replay_stream })
+        Ok(Self {
+            archives,
+            reports,
+            client_host,
+            replay_stream,
+        })
     }
 
     fn control_request_channel(&self, node: usize) -> String {
@@ -106,9 +116,13 @@ fn text(error: impl std::fmt::Debug) -> String {
 
 fn archive_client() -> Result<archive::Aeron, String> {
     let context = archive::AeronContext::new().map_err(text)?;
-    context.set_dir(&cstring(&transport::aeron_dir())?).map_err(text)?;
     context
-        .set_error_handler(Some(|code: i32, message: &str| error!("Aeron: Error {}: {}", code, message)))
+        .set_dir(&cstring(&transport::aeron_dir())?)
+        .map_err(text)?;
+    context
+        .set_error_handler(Some(|code: i32, message: &str| {
+            error!("Aeron: Error {}: {}", code, message)
+        }))
         .map_err(text)?;
     let aeron = archive::Aeron::new(&context).map_err(text)?;
     aeron.start().map_err(text)?;
@@ -165,7 +179,12 @@ impl Follower {
             .poll_blocking(CONNECT_TIMEOUT)
             .map_err(text)?;
         let recording_id = client
-            .find_last_matching_recording(0, &cstring("")?, transport::EXECUTIONS_STREAM, REPORT_SESSION)
+            .find_last_matching_recording(
+                0,
+                &cstring("")?,
+                transport::EXECUTIONS_STREAM,
+                REPORT_SESSION,
+            )
             .map_err(text)?;
         if recording_id < 0 {
             return Err("the report stream has no recording yet".to_string());
@@ -190,7 +209,10 @@ impl Follower {
     }
 
     fn move_to_next_node(&mut self, reason: &str) {
-        warn!("Tape: leaving node {} at position {}: {}", self.node, self.position, reason);
+        warn!(
+            "Tape: leaving node {} at position {}: {}",
+            self.node, self.position, reason
+        );
         self.subscription = None;
         self.aeron = None;
         self.node = (self.node + 1) % self.config.archives.len();
@@ -209,7 +231,10 @@ impl Follower {
             if now >= self.retry_at {
                 match self.open() {
                     Ok(subscription) => {
-                        info!("Tape: following node {} from position {}", self.node, self.position);
+                        info!(
+                            "Tape: following node {} from position {}",
+                            self.node, self.position
+                        );
                         self.subscription = Some(subscription);
                         self.last_progress = Instant::now();
                     }
@@ -239,8 +264,15 @@ impl Follower {
             self.last_progress = now;
         }
         let failure = failure
-            .or_else(|| subscription.has_failed().then(|| text(subscription.get_failure_reason())))
-            .or_else(|| (now.duration_since(self.last_progress) > STALL_AFTER).then(|| "stalled".to_string()));
+            .or_else(|| {
+                subscription
+                    .has_failed()
+                    .then(|| text(subscription.get_failure_reason()))
+            })
+            .or_else(|| {
+                (now.duration_since(self.last_progress) > STALL_AFTER)
+                    .then(|| "stalled".to_string())
+            });
         if let Some(reason) = failure {
             self.move_to_next_node(&reason);
         }
@@ -252,7 +284,9 @@ impl Follower {
     }
 
     pub fn is_live(&self) -> bool {
-        self.subscription.as_ref().is_some_and(|subscription| subscription.is_live())
+        self.subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.is_live())
     }
 }
 
@@ -261,15 +295,22 @@ mod tests {
     use super::*;
 
     fn config() -> TapeConfig {
-        TapeConfig::new("a:8010, b:8011,", "a:40450,b:40451", "me".to_string(), 3000).expect("valid")
+        TapeConfig::new("a:8010, b:8011,", "a:40450,b:40451", "me".to_string(), 3000)
+            .expect("valid")
     }
 
     #[test]
     fn endpoints_are_paired_by_node() {
         let config = config();
         assert_eq!(config.archives, ["a:8010", "b:8011"]);
-        assert_eq!(config.control_request_channel(1), "aeron:udp?endpoint=b:8011");
-        assert_eq!(config.live_channel(1), "aeron:udp?endpoint=me:0|control=b:40451|session-id=1002");
+        assert_eq!(
+            config.control_request_channel(1),
+            "aeron:udp?endpoint=b:8011"
+        );
+        assert_eq!(
+            config.live_channel(1),
+            "aeron:udp?endpoint=me:0|control=b:40451|session-id=1002"
+        );
         assert_eq!(config.client_channel(), "aeron:udp?endpoint=me:0");
         assert_eq!(config.replay_stream(1), 3001);
     }
@@ -282,7 +323,10 @@ mod tests {
 
     #[test]
     fn position_zero_means_the_start_of_the_recording() {
-        assert_eq!(start_position(0), archive::PERSISTENT_SUBSCRIPTION_FROM_START);
+        assert_eq!(
+            start_position(0),
+            archive::PERSISTENT_SUBSCRIPTION_FROM_START
+        );
         assert_eq!(start_position(4096), 4096);
     }
 }

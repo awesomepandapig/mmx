@@ -35,7 +35,12 @@ impl Timing {
             let at = |q: f64| sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)];
             format!(
                 "{name} n={} p50={} p99={} p99.9={} p99.99={} max={}\n",
-                sorted.len(), at(0.5), at(0.99), at(0.999), at(0.9999), at(1.0)
+                sorted.len(),
+                at(0.5),
+                at(0.99),
+                at(0.999),
+                at(0.9999),
+                at(1.0)
             )
         };
         let warm_from = self.in_to_out.len() / 5;
@@ -54,7 +59,13 @@ impl Timing {
         let text = line("matching_ns", &self.matching)
             + &line("in_to_out_ns", &self.in_to_out)
             + &line("warm_in_to_out_ns", &self.in_to_out[warm_from..])
-            + &format!("stalls_us_at_index {:?}\n", stalls.iter().map(|(v, i)| (v / 1000, *i)).collect::<Vec<_>>());
+            + &format!(
+                "stalls_us_at_index {:?}\n",
+                stalls
+                    .iter()
+                    .map(|(v, i)| (v / 1000, *i))
+                    .collect::<Vec<_>>()
+            );
         let _ = std::fs::write(&self.path, text);
     }
 }
@@ -90,8 +101,14 @@ impl Diagnostics {
 
     pub fn message_finished(&mut self, started: Option<Instant>, timestamp: i64) {
         if let (Some(timing), Some(started)) = (&mut self.timing, started) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock is after the epoch").as_nanos() as i64;
-            timing.record(started.elapsed().as_nanos() as u64, (now - timestamp).max(0) as u64);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock is after the epoch")
+                .as_nanos() as i64;
+            timing.record(
+                started.elapsed().as_nanos() as u64,
+                (now - timestamp).max(0) as u64,
+            );
         }
     }
 
@@ -114,7 +131,8 @@ impl Diagnostics {
             if state.written != self.last_written {
                 self.last_written = state.written;
                 if let Some(path) = &self.digest_file {
-                    let _ = std::fs::write(path, format!("{} {:016x}\n", state.written, state.digest));
+                    let _ =
+                        std::fs::write(path, format!("{} {:016x}\n", state.written, state.digest));
                 }
             }
         }

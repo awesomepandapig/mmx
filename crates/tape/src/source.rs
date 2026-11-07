@@ -54,7 +54,8 @@ impl Source {
         match self {
             Self::Tape(follower) => follower.poll(limit, handler),
             Self::Live(aeron, subscription) => {
-                let result = subscription.poll_fn(|buffer, header| handler(buffer, header.position()), limit);
+                let result = subscription
+                    .poll_fn(|buffer, header| handler(buffer, header.position()), limit);
                 match result {
                     Ok(read) if !aeron.is_closed() => read,
                     result => {

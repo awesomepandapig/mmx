@@ -87,6 +87,12 @@ pub fn render(kind: &str, data: &Value) -> String {
                 text(data, "target")
             )
         }
+        "sample" => format!(
+            "sample  {} sent {} of {}",
+            text(data, "table"),
+            data.get("sent").unwrap_or(&Value::Null),
+            data.get("seen").unwrap_or(&Value::Null),
+        ),
         "source_failed" => format!(
             "source  {} failing: {}",
             text(data, "source"),
@@ -153,7 +159,9 @@ pub async fn watch(url: &str, token: Option<&str>, json: bool) -> Result<(), Str
                 while let Ok(Some(chunk)) = response.chunk().await {
                     buffer.extend_from_slice(&chunk);
                     for (kind, data) in take_events(&mut buffer) {
-                        show(&kind, &data, json);
+                        if kind != "ready" {
+                            show(&kind, &data, json);
+                        }
                     }
                 }
                 output::note("connection lost, reconnecting");

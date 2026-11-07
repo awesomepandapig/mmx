@@ -81,11 +81,15 @@ pub struct Limit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Allowed,
-    Limited { retry_after_ms: u64 },
+    Limited {
+        retry_after_ms: u64,
+    },
     /// Another request already claimed this order ID.
     Duplicate,
     /// The claim store lost its data, so nothing can be claimed yet.
-    Recovering { retry_after_ms: u64 },
+    Recovering {
+        retry_after_ms: u64,
+    },
     /// By Valkey's clock this ID is out of date, though it wasn't by the gateway's.
     OutOfDate,
 }
@@ -134,13 +138,13 @@ pub fn claim_key(player: Uuid, id: Uuid) -> String {
 fn decision(reply: &[i64]) -> Result<Decision, String> {
     match reply {
         [1, _] => Ok(Decision::Allowed),
-        [0, retry_after_ms] => {
-            Ok(Decision::Limited { retry_after_ms: (*retry_after_ms).max(1) as u64 })
-        }
+        [0, retry_after_ms] => Ok(Decision::Limited {
+            retry_after_ms: (*retry_after_ms).max(1) as u64,
+        }),
         [2, _] => Ok(Decision::Duplicate),
-        [3, retry_after_ms] => {
-            Ok(Decision::Recovering { retry_after_ms: (*retry_after_ms).max(1) as u64 })
-        }
+        [3, retry_after_ms] => Ok(Decision::Recovering {
+            retry_after_ms: (*retry_after_ms).max(1) as u64,
+        }),
         [4, _] => Ok(Decision::OutOfDate),
         other => Err(format!("unexpected reply {other:?}")),
     }
@@ -155,7 +159,10 @@ pub struct ValkeyLink {
 impl ValkeyLink {
     pub fn new(url: &str) -> Result<Self, String> {
         let client = redis::Client::open(url).map_err(|err| err.to_string())?;
-        Ok(Self { client, connection: OnceCell::new() })
+        Ok(Self {
+            client,
+            connection: OnceCell::new(),
+        })
     }
 
     pub async fn connection(&self) -> Result<ConnectionManager, String> {
@@ -180,12 +187,26 @@ pub struct Valkey {
 }
 
 impl Valkey {
-    pub fn new(url: &str, default_limit: Limit, id_rules: Option<OrderIdRules>) -> Result<Self, String> {
+    pub fn new(
+        url: &str,
+        default_limit: Limit,
+        id_rules: Option<OrderIdRules>,
+    ) -> Result<Self, String> {
         let link = ValkeyLink::new(url)?;
-        Ok(Self { link, script: Script::new(CHECK_SCRIPT), default_limit, id_rules })
+        Ok(Self {
+            link,
+            script: Script::new(CHECK_SCRIPT),
+            default_limit,
+            id_rules,
+        })
     }
 
-    async fn run(&self, player: Uuid, claim: Option<Claim>, epoch: bool) -> Result<Decision, String> {
+    async fn run(
+        &self,
+        player: Uuid,
+        claim: Option<Claim>,
+        epoch: bool,
+    ) -> Result<Decision, String> {
         let mut connection = self.link.connection().await?;
         let mut call = self.script.prepare_invoke();
         call.key(count_key(player))
@@ -203,12 +224,19 @@ impl Valkey {
         if let Some(claim) = claim {
             call.key(claim_key(player, claim.id)).arg(claim.time_ms);
         }
-        let reply: Vec<i64> =
-            call.invoke_async(&mut connection).await.map_err(|err| err.to_string())?;
+        let reply: Vec<i64> = call
+            .invoke_async(&mut connection)
+            .await
+            .map_err(|err| err.to_string())?;
         decision(&reply)
     }
 
-    async fn limited(&self, player: Uuid, claim: Option<Claim>, epoch: bool) -> Result<Decision, String> {
+    async fn limited(
+        &self,
+        player: Uuid,
+        claim: Option<Claim>,
+        epoch: bool,
+    ) -> Result<Decision, String> {
         timeout(CHECK_TIMEOUT, self.run(player, claim, epoch))
             .await
             .map_err(|_| "timed out".to_string())
@@ -247,18 +275,36 @@ mod tests {
     #[test]
     fn reads_the_script_reply() {
         assert_eq!(decision(&[1, 0]), Ok(Decision::Allowed));
-        assert_eq!(decision(&[0, 250]), Ok(Decision::Limited { retry_after_ms: 250 }));
+        assert_eq!(
+            decision(&[0, 250]),
+            Ok(Decision::Limited {
+                retry_after_ms: 250
+            })
+        );
         // A key can expire between the count and the PTTL, which reports a negative time.
-        assert_eq!(decision(&[0, -2]), Ok(Decision::Limited { retry_after_ms: 1 }));
+        assert_eq!(
+            decision(&[0, -2]),
+            Ok(Decision::Limited { retry_after_ms: 1 })
+        );
         assert_eq!(decision(&[2, 0]), Ok(Decision::Duplicate));
-        assert_eq!(decision(&[3, 500]), Ok(Decision::Recovering { retry_after_ms: 500 }));
+        assert_eq!(
+            decision(&[3, 500]),
+            Ok(Decision::Recovering {
+                retry_after_ms: 500
+            })
+        );
         assert_eq!(decision(&[4, 0]), Ok(Decision::OutOfDate));
         assert!(decision(&[]).is_err());
     }
 
-    const RULES: OrderIdRules =
-        OrderIdRules { window: Duration::from_secs(2), session_timeout: Duration::from_secs(1) };
-    const LIMIT: Limit = Limit { orders: 2, window_ms: 60_000 };
+    const RULES: OrderIdRules = OrderIdRules {
+        window: Duration::from_secs(2),
+        session_timeout: Duration::from_secs(1),
+    };
+    const LIMIT: Limit = Limit {
+        orders: 2,
+        window_ms: 60_000,
+    };
 
     async fn raw(client: &redis::Client, command: redis::Cmd) -> redis::Value {
         let mut connection = client.get_multiplexed_async_connection().await.unwrap();
@@ -267,7 +313,10 @@ mod tests {
 
     fn claim_now() -> Claim {
         let id = Uuid::now_v7();
-        Claim { id, time_ms: crate::order_id::time_ms(id).unwrap() }
+        Claim {
+            id,
+            time_ms: crate::order_id::time_ms(id).unwrap(),
+        }
     }
 
     /// Run by hand against a scratch server, because it empties it:
@@ -285,7 +334,10 @@ mod tests {
         // An empty store is a lost one, so the first caller starts the hold for everyone.
         let held = valkey.check(player, Some(claim_now())).await.unwrap();
         assert!(matches!(held, Decision::Recovering { .. }), "{held:?}");
-        assert!(matches!(other.claims_ready().await, Ok(Decision::Recovering { .. })));
+        assert!(matches!(
+            other.claims_ready().await,
+            Ok(Decision::Recovering { .. })
+        ));
         let late_start = Valkey::new(&url, LIMIT, Some(RULES)).unwrap();
         let Ok(Decision::Recovering { retry_after_ms }) = late_start.claims_ready().await else {
             panic!("a gateway starting now must join the same hold");
@@ -298,7 +350,11 @@ mod tests {
         let claim = claim_now();
         let calls: Vec<_> = (0..32)
             .map(|turn| {
-                let gateway = if turn % 2 == 0 { valkey.clone() } else { other.clone() };
+                let gateway = if turn % 2 == 0 {
+                    valkey.clone()
+                } else {
+                    other.clone()
+                };
                 tokio::spawn(async move { gateway.run(player, Some(claim), true).await })
             })
             .collect();
@@ -306,30 +362,65 @@ mod tests {
         for call in calls {
             answers.push(call.await.unwrap());
         }
-        let won = answers.iter().filter(|answer| **answer == Ok(Decision::Allowed)).count();
-        let lost = answers.iter().filter(|answer| **answer == Ok(Decision::Duplicate)).count();
+        let won = answers
+            .iter()
+            .filter(|answer| **answer == Ok(Decision::Allowed))
+            .count();
+        let lost = answers
+            .iter()
+            .filter(|answer| **answer == Ok(Decision::Duplicate))
+            .count();
         assert_eq!((won, lost), (1, 31), "{answers:?}");
 
         // The repeats spent nothing: one more order fits in a limit of two, and the next doesn't.
-        assert_eq!(valkey.check(player, Some(claim_now())).await, Ok(Decision::Allowed));
+        assert_eq!(
+            valkey.check(player, Some(claim_now())).await,
+            Ok(Decision::Allowed)
+        );
         let refused = claim_now();
         let limited = valkey.check(player, Some(refused)).await.unwrap();
         assert!(matches!(limited, Decision::Limited { .. }), "{limited:?}");
-        let exists = raw(&client, redis::cmd("EXISTS").arg(claim_key(player, refused.id)).clone()).await;
-        assert_eq!(exists, redis::Value::Int(0), "a limited order keeps nothing");
+        let exists = raw(
+            &client,
+            redis::cmd("EXISTS")
+                .arg(claim_key(player, refused.id))
+                .clone(),
+        )
+        .await;
+        assert_eq!(
+            exists,
+            redis::Value::Int(0),
+            "a limited order keeps nothing"
+        );
 
         // The claim's lifetime is the one it was promised.
         let key = claim_key(player, claim.id);
-        let redis::Value::Int(ttl) = raw(&client, redis::cmd("PTTL").arg(&key).clone()).await else {
+        let redis::Value::Int(ttl) = raw(&client, redis::cmd("PTTL").arg(&key).clone()).await
+        else {
             panic!("expected a TTL");
         };
-        assert!(ttl > RULES.window.as_millis() as i64 + FUTURE_SKEW.as_millis() as i64, "{ttl}");
+        assert!(
+            ttl > RULES.window.as_millis() as i64 + FUTURE_SKEW.as_millis() as i64,
+            "{ttl}"
+        );
 
         // Valkey's clock has the last word on an ID's age.
-        let old = Claim { id: Uuid::now_v7(), time_ms: 1 };
-        assert_eq!(valkey.check(Uuid::now_v7(), Some(old)).await, Ok(Decision::OutOfDate));
-        let ahead = Claim { id: Uuid::now_v7(), time_ms: u64::MAX / 2 };
-        assert_eq!(valkey.check(Uuid::now_v7(), Some(ahead)).await, Ok(Decision::OutOfDate));
+        let old = Claim {
+            id: Uuid::now_v7(),
+            time_ms: 1,
+        };
+        assert_eq!(
+            valkey.check(Uuid::now_v7(), Some(old)).await,
+            Ok(Decision::OutOfDate)
+        );
+        let ahead = Claim {
+            id: Uuid::now_v7(),
+            time_ms: u64::MAX / 2,
+        };
+        assert_eq!(
+            valkey.check(Uuid::now_v7(), Some(ahead)).await,
+            Ok(Decision::OutOfDate)
+        );
 
         // Losing everything starts a new hold, and a replay of a lost ID can't pass during it.
         raw(&client, redis::cmd("FLUSHALL")).await;
@@ -337,7 +428,10 @@ mod tests {
         assert!(matches!(replay, Decision::Recovering { .. }), "{replay:?}");
         tokio::time::sleep(RULES.recovery_hold()).await;
         // By now the ID is out of date, so the lost claim can't matter.
-        assert_eq!(valkey.check(player, Some(claim)).await, Ok(Decision::OutOfDate));
+        assert_eq!(
+            valkey.check(player, Some(claim)).await,
+            Ok(Decision::OutOfDate)
+        );
     }
 
     #[tokio::test]
@@ -347,6 +441,10 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(valkey.check(Uuid::nil(), Some(claim_now())).await.is_err());
         assert!(valkey.claims_ready().await.is_err());
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

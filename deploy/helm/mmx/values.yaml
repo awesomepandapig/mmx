@@ -1,11 +1,13 @@
-# Production defaults: Linux x86, on nodes prepared as described in deploy/README.md. For a laptop,
-# add values-local.yaml.
+# Shared-CPU defaults for three Linux x86 Kubernetes nodes.
+# Add values-performance.yaml for dedicated peak-throughput nodes.
 
 image:
   registry: ghcr.io/awesomepandapig/mmx
   # Defaults to the chart's appVersion.
   tag: ""
   pullPolicy: IfNotPresent
+  # Per image name, for example api: sha256:<64 hex characters>. Overrides tag.
+  digests: {}
 
 imagePullSecrets: []
 
@@ -19,79 +21,76 @@ cluster:
   # OnDelete, because a pod reports ready before it has caught up with the log, so a rolling update
   # could take out a quorum. Restart members one at a time, as described in deploy/README.md.
   updateStrategy: OnDelete
-  # Whole CPUs and equal requests and limits, so kubelet's static CPU manager gives this pod
-  # exclusive cores. Turn off only where that isn't available.
-  guaranteed: true
+  # Optional exclusive cores with a configured static CPU manager.
+  guaranteed: false
   # Moves consensus, sender, receiver and engine threads onto a CPU each.
-  pinThreads: true
+  pinThreads: false
 
-  # Tight failover settings. A leader is replaced after `leaderHeartbeatTimeout`, so raise these on
-  # hardware or networks that can stall for that long.
-  leaderHeartbeatTimeout: 500ms
+  # Shared-CPU failover settings; tune these against measured scheduler/network stalls.
+  leaderHeartbeatTimeout: 5s
   leaderHeartbeatInterval: 100ms
-  electionTimeout: 500ms
-  startupCanvassTimeout: 5s
+  electionTimeout: 2s
+  startupCanvassTimeout: 15s
   sessionTimeout: 30s
 
-  threadingMode: DEDICATED
-  idleStrategy: org.agrona.concurrent.BusySpinIdleStrategy
-  # Keep false in production, so a term buffer can't fault in memory while matching.
-  sparseTermBuffers: false
-  # The kernel caps this at net.core.rmem_max and wmem_max, which are set on the node.
-  socketBuffer: 4m
+  threadingMode: SHARED
+  idleStrategy: ""
+  # Preallocate buffers in the performance profile to avoid page faults while matching.
+  sparseTermBuffers: true
+  # Fits ordinary Linux socket-buffer limits; tune nodes for larger performance buffers.
+  socketBuffer: 128k
   logTermLength: 16m
-  # 0 relies on replication. 1 syncs data and 2 also syncs metadata, on every write. At 1 a commit is
-  # on a quorum's disks, so those disks must survive power loss.
+  # Archive file sync: 0 disables sync, 1 syncs data and 2 also syncs metadata.
+  # This setting alone does not guarantee quorum disk durability.
   archiveSyncLevel: 1
   # Any other Aeron properties, which override everything above.
   extraProperties: {}
 
   # Holds cnc.dat and every term buffer. It counts against the pod's memory limits below.
   sharedMemory:
-    sizeLimit: 4Gi
+    sizeLimit: 1Gi
 
   persistence:
     # The tape is kept forever by default, so size this for retention.
-    size: 200Gi
+    size: 15Gi
     # Empty uses the cluster's default. Use the fastest local disk available.
     storageClass: ""
 
   node:
     image: node
-    heapMin: 512m
-    heapMax: 2g
-    # Consensus, sender and receiver take a CPU each, and everything else shares the rest. On hosts
-    # with SMT, full-pcpus-only requires a multiple of two.
+    heapMin: 128m
+    heapMax: 512m
+    # Shared CPU request; the performance profile reserves whole cores.
     resources:
-      cpu: "6"
-      memory: 8Gi
+      cpu: 500m
+      memory: 2Gi
 
   engine:
     image: matching-engine
     # Resting orders across all symbols. See "Capacity" in STARTUP.md for the memory this needs.
-    maxOrders: 1000000
-    reportTermLength: 64m
+    maxOrders: 100000
+    reportTermLength: 16m
     rustLog: info
     # Other engine settings, such as TAPE_RETENTION_BYTES or RECOVERY_MODE.
     env: {}
-    # The main thread takes a CPU, and the Aeron client's threads share the other.
+    # Shared CPU request; matching capacity depends on available CPU time.
     resources:
-      cpu: "2"
-      memory: 3Gi
+      cpu: 500m
+      memory: 1Gi
 
   podDisruptionBudget:
     enabled: true
 
 # Media driver beside every gateway and consumer. Term buffers in shared memory are charged to the
-# driver that touches them, so memory covers the JVM and the buffers: a gateway reads one 64m report
-# stream per member, which is 576 MB at three terms each.
+# driver that touches them, so memory covers both the JVM and the term buffers.
+# Increase driver memory when increasing report term lengths or cluster size.
 driver:
   threadingMode: SHARED
-  heapMax: 256m
-  socketBuffer: 4m
+  heapMax: 128m
+  socketBuffer: 128k
   resources:
-    cpu: 500m
-    memory: 1536Mi
+    cpu: 100m
+    memory: 768Mi
 
 gateway:
   image: api
@@ -105,13 +104,18 @@ gateway:
     type: ClusterIP
     port: 8000
     annotations: {}
-  # Set to /readyz once the gateway serves it. Empty uses a TCP check.
-  readinessPath: ""
+    labels: {}
+    nodePort: null
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: ""
+  # The application reports whether it can reach the engine. Empty selects a TCP check.
+  readinessPath: /readyz
   sharedMemory:
     # It reads a report stream from every cluster member.
-    sizeLimit: 2Gi
+    sizeLimit: 1Gi
   resources:
-    cpu: "1"
+    cpu: 250m
     memory: 512Mi
 
 # `mmx serve`: the admin API, with the console built in. The Service is all the chart makes, so
@@ -127,9 +131,36 @@ console:
   adminPasswordSecret:
     name: ""
     key: password
+  # Set this to false with `oidc.enabled`, and people only ever see the provider. It's a first-install
+  # default: `mmx auth password-login on` still works as a way back in, and wins over this value.
+  passwordLogin: true
+  # Connects an OpenID Connect provider at install time. It can't be changed from the console then.
+  # Register https://<the address people use>/admin/v1/oidc/callback with the provider.
+  oidc:
+    enabled: false
+    issuer: ""
+    clientId: ""
+    # A Secret you create, holding the client secret.
+    clientSecret:
+      name: ""
+      key: client-secret
+    # The name on the sign-in button.
+    displayName: ""
+    # The ID token claim holding the person's groups.
+    groupsClaim: groups
+    # Provider groups for each role, by exact name. Anyone in none of them is refused.
+    groups:
+      admin: []
+      operator: []
+      viewer: []
   service:
     type: ClusterIP
     annotations: {}
+    labels: {}
+    nodePort: null
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: ""
   resources:
     cpu: 250m
     memory: 256Mi
@@ -153,18 +184,18 @@ consumers:
     env:
       CHECKPOINT_DIR: /var/lib/mmx/checkpoints
     persistence:
-      size: 5Gi
+      size: 1Gi
       storageClass: ""
       mountPath: /var/lib/mmx
     resources:
-      cpu: "3"
-      memory: 1536Mi
+      cpu: 750m
+      memory: 512Mi
   # Required, along with `questdb.enabled`: the gateway answers `GET` orders from QuestDB.
   trade-reporter:
     enabled: true
     image: trade-reporter
     resources:
-      cpu: "1"
+      cpu: 250m
       memory: 512Mi
   # Takes its URL from the console's ConfigMap and its secret from the console's Secret, and waits
   # without them. Set a webhook in the console, then restart it.
@@ -174,12 +205,12 @@ consumers:
     env:
       OUTBOX_DIR: /data
     persistence:
-      size: 20Gi
+      size: 5Gi
       storageClass: ""
       mountPath: /data
     resources:
-      cpu: "1"
-      memory: 1Gi
+      cpu: 250m
+      memory: 512Mi
   # A development tool that keeps every order in memory.
   observer:
     enabled: false
@@ -203,14 +234,20 @@ websocket:
   service:
     type: ClusterIP
     annotations: {}
+    labels: {}
+    nodePort: null
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: ""
   readinessPath: ""
   resources:
     cpu: 500m
     memory: 256Mi
 
-# The web UI.
+# Optional marketing site and browser-only simulation. The operator console is always
+# embedded in `mmx serve` above; this flag does not control it. Host web/docs separately if preferred.
 ui:
-  enabled: true
+  enabled: false
   image: web
   replicas: 2
   port: 3000
@@ -218,6 +255,11 @@ ui:
   service:
     type: ClusterIP
     annotations: {}
+    labels: {}
+    nodePort: null
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    externalTrafficPolicy: ""
   resources:
     cpu: 250m
     memory: 256Mi
@@ -227,11 +269,11 @@ ui:
 questdbRebuild:
   enabled: false
   resources:
-    cpu: "1"
+    cpu: 250m
     memory: 1Gi
 
-# Demo mode, which lets the web UI trade as a demo player. Its password is generated at install and
-# kept in the `demo` Secret. Leave this off for a real deployment.
+# Reserved legacy demo settings; the current web /demo is always a browser simulation,
+# independent of these credentials. Leave off: no live trading demo or demo-bots image is shipped.
 demo:
   enabled: false
   # Load bots, which send orders through the gateway.
@@ -273,11 +315,11 @@ questdb:
   enabled: true
   image: docker.io/questdb/questdb:8.2.3
   persistence:
-    size: 50Gi
+    size: 10Gi
     storageClass: ""
   resources:
-    cpu: "2"
-    memory: 4Gi
+    cpu: 500m
+    memory: 1Gi
 
 valkey:
   enabled: true

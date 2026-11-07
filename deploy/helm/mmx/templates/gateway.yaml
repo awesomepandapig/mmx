@@ -49,18 +49,25 @@ metadata:
   name: {{ $name }}
   labels:
     {{- include "mmx.labels" $labels | nindent 4 }}
+  {{- with $gateway.service.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with $gateway.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
   type: {{ $gateway.service.type }}
+  {{- include "mmx.serviceNetworking" $gateway.service | nindent 2 }}
   selector:
     {{- include "mmx.selectorLabels" $labels | nindent 4 }}
   ports:
     - name: http
       port: {{ $gateway.service.port }}
       targetPort: http
+      {{- if and (has $gateway.service.type (list "NodePort" "LoadBalancer")) $gateway.service.nodePort }}
+      nodePort: {{ $gateway.service.nodePort }}
+      {{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment

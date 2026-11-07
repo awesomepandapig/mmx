@@ -1,65 +1,61 @@
 import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
+import { Confirm } from "../components/Confirm";
 import {
   Button,
-  Card,
   Code,
   CopyButton,
+  ErrorState,
   Field,
+  Metric,
   Modal,
   Notice,
-  PageHeader,
-  SectionTitle,
+  Panel,
+  Tiles,
+  Word,
 } from "../components/ui";
 import { api, messageOf } from "../lib/api";
 import type { WebhookConfig, WebhookPosition } from "../lib/api";
-import { usePolled } from "../lib/hooks";
-import { WebhookFacts } from "./Activity";
+import { useExchange } from "../lib/exchange";
+import type { Tone } from "../lib/exchange";
+import { bytes, count } from "../lib/format";
+import { usePolled, useTitle } from "../lib/hooks";
+import { useCan } from "../lib/session";
 
-function Applied({ config }: { config: WebhookConfig }) {
-  const restart = (
-    <div className="mt-2 flex flex-wrap items-center gap-2">
-      <Code>{config.restart}</Code>
-      <CopyButton text={config.restart} />
-    </div>
+const deliveryWords: Record<WebhookPosition["state"], { word: string; tone: Tone }> = {
+  not_configured: { word: "Not configured", tone: "warn" },
+  halted: { word: "Halted", tone: "bad" },
+  verifying: { word: "Verifying", tone: "plain" },
+  failing: { word: "Failing", tone: "bad" },
+  delivering: { word: "Delivering", tone: "plain" },
+  idle: { word: "Caught up", tone: "plain" },
+};
+
+function Restart({ config }: { config: WebhookConfig }) {
+  if (config.state !== "restart_required" && config.state !== "unknown") return null;
+  const unknown = config.state === "unknown";
+  return (
+    <Notice
+      state="warn"
+      title={
+        unknown ? "Can't confirm what the outbox is using" : "Restart the outbox to apply this"
+      }
+      className="border-x-0 border-t-0"
+    >
+      {unknown && config.running_error && <p>{config.running_error}</p>}
+      <p>It then delivers everything on the tape it hasn't sent, which can be a large batch.</p>
+      <div className="mt-1 flex flex-wrap items-center gap-2">
+        <Code>{config.restart}</Code>
+        <CopyButton text={config.restart} />
+      </div>
+    </Notice>
   );
-  switch (config.state) {
-    case "applied":
-      return <Notice state="good" title="The outbox is using these settings" />;
-    case "restart_required":
-      return (
-        <Notice state="warn" title="Saved. Restart the outbox to apply it">
-          The outbox reads these settings when it starts, so it's still using the old ones. Once it
-          starts, it sends everything on the tape it hasn't delivered yet, which on a first setup is
-          the whole history.
-          {restart}
-        </Notice>
-      );
-    case "from_environment":
-      return (
-        <Notice state="idle" title="The outbox is using settings from its environment">
-          It's sending to {config.running_url}. Saving a URL and a secret here replaces them after a
-          restart.
-        </Notice>
-      );
-    case "incomplete":
-      return (
-        <Notice state="idle" title="Set a URL and a signing secret">
-          The outbox needs both, and a restart to pick them up.
-        </Notice>
-      );
-    default:
-      return (
-        <Notice state="warn" title="Can't confirm what the outbox is using">
-          {config.running_error ?? "This outbox doesn't report its settings."} Restart it to be sure
-          it has these.
-          {restart}
-        </Notice>
-      );
-  }
 }
 
 export function Webhooks() {
+  useTitle("Webhooks");
+  const canEdit = useCan("admin");
+  const { canTrade, status } = useExchange();
   const config = usePolled(() => api.get<WebhookConfig>("/webhooks/config"), 5000);
   const delivery = usePolled(() => api.get<WebhookPosition>("/webhooks"), 3000);
   const [url, setUrl] = useState("");
@@ -69,9 +65,12 @@ export function Webhooks() {
   const [confirming, setConfirming] = useState(false);
   const [secret, setSecret] = useState<string | null>(null);
 
+  const current = config.data;
+  const position = delivery.data;
+
   useEffect(() => {
-    if (!edited) setUrl(config.data?.url ?? "");
-  }, [config.data, edited]);
+    if (!edited) setUrl(current?.url ?? current?.running_url ?? "");
+  }, [current, edited]);
 
   async function saveUrl(event: FormEvent) {
     event.preventDefault();
@@ -89,45 +88,65 @@ export function Webhooks() {
   }
 
   async function generate() {
-    setBusy(true);
-    setFailure(null);
-    try {
-      const reply = await api.post<WebhookConfig>("/webhooks/secret");
-      setSecret(reply.secret ?? null);
-      setConfirming(false);
-      await config.refresh();
-    } catch (error) {
-      setFailure(messageOf(error));
-      setConfirming(false);
-    } finally {
-      setBusy(false);
-    }
+    const reply = await api.post<WebhookConfig>("/webhooks/secret");
+    setSecret(reply.secret ?? null);
+    setConfirming(false);
+    await config.refresh();
   }
 
-  const hasSecret = !!config.data?.secret_hint;
+  const words = position ? deliveryWords[position.state] : null;
+  const stopped = !!status && !canTrade && words?.tone !== "bad";
+  const outbox = status?.consumers.find((row) => row.name === "outbox");
 
   return (
-    <>
-      <PageHeader
-        title="Webhooks"
-        detail="MMX sends fills, cancels and rejects to your game. Use fill_id to ignore repeats, because a delivery can arrive more than once."
-      />
-
-      <div className="grid gap-4">
-        {config.data && <Applied config={config.data} />}
-        {config.error && (
-          <Notice state="bad" title="Can't read webhook settings">
-            {config.error}
-          </Notice>
-        )}
-
-        <Card className="p-5">
-          <SectionTitle>Destination</SectionTitle>
-          <form onSubmit={(event) => void saveUrl(event)} className="mt-3 space-y-3">
+    <div className="flex flex-1 flex-col">
+      {current && <Restart config={current} />}
+      <Tiles className="flex-none grid-cols-2 border-b border-line md:grid-cols-5">
+        <Metric
+          label="Delivery"
+          value={stopped ? "Tape stopped" : (words?.word ?? (delivery.error ? "-" : null))}
+          tone={stopped ? "muted" : words?.tone}
+          note={position?.halted ?? undefined}
+        />
+        <Metric
+          label="Backlog"
+          value={position ? bytes(position.backlog) : delivery.error ? "-" : null}
+        />
+        <Metric
+          label="Failures in a row"
+          value={position ? count(position.consecutive_failures) : delivery.error ? "-" : null}
+          tone={position && position.consecutive_failures > 0 ? "bad" : "plain"}
+        />
+        <Metric
+          label="Delivered to"
+          value={position ? bytes(position.delivered_position) : delivery.error ? "-" : null}
+          note={position ? `${count(position.delivered_position)} bytes` : undefined}
+        />
+        <Metric
+          label="Behind the tape"
+          value={
+            outbox?.behind !== undefined && !stopped ? `${count(outbox.behind)} events` : "Unknown"
+          }
+          note={position ? `Tape ${count(position.durable_position)} bytes` : undefined}
+        />
+      </Tiles>
+      {delivery.error && <p className="bg-surface px-3 py-1 text-bad">{delivery.error}</p>}
+      {config.error && !current && (
+        <ErrorState
+          title="Can't read webhook settings"
+          detail={config.error}
+          onRetry={() => void config.refresh()}
+        />
+      )}
+      <Tiles className="grid-cols-1 border-b border-line md:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+        <Panel title="Destination" bodyClassName="p-3">
+          <form onSubmit={(event) => void saveUrl(event)} className="flex items-end gap-2">
             <Field
               label="Webhook URL"
               type="url"
+              className="min-w-0 flex-1"
               required
+              readOnly={!canEdit}
               placeholder="https://game.example/mmx/events"
               value={url}
               onChange={(event) => {
@@ -135,81 +154,80 @@ export function Webhooks() {
                 setEdited(true);
               }}
             />
-            {failure && <Notice state="bad">{failure}</Notice>}
-            <Button tone="primary" type="submit" disabled={busy || !edited || !url}>
-              Save URL
-            </Button>
+            {canEdit && (
+              <Button tone="primary" type="submit" disabled={busy || !edited || !url}>
+                Save
+              </Button>
+            )}
           </form>
-        </Card>
+          {failure && (
+            <Notice state="bad" className="mt-2">
+              {failure}
+            </Notice>
+          )}
+        </Panel>
+        <Panel
+          title="Signing secret"
+          aside={
+            canEdit && (
+              <Button
+                tone={current?.secret_hint ? "caution" : "primary"}
+                className="h-[22px] px-1.5 text-[12px]"
+                disabled={!current}
+                onClick={() => setConfirming(true)}
+              >
+                {current?.secret_hint ? "Replace secret" : "Generate secret"}
+              </Button>
+            )
+          }
+          bodyClassName="p-3"
+        >
+          {current?.secret_hint ? (
+            <Word tone="muted">
+              Ends in <Code>{current.secret_hint}</Code>
+            </Word>
+          ) : (
+            <Word tone="muted">None generated here.</Word>
+          )}
+        </Panel>
+      </Tiles>
 
-        <Card className="p-5">
-          <SectionTitle>Signing secret</SectionTitle>
-          <p className="mt-1 text-sm text-muted">
-            Each delivery carries <Code>X-MMX-Timestamp</Code> and <Code>X-MMX-Signature</Code>,
-            which is <Code>v1=</Code> and an HMAC-SHA256 of the timestamp, a dot and the raw body.
-          </p>
-          <p className="mt-3 text-sm">
-            {hasSecret ? (
-              <>
-                Current secret ends in <Code>{config.data?.secret_hint}</Code>
-              </>
-            ) : (
-              "No secret has been generated here."
-            )}
-          </p>
-          <Button
-            className="mt-3"
-            onClick={() => (hasSecret ? setConfirming(true) : void generate())}
-          >
-            {hasSecret ? "Replace secret" : "Generate secret"}
-          </Button>
-        </Card>
-
-        <Card className="p-5">
-          <SectionTitle>Delivery</SectionTitle>
-          <div className="mt-3">
-            {delivery.data && <WebhookFacts position={delivery.data} />}
-            {delivery.error && (
-              <Notice state="bad" title="Can't reach the outbox">
-                {delivery.error}
-              </Notice>
-            )}
-          </div>
-        </Card>
-      </div>
-
-      <Modal
-        open={confirming}
-        title="Replace the signing secret?"
-        description="Once the outbox restarts it signs with the new secret, and your game must accept it. Deliveries signed with the new secret fail against the old one."
-        onClose={() => setConfirming(false)}
-      >
-        <div className="flex justify-end gap-2">
-          <Button onClick={() => setConfirming(false)}>Keep the current one</Button>
-          <Button tone="danger" disabled={busy} onClick={() => void generate()}>
-            Replace secret
-          </Button>
-        </div>
-      </Modal>
+      {confirming && (
+        <Confirm
+          title={
+            current?.secret_hint ? "Replace the signing secret?" : "Generate a signing secret?"
+          }
+          body={
+            current?.secret_hint
+              ? "Your game must accept the new secret before the outbox restarts."
+              : undefined
+          }
+          action={current?.secret_hint ? "Replace secret" : "Generate secret"}
+          tone={current?.secret_hint ? "danger" : "primary"}
+          stepUp
+          run={generate}
+          onClose={() => setConfirming(false)}
+        />
+      )}
 
       <Modal
         open={secret !== null}
         title="Copy this signing secret"
-        description="This is the only time it's shown. Store it with your game's secrets."
+        description="It won't be shown again."
         onClose={() => setSecret(null)}
       >
-        <div className="space-y-4">
-          <p className="break-all rounded-xl bg-raised p-3 font-mono text-sm" data-testid="secret">
+        <div className="space-y-3">
+          <p className="break-all bg-deep p-2 font-code text-[12px]" data-testid="secret">
             {secret}
           </p>
           <div className="flex justify-end gap-2">
             <CopyButton text={secret ?? ""} />
             <Button tone="primary" onClick={() => setSecret(null)}>
-              I've stored it
+              Done
             </Button>
           </div>
         </div>
       </Modal>
-    </>
+    </div>
   );
 }

@@ -5,8 +5,10 @@ use sbe::ord_type_enum::OrdTypeEnum;
 use sbe::order_cancel_request_codec::{self, OrderCancelRequestEncoder};
 use sbe::side_enum::SideEnum;
 
-pub const NEW_ORDER_LENGTH: usize = new_order_single_codec::SBE_BLOCK_LENGTH as usize + ENCODED_LENGTH;
-pub const CANCEL_LENGTH: usize = order_cancel_request_codec::SBE_BLOCK_LENGTH as usize + ENCODED_LENGTH;
+pub const NEW_ORDER_LENGTH: usize =
+    new_order_single_codec::SBE_BLOCK_LENGTH as usize + ENCODED_LENGTH;
+pub const CANCEL_LENGTH: usize =
+    order_cancel_request_codec::SBE_BLOCK_LENGTH as usize + ENCODED_LENGTH;
 
 pub struct NewOrder {
     pub cl_ord_id: [u64; 2],

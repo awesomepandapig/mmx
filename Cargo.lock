@@ -1413,6 +1413,7 @@ name = "mmx"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-nats",
  "axum",
  "base64 0.22.1",
  "clap",
@@ -1608,6 +1609,7 @@ version = "0.1.0"
 dependencies = [
  "crc32fast",
  "hmac",
+ "httpdate",
  "rusteron-archive",
  "sbe",
  "serde",

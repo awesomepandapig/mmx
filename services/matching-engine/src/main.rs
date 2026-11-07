@@ -3,6 +3,7 @@ mod clustered;
 mod config;
 #[cfg(feature = "diagnostics")]
 mod diagnostics;
+mod framing;
 mod handler;
 mod metrics;
 mod orderbook;

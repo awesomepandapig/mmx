@@ -1,381 +1,394 @@
-import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Navigate, useNavigate, useSearchParams } from "react-router-dom";
+import type { ColumnDef, SortingState } from "@tanstack/react-table";
+import { Confirm } from "../components/Confirm";
+import { DataTable } from "../components/DataTable";
+import { lastMarket } from "../components/MarketPicker";
+import { MarketsNav } from "../components/MarketsNav";
+import { MarketDialogs, OutcomeNotice, editOutcome } from "../components/marketActions";
+import type { MarketDialog, Outcome } from "../components/marketActions";
 import {
   Button,
-  Card,
-  Field,
-  Modal,
+  ErrorState,
   Notice,
-  PageHeader,
-  Status,
-  TableFrame,
-  cn,
+  Pager,
+  SearchField,
+  Segmented,
+  SkeletonRows,
+  Word,
 } from "../components/ui";
-import type { State } from "../components/ui";
-import { ApiError, api, messageOf } from "../lib/api";
+import { ApiError, api, messageOf, queryString } from "../lib/api";
 import type {
-  ActionResult,
-  CancelResult,
   Delivery,
   EditResult,
-  GatewayResult,
   Market,
+  MarketCounts,
   MarketList,
   MarketsFile,
   Problem,
   Validation,
 } from "../lib/api";
-import { usePolled } from "../lib/hooks";
+import { tradingState, useExchange } from "../lib/exchange";
+import { ago, count, utc } from "../lib/format";
+import { useDebounced, usePolled, useTitle } from "../lib/hooks";
+import { useCan } from "../lib/session";
 
-type Tab = "list" | "yaml";
-
-function marketState(market: Market): { state: State; text: string } {
-  if (market.halted) return { state: "bad", text: "Halted" };
-  if (!market.enabled) return { state: "idle", text: "Disabled" };
-  return { state: "good", text: "Open" };
-}
-
-function failedGateways(gateways: GatewayResult[]) {
-  return gateways.filter((gateway) => !gateway.ok);
-}
-
-function GatewayFailures({ gateways }: { gateways: GatewayResult[] }) {
-  return (
-    <ul className="mt-1 space-y-0.5">
-      {failedGateways(gateways).map((gateway) => (
-        <li key={gateway.gateway} className="break-words">
-          {gateway.gateway}: {gateway.error}
-        </li>
-      ))}
-    </ul>
+/** `/markets` is a market, the last one looked at, or the busiest if there isn't one. */
+export function MarketsHome() {
+  const [params] = useSearchParams();
+  const pick = params.get("pick") ? "?pick=1" : "";
+  const last = lastMarket();
+  const busiest = usePolled(
+    () => api.get<MarketList>("/markets?limit=1&sort=volume&dir=desc"),
+    60000,
+    last ?? "",
   );
+  useTitle("Markets");
+  if (last) return <Navigate to={`/markets/${last}${pick}`} replace />;
+  const first = busiest.data?.markets[0];
+  if (first) return <Navigate to={`/markets/${first.symbol}${pick}`} replace />;
+  if (busiest.error) {
+    return (
+      <ErrorState
+        title="Can't read markets"
+        detail={busiest.error}
+        onRetry={() => void busiest.refresh()}
+      />
+    );
+  }
+  if (busiest.data) return <Navigate to="/all-markets" replace />;
+  return <SkeletonRows rows={8} />;
 }
 
-/** Says how far the stored file has got. A delay in Kubernetes is normal, so it isn't an error. */
-function DeliveryNotice({ delivery, onReload }: { delivery: Delivery; onReload: () => void }) {
+function DeliveryNotice({ delivery, onReload }: { delivery: Delivery; onReload?: () => void }) {
   if (delivery.state === "in_sync") return null;
-  const reload = <Button onClick={onReload}>Reload gateways</Button>;
+  const reload = onReload && <Button onClick={onReload}>Reload gateways</Button>;
+  const edge = "border-x-0 border-t-0";
   if (delivery.state === "reaching_gateways") {
     return (
-      <Notice state="idle" title="Saved, reaching gateways" action={reload}>
-        Kubernetes takes up to about {delivery.expected_secs ?? 90} seconds to deliver a change to
-        each gateway, and MMX reloads them as it lands. Waiting {delivery.waited_secs ?? 0}s so far.
+      <Notice title="Saved, reaching gateways" action={reload} className={edge}>
+        {delivery.waited_secs ?? 0}s of about {delivery.expected_secs ?? 90}s.
       </Notice>
     );
   }
   if (delivery.state === "stalled") {
     return (
-      <Notice state="bad" title="Gateways still don't have this" action={reload}>
-        It's been {delivery.waited_secs ?? 0}s, which is longer than delivery should take. Behind:{" "}
-        {delivery.behind.join(", ")}
+      <Notice state="bad" title="Gateways haven't taken this file" action={reload} className={edge}>
+        {delivery.waited_secs ?? 0}s. Behind: {delivery.behind.join(", ")}
       </Notice>
     );
   }
   return (
-    <Notice state="warn" title="Gateways differ from the saved file" action={reload}>
-      Behind: {delivery.behind.join(", ")}. If the file was edited by hand, reload to apply it.
+    <Notice
+      state="warn"
+      title="Gateways differ from the saved file"
+      action={reload}
+      className={edge}
+    >
+      Behind: {delivery.behind.join(", ")}
     </Notice>
   );
 }
 
-type Dialog = { kind: "halt" | "resume" | "cancel"; market: Market } | { kind: "new" } | null;
+type Filter = "all" | "open" | "halted" | "disabled" | "out_of_sync";
 
-function ActionDialog({
-  dialog,
-  onClose,
-  onDone,
-}: {
-  dialog: Exclude<Dialog, null | { kind: "new" }>;
-  onClose: () => void;
-  onDone: (notice: Outcome) => void;
-}) {
-  const { kind, market } = dialog;
-  const [typed, setTyped] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [failure, setFailure] = useState<string | null>(null);
+function filters(counts?: MarketCounts): { value: Filter; label: string }[] {
+  const label = (name: string, value?: number) =>
+    value === undefined ? name : `${name} ${value.toLocaleString()}`;
+  return [
+    { value: "all", label: label("All", counts?.all) },
+    { value: "open", label: label("Open", counts?.open) },
+    { value: "halted", label: label("Halted", counts?.halted) },
+    { value: "disabled", label: label("Disabled", counts?.disabled) },
+    { value: "out_of_sync", label: label("Out of sync", counts?.out_of_sync) },
+  ];
+}
 
-  async function act() {
-    setBusy(true);
-    setFailure(null);
-    try {
-      if (kind === "cancel") {
-        const result = await api.post<CancelResult>(`/markets/${market.symbol}/cancel-all`);
-        const counts = `${result.requested} requested, ${result.canceled} canceled, ${result.failed} failed.`;
-        onDone(
-          result.complete
-            ? { state: "good", title: `Canceled open orders in ${market.symbol}`, body: counts }
-            : {
-                state: "warn",
-                title: `Some orders in ${market.symbol} may still be open`,
-                body: `${counts}${result.truncated ? " More remain, so run it again." : ""}`,
-                gateways: result.gateways,
-              },
-        );
-      } else {
-        const result = await api.post<ActionResult>(`/markets/${market.symbol}/${kind}`);
-        const verb = kind === "halt" ? "Halted" : "Resumed";
-        onDone(
-          result.ok
-            ? { state: "good", title: `${verb} ${market.symbol} on every gateway` }
-            : {
-                state: "bad",
-                title: `${market.symbol} isn't ${verb.toLowerCase()} on every gateway`,
-                gateways: result.gateways,
-              },
-        );
-      }
-    } catch (error) {
-      setFailure(messageOf(error));
-      setBusy(false);
+const SERVER_SORTS = new Set([
+  "symbol",
+  "state",
+  "last",
+  "volume",
+  "trades",
+  "spread",
+  "open_orders",
+  "last_trade",
+]);
+
+export function AllMarkets() {
+  useTitle("All markets");
+  const canAct = useCan("operator");
+  const navigate = useNavigate();
+  const { canTrade, status } = useExchange();
+  const [params, setParams] = useSearchParams();
+  const [dialog, setDialog] = useState<MarketDialog>(null);
+  const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [stamp, setStamp] = useState(0);
+  const [text, setText] = useState(params.get("q") ?? "");
+  const q = useDebounced(text.trim(), 200);
+  const state = (params.get("state") ?? "all") as Filter;
+  const sort = params.get("sort") ?? "volume";
+  const dir = params.get("dir") === "asc" ? "asc" : "desc";
+  const limit = Number(params.get("limit")) || 50;
+  const offset = Number(params.get("offset")) || 0;
+
+  function change(next: Record<string, string | number>, resetPage = true) {
+    const merged = new URLSearchParams(params);
+    for (const [name, value] of Object.entries(next)) {
+      if (value === "" || value === "all" || value === 0) merged.delete(name);
+      else merged.set(name, String(value));
     }
+    if (resetPage) merged.delete("offset");
+    setParams(merged, { replace: true });
   }
 
-  const copy = {
-    halt: {
-      title: `Halt ${market.symbol}?`,
-      body: "Every gateway stops taking new orders in this market. Open orders stay on the book, and can still be canceled. The halt stays in place until you resume, including across reloads.",
-      confirm: "Halt market",
-    },
-    resume: {
-      title: `Resume ${market.symbol}?`,
-      body: "Every gateway starts taking new orders in this market again.",
-      confirm: "Resume market",
-    },
-    cancel: {
-      title: `Cancel all orders in ${market.symbol}?`,
-      body: "This cancels every open order in this market, for every player. It can't be undone. Halt the market first, or new orders can arrive while it runs.",
-      confirm: "Cancel all orders",
-    },
-  }[kind];
+  useEffect(() => {
+    if ((params.get("q") ?? "") !== q) change({ q });
+  }, [q]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const blocked = kind === "cancel" && typed.toUpperCase() !== market.symbol;
+  const query = queryString({
+    q,
+    state: state === "all" ? undefined : state,
+    sort,
+    dir,
+    limit,
+    offset,
+  });
+  const markets = usePolled(() => api.get<MarketList>(`/markets${query}`), 3000, query + stamp);
+  const data = markets.data;
+  const known = !!status;
 
-  return (
-    <Modal open title={copy.title} description={copy.body} onClose={onClose}>
-      <div className="space-y-4">
-        {kind === "cancel" && (
-          <Field
-            label={`Type ${market.symbol} to confirm`}
-            autoComplete="off"
-            value={typed}
-            onChange={(event) => setTyped(event.target.value)}
-          />
-        )}
-        {failure && <Notice state="bad">{failure}</Notice>}
-        <div className="flex justify-end gap-2">
-          <Button onClick={onClose}>Keep as it is</Button>
-          <Button
-            tone={kind === "resume" ? "primary" : "danger"}
-            disabled={busy || blocked}
-            onClick={() => void act()}
-          >
-            {busy ? "Working" : copy.confirm}
-          </Button>
-        </div>
-      </div>
-    </Modal>
-  );
-}
-
-function NewMarketDialog({
-  onClose,
-  onDone,
-}: {
-  onClose: () => void;
-  onDone: (notice: Outcome) => void;
-}) {
-  const [symbol, setSymbol] = useState("");
-  const [tick, setTick] = useState("0.01");
-  const [min, setMin] = useState("");
-  const [max, setMax] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [failure, setFailure] = useState<string | null>(null);
-
-  async function create() {
-    setBusy(true);
-    setFailure(null);
+  async function reload() {
     try {
-      const body: Record<string, string> = { tick_size: tick };
-      if (min) body.min_size = min;
-      if (max) body.max_size = max;
-      const name = symbol.trim().toUpperCase();
-      const result = await api.put<EditResult>(`/markets/${encodeURIComponent(name)}`, body);
-      onDone(editOutcome(result, name));
+      setOutcome(editOutcome(await api.post<EditResult>("/markets/reload")));
     } catch (error) {
-      setFailure(messageOf(error));
-      setBusy(false);
+      setOutcome({ state: "bad", title: "Reload failed", body: messageOf(error) });
     }
+    void markets.refresh();
   }
 
-  return (
-    <Modal
-      open
-      title="New market"
-      description="Gateways accept orders for it as soon as they have it. The engine needs no restart."
-      onClose={onClose}
-    >
-      <form
-        className="space-y-4"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void create();
-        }}
-      >
-        <Field
-          label="Symbol"
-          autoFocus
-          required
-          maxLength={6}
-          placeholder="IRON"
-          value={symbol}
-          onChange={(event) => setSymbol(event.target.value)}
-          hint="1 to 6 letters or digits."
-        />
-        <Field
-          label="Tick size"
-          required
-          value={tick}
-          onChange={(event) => setTick(event.target.value)}
-          hint="Prices must be a multiple of this."
-        />
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Field
-            label="Minimum size"
-            placeholder="Optional"
-            value={min}
-            onChange={(event) => setMin(event.target.value)}
-          />
-          <Field
-            label="Maximum size"
-            placeholder="Optional"
-            value={max}
-            onChange={(event) => setMax(event.target.value)}
-          />
-        </div>
-        {failure && <Notice state="bad">{failure}</Notice>}
-        <div className="flex justify-end gap-2">
-          <Button onClick={onClose}>Cancel</Button>
-          <Button tone="primary" type="submit" disabled={busy || !symbol.trim() || !tick}>
-            {busy ? "Creating" : "Create market"}
-          </Button>
-        </div>
-      </form>
-    </Modal>
-  );
-}
+  const sorting: SortingState = [{ id: sort, desc: dir === "desc" }];
 
-interface Outcome {
-  state: State;
-  title: string;
-  body?: string;
-  gateways?: GatewayResult[];
-}
-
-function editOutcome(result: EditResult, name?: string): Outcome {
-  const subject = name ?? "Markets";
-  if (result.state === "applied") {
-    return { state: "good", title: `${subject} saved and live on every gateway` };
-  }
-  if (result.state === "reaching_gateways") {
-    return {
-      state: "idle",
-      title: `${subject} saved, reaching gateways`,
-      body: `Kubernetes takes up to about ${result.expected_secs ?? 90} seconds to deliver it.`,
-    };
-  }
-  return {
-    state: "bad",
-    title: `${subject} saved, but not every gateway took it`,
-    body: "The file is saved, so reload rather than editing again.",
-    gateways: result.gateways,
-  };
-}
-
-function MarketRow({ market, onDialog }: { market: Market; onDialog: (dialog: Dialog) => void }) {
-  const { state, text } = marketState(market);
-  const held = market.gateways.filter((gateway) => gateway.in_sync).length;
-  const unreachable = market.gateways.filter((gateway) => !gateway.reachable).length;
-  const halting = market.gateways.filter((gateway) => gateway.market?.halted).length;
-  const partlyHalted = market.halted && halting < market.gateways.length;
-  return (
-    <tr className="border-b border-line last:border-b-0">
-      <td className="px-5 py-3">
-        <Link
-          to={`/activity?symbol=${market.symbol}`}
-          className="font-mono font-medium hover:underline"
-        >
-          {market.symbol}
-        </Link>
-        {!market.in_file && <p className="text-xs text-warn">On a gateway, not in the file</p>}
-      </td>
-      <td className="px-5 py-3">
-        <Status state={state}>{text}</Status>
-        {partlyHalted && (
-          <p className="text-xs text-warn">
-            On {halting} of {market.gateways.length} gateways
-          </p>
-        )}
-      </td>
-      <td className="tabular px-5 py-3 font-mono text-xs">{market.tick_size}</td>
-      <td className="tabular px-5 py-3 font-mono text-xs">{market.min_size ?? "default"}</td>
-      <td className="tabular px-5 py-3 font-mono text-xs">{market.max_size ?? "default"}</td>
-      <td className="px-5 py-3 text-xs text-muted">
-        {held} of {market.gateways.length} in sync
-        {unreachable > 0 && <span className="block text-bad">{unreachable} unreachable</span>}
-      </td>
-      <td className="px-5 py-3">
-        <div className="flex justify-end gap-2">
-          {market.halted ? (
-            <Button onClick={() => onDialog({ kind: "resume", market })}>Resume</Button>
+  const columns = useMemo(() => {
+    const number = (
+      id: string,
+      header: string,
+      size: number,
+      value: (market: Market) => string | number | undefined,
+      sortable = true,
+    ): ColumnDef<Market, never> => ({
+      id,
+      header,
+      size,
+      enableSorting: sortable,
+      accessorFn: (market) => (value(market) ?? "") as never,
+      cell: ({ getValue }) => {
+        const shown = getValue() as string | number;
+        return shown === "" ? <span className="text-faint">-</span> : shown;
+      },
+      meta: { mono: true, align: "right" },
+    });
+    const list: ColumnDef<Market, never>[] = [
+      {
+        id: "symbol",
+        header: "Market",
+        size: 96,
+        accessorFn: (market) => market.symbol as never,
+        cell: ({ row }) => <span className="font-medium text-accent">{row.original.symbol}</span>,
+        meta: { mono: true, required: true },
+      },
+      {
+        id: "state",
+        header: "State",
+        size: 130,
+        accessorFn: (market) => tradingState(market, canTrade, known).word as never,
+        cell: ({ row }) => {
+          const { word, tone } = tradingState(row.original, canTrade, known);
+          return <Word tone={tone === "plain" ? "muted" : tone}>{word}</Word>;
+        },
+      },
+      number("last", "Last", 110, (market) => market.last),
+      number("spread", "Spread", 90, (market) => market.spread),
+      number("volume", "24h volume", 120, (market) => market.volume_24h),
+      number("trades", "24h trades", 96, (market) =>
+        market.trades_24h === undefined ? undefined : count(market.trades_24h),
+      ),
+      number("open_orders", "Open orders", 96, (market) =>
+        market.open_orders === undefined ? undefined : count(market.open_orders),
+      ),
+      {
+        id: "last_trade",
+        header: "Last trade (UTC)",
+        size: 186,
+        accessorFn: (market) => (market.last_time ? utc(market.last_time) : "") as never,
+        meta: { mono: true },
+      },
+      {
+        id: "age",
+        header: "Traded",
+        size: 90,
+        enableSorting: false,
+        accessorFn: (market) => (market.last_time ? ago(market.last_time) : "") as never,
+        meta: { align: "right", hidden: true },
+      },
+      number("tick", "Tick", 84, (market) => market.tick_size, false),
+      number("min", "Min size", 90, (market) => market.min_size, false),
+      number("max", "Max size", 100, (market) => market.max_size, false),
+      {
+        id: "gateways",
+        header: "Gateways",
+        size: 120,
+        enableSorting: false,
+        accessorFn: (market) =>
+          `${market.gateways.filter((gateway) => gateway.in_sync).length} of ${market.gateways.length}` as never,
+        cell: ({ row }) => {
+          const { gateways } = row.original;
+          const held = gateways.filter((gateway) => gateway.in_sync).length;
+          return held === gateways.length ? (
+            <span className="text-muted">
+              {held} of {gateways.length} agree
+            </span>
           ) : (
-            <Button disabled={!market.enabled} onClick={() => onDialog({ kind: "halt", market })}>
-              Halt
+            <Word tone="warn">
+              {held} of {gateways.length} agree
+            </Word>
+          );
+        },
+      },
+      {
+        id: "file",
+        header: "In file",
+        size: 70,
+        enableSorting: false,
+        accessorFn: (market) => (market.in_file ? "" : "Not in file") as never,
+        cell: ({ getValue }) => <Word tone="warn">{getValue() as string}</Word>,
+        meta: { hidden: true },
+      },
+      {
+        id: "actions",
+        header: "",
+        size: 76,
+        enableSorting: false,
+        enableResizing: false,
+        meta: { label: "Halt or resume" },
+        cell: ({ row }) =>
+          !canAct || (!row.original.enabled && !row.original.halted) ? null : (
+            <Button
+              tone={row.original.halted ? "plain" : "caution"}
+              className="h-[22px] px-1.5 text-[12px]"
+              onClick={(event) => {
+                event.stopPropagation();
+                setDialog({ kind: row.original.halted ? "resume" : "halt", market: row.original });
+              }}
+            >
+              {row.original.halted ? "Resume" : "Halt"}
             </Button>
-          )}
-          <Button tone="danger" onClick={() => onDialog({ kind: "cancel", market })}>
-            Cancel all
-          </Button>
-        </div>
-      </td>
-    </tr>
-  );
-}
+          ),
+      },
+    ];
+    return list;
+  }, [canAct, canTrade, known]);
 
-function MarketTable({ markets, onDialog }: { markets: Market[]; onDialog: (d: Dialog) => void }) {
-  if (markets.length === 0) {
-    return (
-      <div className="p-10 text-center">
-        <p className="text-lg font-semibold tracking-heading">No markets yet</p>
-        <p className="mt-1 text-muted">Create one, and gateways start taking its orders.</p>
-        <Button tone="primary" className="mt-4" onClick={() => onDialog({ kind: "new" })}>
-          New market
-        </Button>
-      </div>
-    );
-  }
+  const broken = markets.failure instanceof ApiError && markets.failure.code === "markets_file";
+
   return (
-    <TableFrame>
-      <table className="w-full min-w-[820px] text-left text-sm">
-        <thead className="text-muted">
-          <tr className="border-b border-line">
-            <th className="px-5 py-3 font-medium">Market</th>
-            <th className="px-5 py-3 font-medium">State</th>
-            <th className="px-5 py-3 font-medium">Tick</th>
-            <th className="px-5 py-3 font-medium">Min</th>
-            <th className="px-5 py-3 font-medium">Max</th>
-            <th className="px-5 py-3 font-medium">Gateways</th>
-            <th className="px-5 py-3 font-medium">
-              <span className="sr-only">Actions</span>
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {markets.map((market) => (
-            <MarketRow key={market.symbol} market={market} onDialog={onDialog} />
-          ))}
-        </tbody>
-      </table>
-    </TableFrame>
+    <div className="flex min-h-[480px] flex-1 flex-col lg:min-h-0">
+      <MarketsNav />
+      {data && (
+        <DeliveryNotice
+          delivery={data.delivery}
+          onReload={canAct ? () => void reload() : undefined}
+        />
+      )}
+      {outcome && (
+        <div className="flex-none">
+          <OutcomeNotice outcome={outcome} onClose={() => setOutcome(null)} />
+        </div>
+      )}
+      {broken && (
+        <Notice
+          state="bad"
+          title="The markets file doesn't parse"
+          className="border-x-0 border-t-0"
+        >
+          {markets.error}
+        </Notice>
+      )}
+      <DataTable
+        id="all-markets"
+        className="min-h-[360px] flex-1"
+        columns={columns}
+        data={data?.markets ?? []}
+        rowId={(market) => market.symbol}
+        onRowClick={(market) => navigate(`/markets/${market.symbol}`)}
+        loading={!data && !markets.error}
+        error={markets.error}
+        onRetry={() => void markets.refresh()}
+        sorting={sorting}
+        onSorting={(updater) => {
+          const next = typeof updater === "function" ? updater(sorting) : updater;
+          const first = next[0];
+          if (first && SERVER_SORTS.has(first.id)) {
+            change({ sort: first.id, dir: first.desc ? "desc" : "asc" });
+          }
+        }}
+        empty={q || state !== "all" ? "No markets match" : "No markets"}
+        title={
+          <>
+            Markets{" "}
+            <span className="tabular font-normal text-faint">
+              ({(data?.total ?? 0).toLocaleString()})
+            </span>
+          </>
+        }
+        toolbar={
+          <>
+            <SearchField
+              label="Search markets"
+              className="w-44"
+              placeholder="Find market"
+              value={text}
+              onChange={(event) => setText(event.target.value)}
+            />
+            <Segmented
+              label="State"
+              className="max-w-full overflow-x-auto"
+              value={state}
+              options={filters(data?.counts)}
+              onChange={(value) => change({ state: value })}
+            />
+          </>
+        }
+        footer={
+          <>
+            {data && (
+              <Pager
+                offset={offset}
+                limit={limit}
+                total={data.total}
+                onOffset={(next) => change({ offset: next }, false)}
+                onLimit={(next) => change({ limit: next === 50 ? 0 : next })}
+              />
+            )}
+            {canAct && (
+              <Button tone="primary" onClick={() => setDialog({ kind: "new" })}>
+                New market
+              </Button>
+            )}
+          </>
+        }
+      />
+      <MarketDialogs
+        dialog={dialog}
+        onClose={() => setDialog(null)}
+        onDone={(notice) => {
+          setDialog(null);
+          // A save on its way has its own banner, which keeps counting until it lands.
+          setOutcome(notice.title.endsWith("reaching gateways") ? null : notice);
+          setStamp(stamp + 1);
+        }}
+      />
+    </div>
   );
 }
 
@@ -383,63 +396,72 @@ function SaveDialog({
   check,
   onClose,
   onSave,
-  busy,
 }: {
   check: Validation;
   onClose: () => void;
-  onSave: () => void;
-  busy: boolean;
+  onSave: () => Promise<void>;
 }) {
   const changes = check.changes;
   const lines = changes
-    ? [
+    ? ([
         ["Adds", changes.added],
         ["Removes", changes.removed],
         ["Changes", changes.changed],
-      ].filter(([, symbols]) => symbols.length > 0)
+      ] as [string, string[]][])
     : [];
+  const shown = lines.filter(([, symbols]) => symbols.length > 0);
   return (
-    <Modal open title="Save markets?" onClose={onClose}>
-      <div className="space-y-4 text-sm">
-        {lines.length === 0 ? (
-          <p className="text-muted">No markets change. Only comments or formatting differ.</p>
-        ) : (
-          <ul className="space-y-1">
-            {lines.map(([verb, symbols]) => (
-              <li key={verb as string}>
-                <span className="font-medium">{verb}: </span>
-                <span className="font-mono">{(symbols as string[]).join(", ")}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-        {check.warnings?.map((warning) => (
-          <Notice state="warn" key={warning}>
-            {warning}
-          </Notice>
-        ))}
-        <div className="flex justify-end gap-2">
-          <Button onClick={onClose}>Keep editing</Button>
-          <Button tone="primary" disabled={busy} onClick={onSave}>
-            {busy ? "Saving" : "Save and reload gateways"}
-          </Button>
+    <Confirm
+      title="Save markets?"
+      action="Save and reload gateways"
+      tone="primary"
+      stepUp={!!changes?.removed.length}
+      run={onSave}
+      onClose={onClose}
+      body={
+        <div className="space-y-2">
+          {shown.length === 0 ? (
+            <p>Only comments or formatting differ.</p>
+          ) : (
+            <ul className="space-y-1">
+              {shown.map(([verb, symbols]) => (
+                <li key={verb}>
+                  <span className="font-medium text-ink">{verb}: </span>
+                  <span className="font-code">
+                    {symbols.slice(0, 40).join(", ")}
+                    {symbols.length > 40 ? ` and ${symbols.length - 40} more` : ""}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {check.warnings?.map((warning) => (
+            <Notice state="warn" key={warning}>
+              {warning}
+            </Notice>
+          ))}
         </div>
-      </div>
-    </Modal>
+      }
+    />
   );
 }
 
-function YamlEditor({ onSaved }: { onSaved: (notice: Outcome) => void }) {
+function YamlEditor({
+  readOnly,
+  onSaved,
+}: {
+  readOnly: boolean;
+  onSaved: (notice: Outcome) => void;
+}) {
   const [file, setFile] = useState<MarketsFile | null>(null);
   const [text, setText] = useState("");
   const [problem, setProblem] = useState<Problem | null>(null);
   const [check, setCheck] = useState<Validation | null>(null);
   const [checking, setChecking] = useState(false);
   const [confirming, setConfirming] = useState(false);
-  const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
-  const gutter = useRef<HTMLDivElement>(null);
+  const gutter = useRef<HTMLPreElement>(null);
 
   async function load() {
     setFailure(null);
@@ -460,7 +482,7 @@ function YamlEditor({ onSaved }: { onSaved: (notice: Outcome) => void }) {
 
   // The server checks with the gateway's rules, so the editor can't disagree with what's saved.
   useEffect(() => {
-    if (!file) return;
+    if (!file || readOnly) return;
     let stale = false;
     setChecking(true);
     const timer = setTimeout(() => {
@@ -482,12 +504,10 @@ function YamlEditor({ onSaved }: { onSaved: (notice: Outcome) => void }) {
       stale = true;
       clearTimeout(timer);
     };
-  }, [text, file]);
+  }, [text, file, readOnly]);
 
   async function save() {
     if (!file) return;
-    setBusy(true);
-    setFailure(null);
     try {
       const result = await api.put<EditResult>("/config/markets", {
         yaml: text,
@@ -497,61 +517,55 @@ function YamlEditor({ onSaved }: { onSaved: (notice: Outcome) => void }) {
       onSaved(editOutcome(result));
       await load();
     } catch (error) {
+      if (error instanceof ApiError && error.code === "reauth_required") throw error;
       setConfirming(false);
       if (error instanceof ApiError && error.code === "markets_changed") setConflict(true);
       setFailure(messageOf(error));
-    } finally {
-      setBusy(false);
     }
   }
 
   if (!file) {
     return failure ? (
-      <div className="p-5">
-        <Notice state="bad" title="Can't open the markets file">
-          {failure}
-        </Notice>
-      </div>
-    ) : null;
+      <ErrorState
+        title="Can't open the markets file"
+        detail={failure}
+        onRetry={() => void load()}
+      />
+    ) : (
+      <SkeletonRows rows={8} />
+    );
   }
 
   const lines = text.split("\n").length;
   const dirty = text !== file.yaml;
-  const location = file.backend === "kubernetes" ? `ConfigMap ${file.location}` : file.location;
+  const numbers = Array.from({ length: lines }, (_, index) => index + 1).join("\n");
 
   return (
-    <div className="space-y-3 p-5">
-      <p className="break-all text-xs text-muted">Stored in {location}</p>
-      <div className="flex h-[26rem] overflow-hidden rounded-xl border border-line bg-canvas font-mono text-[13px] leading-6 focus-within:border-ink">
-        <div
+    <div className="flex min-h-0 flex-1 flex-col gap-2 p-2">
+      <div className="flex min-h-[320px] flex-1 overflow-hidden border border-line bg-deep font-code text-[12px] leading-5 focus-within:border-accent">
+        <pre
           ref={gutter}
           aria-hidden
-          className="w-11 shrink-0 select-none overflow-hidden border-r border-line py-3 text-right text-muted"
+          className="w-12 shrink-0 select-none overflow-hidden border-r border-hairline py-2 pr-2 text-right text-faint"
         >
-          {Array.from({ length: lines }, (_, index) => (
-            <div
-              key={index}
-              className={cn("pr-2", problem?.line === index + 1 && "bg-bad/20 text-bad")}
-            >
-              {index + 1}
-            </div>
-          ))}
-        </div>
+          {numbers}
+        </pre>
         <textarea
           aria-label="Markets file"
           spellCheck={false}
           wrap="off"
+          readOnly={readOnly}
           value={text}
           onChange={(event) => setText(event.target.value)}
           onScroll={(event) => {
             if (gutter.current) gutter.current.scrollTop = event.currentTarget.scrollTop;
           }}
-          className="h-full min-w-0 flex-1 resize-none overflow-auto bg-transparent px-3 py-3 focus:outline-none"
+          className="h-full min-w-0 flex-1 resize-none overflow-auto bg-transparent px-2 py-2 focus:outline-none"
         />
       </div>
 
       {problem && (
-        <Notice state="bad" title={problem.line ? `Line ${problem.line}` : "This file isn't valid"}>
+        <Notice state="bad" title={problem.line ? `Line ${problem.line}` : "Not valid"}>
           {problem.message}
         </Notice>
       )}
@@ -567,145 +581,41 @@ function YamlEditor({ onSaved }: { onSaved: (notice: Outcome) => void }) {
       )}
 
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm text-muted">
-          {checking
-            ? "Checking"
-            : problem
-              ? "Fix this to save."
-              : dirty
-                ? "Valid, with unsaved changes."
-                : "Valid. No changes."}
-        </p>
-        <div className="flex gap-2">
-          <Button disabled={!dirty} onClick={() => setText(file.yaml)}>
-            Discard
-          </Button>
-          <Button
-            tone="primary"
-            disabled={!dirty || checking || !!problem || !check?.valid}
-            onClick={() => setConfirming(true)}
-          >
-            Save
-          </Button>
-        </div>
+        <p className="min-w-0 break-all font-code text-[12px] text-faint">{file.location}</p>
+        {!readOnly && (
+          <div className="flex gap-2">
+            <Button disabled={!dirty} onClick={() => setText(file.yaml)}>
+              Discard
+            </Button>
+            <Button
+              tone="primary"
+              disabled={!dirty || checking || !!problem || !check?.valid}
+              onClick={() => setConfirming(true)}
+            >
+              Save
+            </Button>
+          </div>
+        )}
       </div>
 
       {confirming && check && (
-        <SaveDialog
-          check={check}
-          busy={busy}
-          onClose={() => setConfirming(false)}
-          onSave={() => void save()}
-        />
+        <SaveDialog check={check} onClose={() => setConfirming(false)} onSave={save} />
       )}
     </div>
   );
 }
 
-export function Markets() {
-  const markets = usePolled(() => api.get<MarketList>("/markets"), 3000);
-  const [tab, setTab] = useState<Tab>("list");
-  const [dialog, setDialog] = useState<Dialog>(null);
+export function MarketsFilePage() {
+  useTitle("Markets file");
+  const canAct = useCan("operator");
   const [outcome, setOutcome] = useState<Outcome | null>(null);
-
-  function finish(notice: Outcome) {
-    setDialog(null);
-    // A save on its way has its own banner, which keeps counting until it lands.
-    setOutcome(notice.title.endsWith("reaching gateways") ? null : notice);
-    void markets.refresh();
-  }
-
-  async function reload() {
-    try {
-      const result = await api.post<EditResult>("/markets/reload");
-      finish(editOutcome(result));
-    } catch (error) {
-      finish({ state: "bad", title: "Reload failed", body: messageOf(error) });
-    }
-  }
-
-  // The list reads a parsed file, so a broken one shows here and is fixed in the editor.
-  const broken = markets.failure instanceof ApiError && markets.failure.code === "markets_file";
-
   return (
-    <>
-      <PageHeader
-        title="Markets"
-        actions={
-          <>
-            <div role="tablist" aria-label="View" className="flex rounded-full bg-raised p-1">
-              {(
-                [
-                  ["list", "List"],
-                  ["yaml", "YAML"],
-                ] as const
-              ).map(([value, label]) => (
-                <button
-                  key={value}
-                  type="button"
-                  role="tab"
-                  aria-selected={tab === value}
-                  onClick={() => setTab(value)}
-                  className={cn(
-                    "h-7 rounded-full px-4 text-sm font-medium",
-                    tab === value ? "bg-surface text-ink" : "text-muted hover:text-ink",
-                  )}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-            <Button tone="primary" onClick={() => setDialog({ kind: "new" })}>
-              New market
-            </Button>
-          </>
-        }
-      />
-
-      <div className="mb-4 space-y-3 empty:hidden">
-        {outcome && (
-          <Notice
-            state={outcome.state}
-            title={outcome.title}
-            action={<Button onClick={() => setOutcome(null)}>Dismiss</Button>}
-          >
-            {outcome.body}
-            {outcome.gateways && <GatewayFailures gateways={outcome.gateways} />}
-          </Notice>
-        )}
-        {markets.data && (
-          <DeliveryNotice delivery={markets.data.delivery} onReload={() => void reload()} />
-        )}
-        {markets.error && (
-          <Notice
-            state="bad"
-            title={broken ? "The markets file doesn't parse" : "Can't read markets"}
-            action={
-              broken && tab === "list" ? (
-                <Button onClick={() => setTab("yaml")}>Open the editor</Button>
-              ) : undefined
-            }
-          >
-            {markets.error}
-            {broken && " Gateways keep what they last loaded until this is fixed."}
-          </Notice>
-        )}
+    <div className="flex min-h-[480px] flex-1 flex-col lg:min-h-0">
+      <MarketsNav />
+      {outcome && <OutcomeNotice outcome={outcome} onClose={() => setOutcome(null)} />}
+      <div className="flex min-h-0 flex-1 flex-col bg-surface">
+        <YamlEditor readOnly={!canAct} onSaved={setOutcome} />
       </div>
-
-      <Card>
-        {tab === "list" ? (
-          markets.data && <MarketTable markets={markets.data.markets} onDialog={setDialog} />
-        ) : (
-          <YamlEditor onSaved={finish} />
-        )}
-      </Card>
-
-      {dialog?.kind === "new" && (
-        <NewMarketDialog onClose={() => setDialog(null)} onDone={finish} />
-      )}
-      {dialog && dialog.kind !== "new" && (
-        <ActionDialog dialog={dialog} onClose={() => setDialog(null)} onDone={finish} />
-      )}
-    </>
+    </div>
   );
 }

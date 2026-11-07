@@ -1,0 +1,41 @@
+# Local Kubernetes
+
+Run the published Helm release in a three-worker [kind](https://kind.sigs.k8s.io/) cluster. Install
+Docker, kind, Helm, kubectl, and the native CLI from [Local Docker](/installation/local#install).
+
+## Create the cluster
+
+```sh
+curl -fsSLO https://github.com/awesomepandapig/sbx/releases/download/v0.1.0/quickstart.yaml
+kind create cluster --name mmx --config quickstart.yaml
+helm upgrade --install mmx oci://ghcr.io/awesomepandapig/mmx/charts/mmx \
+  --version 0.1.0 --namespace mmx --create-namespace \
+  --set console.service.type=NodePort --set console.service.nodePort=30093 \
+  --set gateway.service.type=NodePort --set gateway.service.nodePort=30080 \
+  --set websocket.service.type=NodePort --set websocket.service.nodePort=30081 \
+  --set networkPolicy.enabled=false --wait --timeout 10m
+helm test mmx --namespace mmx --logs
+```
+
+The kind profile maps console **8093**, REST **8000**, and WebSocket **8080** onto the Docker host's
+loopback interface. NetworkPolicy is disabled for this local test network.
+
+## Connect
+
+Use the [Helm instructions](/installation/helm#configure-the-native-cli) to read your admin token, then
+set the local addresses:
+
+```sh
+export MMX_URL=http://127.0.0.1:8093
+export MMX_GATEWAY_URLS=http://127.0.0.1:8000
+mmx health
+mmx status
+```
+
+Read the console password with the [installation log command](/installation/helm#sign-in), then follow
+[Getting started](/getting-started).
+
+:::warning[Deleting the cluster]
+**`kind delete cluster --name mmx` deletes this test deployment and its local volumes.** Export any
+state you want to preserve first.
+:::

@@ -1,0 +1,32 @@
+# Build from source
+
+Build the CLI and console, then let Docker build and run the exchange services from your checkout.
+
+## Requirements
+
+- Rust and Cargo (tested with 1.99), plus a C compiler.
+- Node 24 LTS and npm.
+- Docker with the Compose plugin.
+
+## Build and run
+
+```sh
+git clone https://github.com/awesomepandapig/mmx.git
+cd mmx
+npm --prefix console ci
+npm --prefix console run build
+cargo build --release -p mmx
+export PATH="$PWD/target/release:$PATH"
+export MMX_COMPOSE_FILE="$PWD/deploy/compose.yaml"
+mmx local up --build
+mmx local status
+mmx local credentials
+```
+
+The container build installs the services' native toolchain. The CLI keeps operator settings and
+credentials under `deploy/config` and `deploy/.env`; data lives in Docker volumes.
+
+Continue with [Getting started](/getting-started). Use `mmx local down` to stop the deployment while
+preserving its data. Rebuild changed services with `mmx local up --build`.
+
+For native service development without containers, see the repository's `STARTUP.md`.

@@ -125,7 +125,7 @@ class Local(Target):
     tool_env = {"AERON_DIR": "/Volumes/DevShm/cluster-client"}
 
     def preflight(self):
-        for name in ("aeronmd", "sbx-bench"):
+        for name in ("aeronmd", "mmx-bench"):
             if shell("pgrep", "-x", name):
                 sys.exit(f"{name} is running, which would skew every result")
         if shell("pgrep", "-f", "[C]lusteredMediaDriver"):
@@ -253,7 +253,7 @@ def tape(target, orders, symbols=1):
     path = target.tape_dir / f"cluster-{orders}-{symbols}.tape"
     if target.name == "local" and path.exists():
         return path
-    process = target.client("sbx-tape", "--out", path, "--orders", orders, "--seed", SEED, "--symbol", "ITEM",
+    process = target.client("mmx-tape", "--out", path, "--orders", orders, "--seed", SEED, "--symbol", "ITEM",
                              "--symbols", symbols)
     output, _ = process.communicate(timeout=300)
     if process.returncode:
@@ -287,7 +287,7 @@ def run_bench(target, step, tapes):
     leader = target.leader()
     roles = target.roles()
     args = bench_args(target, tapes["path"], rate, orders, rate * target.warmup_seconds, leader)
-    process = target.client("sbx-cluster-bench", *args)
+    process = target.client("mmx-cluster-bench", *args)
 
     sampled = {}
     sampler = None
@@ -319,7 +319,7 @@ def run_failover(target, step, tapes):
     target.up(settings, step["sync"], "diagnostics", target.max_orders)
     leader = target.leader()
     # Reads a survivor, because the tool waits seconds before leaving a dead node, which isn't failover.
-    process = target.client("sbx-cluster-load", "--tape", tapes["path"], "--limit", orders, "--rate", rate,
+    process = target.client("mmx-cluster-load", "--tape", tapes["path"], "--limit", orders, "--rate", rate,
                             "--source", (leader + 1) % 3)
     time.sleep(target.seconds / 3)
     target.kill(leader)

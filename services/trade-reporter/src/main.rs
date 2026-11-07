@@ -76,15 +76,18 @@ fn main() -> ExitCode {
     let mut last_flush = Instant::now();
 
     loop {
-        let fragments_read = source.poll(FRAGMENT_LIMIT, &mut |buffer, _position| match frame::parse(buffer) {
-            Frame::Report(report) => {
-                store.record(&report);
-                candles.apply(&report);
-            }
-            Frame::CancelReject | Frame::TermMarker(_) => {}
-            Frame::Unknown(template_id) => warn!("Skipping unknown template {}", template_id),
-            Frame::Malformed => warn!("Skipping a malformed message of {} bytes", buffer.len()),
-        });
+        let fragments_read = source.poll(
+            FRAGMENT_LIMIT,
+            &mut |buffer, _position| match frame::parse(buffer) {
+                Frame::Report(report) => {
+                    store.record(&report);
+                    candles.apply(&report);
+                }
+                Frame::CancelReject | Frame::TermMarker(_) => {}
+                Frame::Unknown(template_id) => warn!("Skipping unknown template {}", template_id),
+                Frame::Malformed => warn!("Skipping a malformed message of {} bytes", buffer.len()),
+            },
+        );
 
         let position = source.position();
         let idle_flush_due = last_flush.elapsed() >= FLUSH_INTERVAL;

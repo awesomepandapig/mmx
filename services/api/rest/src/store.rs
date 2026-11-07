@@ -84,7 +84,11 @@ pub trait OrderStore: Send + Sync {
     async fn orders(&self, query: &OrderQuery) -> Result<Vec<RecordedOrder>, String>;
 
     /// Every player's working orders in one market. `symbol` must already be normalized.
-    async fn open_orders_in_market(&self, symbol: &str, limit: usize) -> Result<Vec<OpenOrder>, String>;
+    async fn open_orders_in_market(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<OpenOrder>, String>;
 }
 
 #[derive(Deserialize)]
@@ -161,13 +165,21 @@ fn parse_open_orders(reply: &ExecReply) -> Result<Vec<OpenOrder>, String> {
     };
     let (account, id) = (column("account")?, column("cl_ord_id")?);
     let uuid = |row: &[Value], at: usize| -> Result<Uuid, String> {
-        let text = row.get(at).and_then(Value::as_str).ok_or("expected a UUID")?;
+        let text = row
+            .get(at)
+            .and_then(Value::as_str)
+            .ok_or("expected a UUID")?;
         Uuid::parse_str(text).map_err(|err| err.to_string())
     };
     reply
         .dataset
         .iter()
-        .map(|row| Ok(OpenOrder { account: uuid(row, account)?, id: uuid(row, id)? }))
+        .map(|row| {
+            Ok(OpenOrder {
+                account: uuid(row, account)?,
+                id: uuid(row, id)?,
+            })
+        })
         .collect()
 }
 
@@ -189,13 +201,20 @@ fn parse_orders(reply: &ExecReply) -> Result<Vec<RecordedOrder>, String> {
             .position(|column| column.name == name)
             .ok_or_else(|| format!("no column {name}"))
     };
-    let (id, symbol, status) = (column("cl_ord_id")?, column("symbol")?, column("ord_status")?);
+    let (id, symbol, status) = (
+        column("cl_ord_id")?,
+        column("symbol")?,
+        column("ord_status")?,
+    );
     let (side, leaves, filled) = (column("side")?, column("leaves_qty")?, column("cum_qty")?);
     let (price, average) = (column("price")?, column("avg_px")?);
     let (created_at, updated_at) = (column("created_at")?, column("updated_at")?);
 
     let text = |row: &[Value], at: usize| -> Result<String, String> {
-        row[at].as_str().map(str::to_string).ok_or_else(|| format!("expected text, got {}", row[at]))
+        row[at]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("expected text, got {}", row[at]))
     };
     let number = |row: &[Value], at: usize| row[at].as_i64();
 
@@ -255,7 +274,10 @@ impl QuestDb {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|err| err.to_string())?;
-        Ok(Self { url: format!("{}/exec", url.trim_end_matches('/')), client })
+        Ok(Self {
+            url: format!("{}/exec", url.trim_end_matches('/')),
+            client,
+        })
     }
 
     async fn exec(&self, sql: &str) -> Result<Option<ExecReply>, String> {
@@ -297,7 +319,11 @@ impl OrderStore for QuestDb {
         }
     }
 
-    async fn open_orders_in_market(&self, symbol: &str, limit: usize) -> Result<Vec<OpenOrder>, String> {
+    async fn open_orders_in_market(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> Result<Vec<OpenOrder>, String> {
         match self.exec(&open_orders_sql(symbol, limit)).await? {
             Some(reply) => parse_open_orders(&reply),
             None => Ok(Vec::new()),
@@ -328,7 +354,10 @@ mod tests {
     #[test]
     fn reads_a_position() {
         let body = r#"{"columns":[{"name":"max","type":"LONG"}],"dataset":[[4096]],"count":1}"#;
-        assert_eq!(first_number(&parse_reply(body).unwrap().unwrap()), Some(4096));
+        assert_eq!(
+            first_number(&parse_reply(body).unwrap().unwrap()),
+            Some(4096)
+        );
         // An empty table gives a null.
         let body = r#"{"columns":[{"name":"max","type":"LONG"}],"dataset":[[null]],"count":1}"#;
         assert_eq!(first_number(&parse_reply(body).unwrap().unwrap()), None);
@@ -367,9 +396,16 @@ mod tests {
 
     #[test]
     fn reads_commit_progress() {
-        let body = r#"{"columns":[{"name":"writerTxn"},{"name":"sequencerTxn"}],"dataset":[[7,9]]}"#;
+        let body =
+            r#"{"columns":[{"name":"writerTxn"},{"name":"sequencerTxn"}],"dataset":[[7,9]]}"#;
         let reply = parse_reply(body).unwrap().unwrap();
-        assert_eq!(parse_commits(&reply), Ok(OrdersCommits { applied: 7, made: 9 }));
+        assert_eq!(
+            parse_commits(&reply),
+            Ok(OrdersCommits {
+                applied: 7,
+                made: 9
+            })
+        );
 
         let body = r#"{"columns":[{"name":"writerTxn"},{"name":"sequencerTxn"}],"dataset":[]}"#;
         let reply = parse_reply(body).unwrap().unwrap();
@@ -381,7 +417,11 @@ mod tests {
 
     #[test]
     fn order_queries_leave_out_rejected_repeats() {
-        let sql = orders_sql(&OrderQuery { account: account(), limit: 1, ..Default::default() });
+        let sql = orders_sql(&OrderQuery {
+            account: account(),
+            limit: 1,
+            ..Default::default()
+        });
         assert!(sql.contains(&format!("from orders where account = '{}' and (ord_rej_reason is null or ord_rej_reason != 'duplicate_order')", account())), "{sql}");
     }
 
@@ -407,10 +447,28 @@ mod tests {
             (resting, "new", "new", "null", 1, 200, 0),
             (partial, "new", "new", "null", 2, 200, 0),
             (partial, "trade", "partially_filled", "null", 2, 150, 50),
-            (resting, "rejected", "rejected", "'duplicate_order'", 3, 200, 0),
-            (partial, "rejected", "rejected", "'duplicate_order'", 4, 200, 0),
+            (
+                resting,
+                "rejected",
+                "rejected",
+                "'duplicate_order'",
+                3,
+                200,
+                0,
+            ),
+            (
+                partial,
+                "rejected",
+                "rejected",
+                "'duplicate_order'",
+                4,
+                200,
+                0,
+            ),
         ];
-        for (at, (id, exec_type, status, reason, order_id, leaves, filled)) in rows.iter().enumerate() {
+        for (at, (id, exec_type, status, reason, order_id, leaves, filled)) in
+            rows.iter().enumerate()
+        {
             let sql = format!(
                 "insert into orders values ('2026-11-04T12:00:{at:02}.000000Z', '{symbol}', '{exec_type}', \
                  '{status}', 'buy', {reason}, '{player}', '{id}', {order_id}, {}, 100, 200, {leaves}, \
@@ -430,19 +488,43 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        let query = OrderQuery { account: player, limit: 10, ..Default::default() };
+        let query = OrderQuery {
+            account: player,
+            limit: 10,
+            ..Default::default()
+        };
         let listed = db.orders(&query).await.unwrap();
         assert_eq!(listed.len(), 2, "{listed:?}");
-        assert!(listed.iter().all(|order| order.status == RecordedStatus::Open), "{listed:?}");
+        assert!(
+            listed
+                .iter()
+                .all(|order| order.status == RecordedStatus::Open),
+            "{listed:?}"
+        );
 
-        let open = OrderQuery { open_only: true, ..query.clone() };
-        assert_eq!(db.orders(&open).await.unwrap().len(), 2, "cancel-all must find both");
+        let open = OrderQuery {
+            open_only: true,
+            ..query.clone()
+        };
+        assert_eq!(
+            db.orders(&open).await.unwrap().len(),
+            2,
+            "cancel-all must find both"
+        );
 
-        let one = OrderQuery { cl_ord_id: Some(partial), limit: 1, ..query };
+        let one = OrderQuery {
+            cl_ord_id: Some(partial),
+            limit: 1,
+            ..query
+        };
         let order = db.orders(&one).await.unwrap().remove(0);
         assert_eq!(order.status, RecordedStatus::Open);
         assert_eq!((order.leaves_mantissa, order.filled_mantissa), (150, 50));
-        assert!(order.created_at.contains("12:00:01"), "{}", order.created_at);
+        assert!(
+            order.created_at.contains("12:00:01"),
+            "{}",
+            order.created_at
+        );
 
         let market = db.open_orders_in_market(&symbol, 10).await.unwrap();
         assert_eq!(market.len(), 2, "{market:?}");
@@ -453,7 +535,10 @@ mod tests {
         let sql = open_orders_sql("ITEM", 25);
         assert!(sql.contains("symbol = 'ITEM'"));
         assert!(!sql.contains("account ="), "every player: {sql}");
-        assert!(sql.contains("select account, cl_ord_id, order_id,"), "{sql}");
+        assert!(
+            sql.contains("select account, cl_ord_id, order_id,"),
+            "{sql}"
+        );
         assert!(sql.contains("ord_status in ('new', 'partially_filled')"));
         assert!(sql.ends_with("limit 25"));
     }
@@ -466,9 +551,13 @@ mod tests {
         }"#;
         let orders = parse_open_orders(&parse_reply(body).unwrap().unwrap()).unwrap();
         assert_eq!(orders[0].account, account());
-        assert_eq!(orders[0].id, Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+        assert_eq!(
+            orders[0].id,
+            Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()
+        );
 
-        let body = r#"{"columns":[{"name":"account"},{"name":"cl_ord_id"}],"dataset":[[null,"x"]]}"#;
+        let body =
+            r#"{"columns":[{"name":"account"},{"name":"cl_ord_id"}],"dataset":[[null,"x"]]}"#;
         assert!(parse_open_orders(&parse_reply(body).unwrap().unwrap()).is_err());
     }
 
@@ -492,7 +581,11 @@ mod tests {
         assert!(sql.contains("ord_status in ('new', 'partially_filled')"));
         assert!(sql.ends_with("limit 25"));
 
-        let sql = orders_sql(&OrderQuery { account: account(), limit: 1, ..Default::default() });
+        let sql = orders_sql(&OrderQuery {
+            account: account(),
+            limit: 1,
+            ..Default::default()
+        });
         assert!(!sql.contains("ord_status in"));
         assert!(!sql.contains("symbol ="));
     }

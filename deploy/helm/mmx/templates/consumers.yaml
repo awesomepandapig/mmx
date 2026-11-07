@@ -7,6 +7,9 @@
 {{- $name := printf "%s-%s" (include "mmx.fullname" $root) $component -}}
 {{- $labels := dict "root" $root "component" $component -}}
 {{- $persistence := $consumer.persistence | default dict }}
+{{- if and (eq $component "trade-reporter") (ne (int ($consumer.replicas | default 1)) 1) }}
+{{- fail "trade-reporter requires exactly one writer; multiple replicas are not supported" }}
+{{- end }}
 {{- if $persistence.size }}
 ---
 # A StatefulSet needs this, and the console reads the outbox's status through it.
@@ -38,6 +41,11 @@ spec:
   serviceName: {{ $name }}
   {{- end }}
   replicas: {{ $consumer.replicas | default 1 }}
+  {{- if and (eq $component "trade-reporter") (not $persistence.size) }}
+  # Resume barriers assume the previous recorder has stopped writing.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "mmx.selectorLabels" $labels | nindent 6 }}

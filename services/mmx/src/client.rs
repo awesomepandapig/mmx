@@ -68,7 +68,7 @@ fn render_status(body: &Value) -> String {
             .and_then(Value::as_str)
             .unwrap_or("-");
         let mut row = format!(
-            "{:<8} {:<11} {:<8} {}",
+            "{:<16} {:<11} {:<8} {}",
             text(service, "name"),
             state,
             version,
@@ -78,6 +78,33 @@ fn render_status(body: &Value) -> String {
             row = format!("{row}  ({error})");
         }
         lines.push(row);
+    }
+    if let Some(cluster) = body
+        .get("cluster")
+        .filter(|cluster| text(cluster, "mode") == "cluster")
+    {
+        let number = |name: &str| cluster.get(name).unwrap_or(&Value::Null);
+        let quorum = if flag(cluster, "quorum") {
+            "quorum"
+        } else {
+            "no quorum"
+        };
+        lines.push(format!(
+            "cluster: {} of {} members, {quorum}, leader {}, term {}",
+            number("members_up"),
+            number("members_total"),
+            number("leader"),
+            number("term"),
+        ));
+    }
+    for condition in list(body, "conditions") {
+        lines.push(format!(
+            "failing: {} {} since {}: {}",
+            text(condition, "subject"),
+            text(condition, "check"),
+            text(condition, "since"),
+            text(condition, "detail"),
+        ));
     }
     lines.join("\n")
 }
@@ -178,7 +205,7 @@ fn render_webhook_config(body: &Value) -> String {
 fn render_auth(body: &Value) -> String {
     let oidc = body.get("oidc").unwrap_or(&Value::Null);
     format!(
-        "password login: {}\nsingle sign-on: {}\npublic url: {}",
+        "password login: {}\nsingle sign-on: {}\nredirect uri: {}",
         if flag(body, "password_login") {
             "on"
         } else {
@@ -189,7 +216,7 @@ fn render_auth(body: &Value) -> String {
         } else {
             "off"
         },
-        text(body, "public_url"),
+        text(oidc, "redirect_uri"),
     )
 }
 
@@ -237,7 +264,12 @@ fn render_webhooks(body: &Value) -> String {
 fn render_order(order: &Value) -> String {
     // An order with no record has only a status and what to do about it.
     if order.get("product_id").is_none() {
-        return format!("{} {}: {}", text(order, "id"), text(order, "status"), text(order, "message"));
+        return format!(
+            "{} {}: {}",
+            text(order, "id"),
+            text(order, "status"),
+            text(order, "message")
+        );
     }
     format!(
         "{} {:<6} {:<4} {} @ {} {} filled={}",
@@ -502,16 +534,29 @@ impl Admin {
         finish(self.json, &reply, render_webhook_config)
     }
 
-    pub async fn rotate_webhook_secret(&self) -> Result<(), String> {
+    pub async fn rotate_webhook_secret(&self, raw: bool) -> Result<(), String> {
         let reply = self
             .call(self.request(Method::POST, "/admin/v1/webhooks/secret"))
             .await?;
+        if raw {
+            line(text(&reply.body, "secret"));
+            return Ok(());
+        }
         finish(self.json, &reply, |body| {
             format!(
                 "signing secret: {}\nIt's shown once.\n{}",
                 text(body, "secret"),
                 render_webhook_config(body)
             )
+        })
+    }
+
+    pub async fn restart_webhook(&self) -> Result<(), String> {
+        let reply = self
+            .call(self.request(Method::POST, "/admin/v1/webhooks/restart"))
+            .await?;
+        finish(self.json, &reply, |_| {
+            "outbox restart requested; use `mmx webhook config` to confirm the saved settings are applied".to_string()
         })
     }
 
@@ -648,7 +693,7 @@ mod tests {
         });
         let text = render_status(&body);
         assert!(text.starts_with("verdict: degraded"), "{text}");
-        assert!(text.contains("gateway  ready       1.2"), "{text}");
+        assert!(text.contains("gateway          ready       1.2"), "{text}");
         assert!(
             text.contains("not ready") && text.contains("(halted)"),
             "{text}"

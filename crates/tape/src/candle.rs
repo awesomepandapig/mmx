@@ -75,9 +75,21 @@ impl CandleBook {
     pub fn resume(candles: impl IntoIterator<Item = Candle>) -> Self {
         let open = candles
             .into_iter()
-            .map(|candle| (candle.symbol, OpenCandle { candle, changed: false }))
+            .map(|candle| {
+                (
+                    candle.symbol,
+                    OpenCandle {
+                        candle,
+                        changed: false,
+                    },
+                )
+            })
             .collect();
-        Self { open, closed: Vec::new(), skip_replayed: true }
+        Self {
+            open,
+            closed: Vec::new(),
+            skip_replayed: true,
+        }
     }
 
     /// Adds a trade. Both sides of a match report it, so only the buy side counts.
@@ -85,7 +97,9 @@ impl CandleBook {
         if report.exec_type != ExecTypeEnum::Trade || report.side != SideEnum::Buy {
             return;
         }
-        let Some(match_id) = report.trd_match_id else { return };
+        let Some(match_id) = report.trd_match_id else {
+            return;
+        };
         if report.last_px == NULL_DECIMAL || report.last_qty == NULL_DECIMAL {
             return;
         }
@@ -110,7 +124,10 @@ impl CandleBook {
             }
             Entry::Vacant(entry) => {
                 let candle = Candle::first(report.symbol, start, price, quantity, match_id);
-                entry.insert(OpenCandle { candle, changed: true });
+                entry.insert(OpenCandle {
+                    candle,
+                    changed: true,
+                });
             }
         }
     }
@@ -150,7 +167,13 @@ mod tests {
 
     const BUCKET: u64 = 1_500;
 
-    fn trade(seconds: u64, match_id: u64, price: i64, quantity: i64, side: SideEnum) -> ExecutionReportMessage {
+    fn trade(
+        seconds: u64,
+        match_id: u64,
+        price: i64,
+        quantity: i64,
+        side: SideEnum,
+    ) -> ExecutionReportMessage {
         ExecutionReportMessage {
             exec_type: ExecTypeEnum::Trade,
             trd_match_id: Some(match_id),
@@ -179,7 +202,10 @@ mod tests {
         assert_eq!(candles.len(), 1);
         let candle = &candles[0];
         assert_eq!(candle.start, BUCKET);
-        assert_eq!((candle.open, candle.high, candle.low, candle.close), (100, 120, 90, 110));
+        assert_eq!(
+            (candle.open, candle.high, candle.low, candle.close),
+            (100, 120, 90, 110)
+        );
         assert_eq!(candle.volume, 14);
         assert_eq!(candle.trades, 4);
         assert_eq!(candle.last_match_id, 4);
@@ -208,7 +234,10 @@ mod tests {
     fn symbols_keep_separate_candles() {
         let mut book = CandleBook::default();
         pair(&mut book, BUCKET, 1, 100, 2);
-        let other = ExecutionReportMessage { symbol: *b"OTHER\0", ..trade(BUCKET, 2, 500, 1, SideEnum::Buy) };
+        let other = ExecutionReportMessage {
+            symbol: *b"OTHER\0",
+            ..trade(BUCKET, 2, 500, 1, SideEnum::Buy)
+        };
         book.apply(&other);
 
         assert_eq!(book.take_changed().len(), 2);
@@ -218,8 +247,14 @@ mod tests {
     fn only_trades_count() {
         let mut book = CandleBook::default();
         book.apply(&sample_report());
-        book.apply(&ExecutionReportMessage { last_px: NULL_DECIMAL, ..trade(BUCKET, 1, 100, 2, SideEnum::Buy) });
-        book.apply(&ExecutionReportMessage { trd_match_id: None, ..trade(BUCKET, 1, 100, 2, SideEnum::Buy) });
+        book.apply(&ExecutionReportMessage {
+            last_px: NULL_DECIMAL,
+            ..trade(BUCKET, 1, 100, 2, SideEnum::Buy)
+        });
+        book.apply(&ExecutionReportMessage {
+            trd_match_id: None,
+            ..trade(BUCKET, 1, 100, 2, SideEnum::Buy)
+        });
 
         assert!(book.take_changed().is_empty());
     }
@@ -238,7 +273,11 @@ mod tests {
         let mut book = CandleBook::default();
         pair(&mut book, BUCKET, 1, 100, 2);
 
-        assert_eq!(book.tick(BUCKET + 301).len(), 1, "the final state still goes out once");
+        assert_eq!(
+            book.tick(BUCKET + 301).len(),
+            1,
+            "the final state still goes out once"
+        );
         assert!(book.tick(BUCKET + 302).is_empty());
     }
 

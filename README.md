@@ -1,57 +1,74 @@
-# SBX - SkyBlock Exchange
+# MMX
 
-SBX is a high-performance trading platform engineered specifically for Hypixel SkyBlock. It is built on modern exchange design principles, featuring horizontally scalable microservices that communicate over [Aeron](https://github.com/aeron-io/aeron), a high-throughput, low-latency messaging system.
+**Self-hosted exchange infrastructure for game economies.**
 
-<div align="center">
-    
-<img width="1507" src="https://github.com/user-attachments/assets/2cab6199-5f6e-4a54-af00-5906d71e0af8" />
-</p>
+<img width="1263" height="827" alt="image" src="https://github.com/user-attachments/assets/7dd09a4b-3307-43a6-8a9a-795500477d89" />
 
-</div>
- 
-Check out our [Github Project](https://github.com/users/awesomepandapig/projects/6) to see current progress.
+[Website](https://mmx.exchange) · [Documentation](https://docs.mmx.exchange) · [Demo](https://mmx.exchange/demo) · [Roadmap](ROADMAP.md) · [Guidelines](AGENTS.md)
+
+## What is MMX?
+
+MMX is an open-source trading engine for building player-driven markets in games.
+
+It provides a price-time priority order book, market data streaming, and reliable trade delivery. Games retain full control of player accounts, inventory, and currency while MMX handles high-throughput order matching and execution.
+
+MMX is written in Rust and designed to run on your own infrastructure. Although built with game economies in mind, its matching engine operates on generic accounts, symbols, prices, and quantities.
+
+## Features
+
+- **Price-time priority matching:** Deterministic limit order books with fixed-point prices and quantities.
+- **Fault-tolerant execution:** Three-node [Aeron](https://github.com/aeron-io/aeron) Cluster replication with deterministic replay and snapshots.
+- **Reliable trade delivery:** Durable outbox, signed webhooks, and stable fill identifiers for idempotent settlement.
+- **Real-time market data:** Streaming market events over NATS and WebSockets.
+- **Game-controlled settlement:** Keep inventory, currency, authorization, and account management in your own backend.
+- **Self-hosted deployment:** Run locally with Docker Compose or deploy to Kubernetes with Helm.
+- **Operator tooling:** CLI, admin API, and web console for managing markets, orders, and cluster health.
 
 ## Architecture
 
-| Component           | Tech Stack                 | Description                                                               |
-| ------------------- | -------------------------- | ------------------------------------------------------------------- |
-| **Matching Engine** | Rust                       | Zero-GC, in-memory matching engine designed for predictable performance with minimal latency jitter, capable of processing millions of orders per second. |
-| **Data Transport**  | Aeron                      | High-performance, low-latency messaging for service decoupling and reliable event streaming.        |
-| **Persistence**     | QuestDB + Postgres         | Time-series storage for candles & tickers; relational storage for account and order data.   |
-| **REST Gateway**    | Rust + Axum                | Type-safe API design with comprehensive request validation. Enables order lifecycle management and account operations. |
-| **WebSocket**       | Rust + Tungstenite         | Market data feed pushes real-time updates (orders, trades, tickers) to clients via selective, channel-based routing. |
-| **Frontend**        | TypeScript + Remix + TailwindCSS + Vite | Intuitive trading interfaces, market visualization, and account management features |
+MMX separates order matching from application authorization and settlement.
 
+Orders enter through the REST gateway and are processed by a replicated matching engine. Execution reports are recorded for replay, delivered to applications through signed webhooks, and published to market data consumers.
 
-## Engineering Highlights
+The application remains responsible for reserving assets before orders are accepted and applying fills to its own ledger.
 
-* **In-Memory Order Matching**
-  
-  Built in Rust for maximum safety, the matching engine is capable of processing `4.15 million` messages per second (benchmarked on a 2024 M4 Mac Mini). It implements a price-time priority model to ensure fair and efficient order execution.
+See the [architecture documentation](https://docs.mmx.exchange/guides/architecture) for details on replication, recovery, and trade delivery.
 
-* **Event-Sourced Architecture**
-  
-  Trade and order lifecycle events are streamed via Aeron, creating a durable and auditable log. This enables complete system recovery and allows for decoupled state reconstruction across all microservices.
+## Getting started
 
-* **Scalable Market Data Distribution**
-  
-  Market state is derived from the multicast Aeron stream and efficiently broadcast via WebSockets. Channel-based subscription management ensures that clients receive only the updates that are relevant to them, minimizing network overhead.
+### Quickstart with Helm (Kubernetes)
 
-* **Fault Isolation**
+Deploy MMX to Kubernetes using Helm:
 
-  Each service is independently deployable and restartable, allowing for horizontal scaling and minimizing the impact of any single component failure. The system is designed to maintain partial functionality even if individual services go down.
+```sh
+helm install mmx deploy/helm/mmx -n mmx --create-namespace
+```
+
+### Local Docker
+
+Run the stack locally with Docker Compose:
+
+```sh
+curl -fsSLO https://github.com/awesomepandapig/sbx/releases/latest/download/install.sh
+sh install.sh 0.1.0
+export PATH="$HOME/.local/bin:$PATH"
+mmx local up
+```
+
+For detailed guides, configuration, and submitting your first trade, see the [getting started guide](https://docs.mmx.exchange/getting-started).
+
+You can also explore the [interactive demo](https://mmx.exchange/demo) without deploying anything.
+
+## Project status
+
+MMX is under active development.
+
+See the [feature status](https://docs.mmx.exchange/status) and [roadmap](ROADMAP.md) for current capabilities, integration contracts, and planned work.
+
+## Contributing
+
+MMX is open source. For repository structure, guidelines, and commands, see [AGENTS.md](AGENTS.md). For dependencies and local setup, see [STARTUP.md](STARTUP.md).
 
 ## License
 
-This project is dual-licensed under either:
-
-* [MIT License](./LICENSE-MIT)
-* [Apache License 2.0](./LICENSE-APACHE)
-
-You may choose either license.
-
-### Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in SBX by you shall be dual-licensed as above, without any additional
-terms or conditions.
+MMX is dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE), at your option.

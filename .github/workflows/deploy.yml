@@ -22,6 +22,71 @@ jobs:
       - uses: azure/setup-helm@v4
       - run: deploy/scripts/validate.sh
 
+  frontend:
+    name: Frontends and browser checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            docs/package-lock.json
+            console/package-lock.json
+            tools/browser/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm --prefix web ci
+          npm --prefix docs ci
+          npm --prefix console ci
+          npm --prefix tools/browser ci
+      - name: Check and build
+        env:
+          VITE_DOCS_URL: http://127.0.0.1:5174
+          DOCS_BASE_URL: http://127.0.0.1:5174
+        run: |
+          npm --prefix web run typecheck
+          npm --prefix web run lint
+          npm --prefix web run build
+          npm --prefix docs run typecheck
+          npm --prefix docs run build
+          npm --prefix console run lint
+          npm --prefix console run build
+      - name: Install browser
+        run: tools/browser/node_modules/.bin/playwright install --with-deps chromium
+      - name: Check mobile layouts and documentation routes
+        env:
+          SCREENSHOT_DIR: ${{ github.workspace }}/.local/browser
+        run: |
+          PORT=5193 HOST=127.0.0.1 npm --prefix web start > /tmp/mmx-web.log 2>&1 &
+          DOCS_ROOT=docs/dist/public PORT=5174 HOST=127.0.0.1 node deploy/docker/serve-docs.mjs > /tmp/mmx-docs.log 2>&1 &
+          npm --prefix tools/browser test
+      - name: Build Vercel output
+        env:
+          VERCEL: '1'
+          VITE_DOCS_URL: http://127.0.0.1:5175
+        run: |
+          npm --prefix web run build
+          npm --prefix docs run build
+      - name: Check Vercel handler and static output
+        env:
+          WEB_URL: http://127.0.0.1:5195
+          DOCS_URL: http://127.0.0.1:5175
+          SCREENSHOT_DIR: ${{ github.workspace }}/.local/browser-vercel
+        run: |
+          PORT=5195 node tools/browser/vercel-preview.mjs > /tmp/mmx-vercel-web.log 2>&1 &
+          DOCS_ROOT=docs/.vercel/output/static PORT=5175 HOST=127.0.0.1 node deploy/docker/serve-docs.mjs > /tmp/mmx-vercel-docs.log 2>&1 &
+          npm --prefix tools/browser test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-screenshots
+          path: |
+            .local/browser
+            .local/browser-vercel
+
   test:
     name: Cargo test
     runs-on: ubuntu-24.04
@@ -46,7 +111,7 @@ jobs:
   images:
     name: Images (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: [validate, test]
+    needs: [validate, test, frontend]
     permissions:
       contents: read
       packages: write
@@ -87,7 +152,7 @@ jobs:
   chart-install:
     name: Install the chart
     runs-on: ubuntu-24.04
-    needs: [validate, test]
+    needs: [validate, test, frontend]
     env:
       PLATFORMS: linux/amd64
       CACHE_SCOPE: amd64
@@ -121,9 +186,9 @@ jobs:
         run: |
           helm install mmx deploy/helm/mmx --namespace mmx --create-namespace \
             -f deploy/helm/mmx/values-local.yaml \
-            --set image.pullPolicy=Never --set ui.enabled=false \
+            --set image.registry=mmx --set image.tag=dev --set image.pullPolicy=Never --set ui.enabled=false \
             --wait --timeout 10m
-      - name: Send an order through a gateway
+      - name: Check installed services (read-only)
         run: helm test mmx --namespace mmx --logs --timeout 3m
       - name: Show what went wrong
         if: failure()

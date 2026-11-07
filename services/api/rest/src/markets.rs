@@ -56,7 +56,9 @@ pub fn normalize_symbol(symbol: &str) -> Result<String, String> {
         ));
     }
     if !normalized.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(format!("Product ID '{symbol}' is invalid. It must be alphanumeric."));
+        return Err(format!(
+            "Product ID '{symbol}' is invalid. It must be alphanumeric."
+        ));
     }
     Ok(normalized)
 }
@@ -95,7 +97,16 @@ impl Markets {
             let mut symbol = [0u8; SYMBOL_LENGTH];
             symbol[..name.len()].copy_from_slice(name.as_bytes());
             let enabled = entry.enabled.unwrap_or(true);
-            listed.insert(name, Market { symbol, tick_size, min_size, max_size, enabled });
+            listed.insert(
+                name,
+                Market {
+                    symbol,
+                    tick_size,
+                    min_size,
+                    max_size,
+                    enabled,
+                },
+            );
         }
         Ok(Self { listed })
     }
@@ -116,7 +127,11 @@ impl Markets {
 
     /// The enabled markets, sorted.
     pub fn symbols(&self) -> Vec<String> {
-        self.listed.iter().filter(|(_, market)| market.enabled).map(|(name, _)| name.clone()).collect()
+        self.listed
+            .iter()
+            .filter(|(_, market)| market.enabled)
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 }
 
@@ -130,7 +145,10 @@ impl MarketRegistry {
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, String> {
         let path = path.into();
         let markets = Self::read(&path)?;
-        Ok(Self { path, current: RwLock::new(Arc::new(markets)) })
+        Ok(Self {
+            path,
+            current: RwLock::new(Arc::new(markets)),
+        })
     }
 
     fn read(path: &Path) -> Result<Markets, String> {
@@ -139,7 +157,10 @@ impl MarketRegistry {
     }
 
     pub fn current(&self) -> Arc<Markets> {
-        self.current.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn reload(&self) -> Result<Arc<Markets>, String> {
@@ -197,7 +218,8 @@ markets:
             entry(r#"{symbol: A}"#),
             entry(r#"{symbol: A, tick_size: "1", surprise: true}"#),
             entry(r#"{symbol: A, tick_size: "1", min_size: "2", max_size: "1"}"#),
-            "markets:\n  - {symbol: A, tick_size: \"1\"}\n  - {symbol: a, tick_size: \"1\"}\n".to_string(),
+            "markets:\n  - {symbol: A, tick_size: \"1\"}\n  - {symbol: a, tick_size: \"1\"}\n"
+                .to_string(),
             "not yaml: [".to_string(),
         ] {
             assert!(Markets::parse(&text).is_err(), "{text} should be refused");
@@ -212,7 +234,11 @@ markets:
         assert_eq!(registry.current().symbols(), ["GEM", "ITEM"]);
 
         fs::write(&path, "markets:\n  - {symbol: NEW, tick_size: \"1\"}\n").unwrap();
-        assert_eq!(registry.current().symbols(), ["GEM", "ITEM"], "edits wait for a reload");
+        assert_eq!(
+            registry.current().symbols(),
+            ["GEM", "ITEM"],
+            "edits wait for a reload"
+        );
         registry.reload().unwrap();
         assert_eq!(registry.current().symbols(), ["NEW"]);
 

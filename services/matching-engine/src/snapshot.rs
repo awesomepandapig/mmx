@@ -37,8 +37,9 @@ pub fn write(handler: &Handler, output: &OutputState, write: &mut dyn FnMut(&[u8
     chunk[0] = ORDER_CHUNK;
     let mut length = 1;
     for order in handler.book.resting() {
-        let record: &mut [u8; ORDER_RECORD] =
-            (&mut chunk[length..length + ORDER_RECORD]).try_into().expect("a record's length");
+        let record: &mut [u8; ORDER_RECORD] = (&mut chunk[length..length + ORDER_RECORD])
+            .try_into()
+            .expect("a record's length");
         types::encode_order(order, record);
         length += ORDER_RECORD;
         if length + ORDER_RECORD > CHUNK_LENGTH {
@@ -61,8 +62,13 @@ impl Loader {
     pub fn on_chunk(&mut self, handler: &mut Handler, chunk: &[u8]) {
         match chunk[0] {
             HEADER_CHUNK => {
-                let value =
-                    |i: usize| u64::from_le_bytes(chunk[8 + i * 8..16 + i * 8].try_into().expect("eight bytes"));
+                let value = |i: usize| {
+                    u64::from_le_bytes(
+                        chunk[8 + i * 8..16 + i * 8]
+                            .try_into()
+                            .expect("eight bytes"),
+                    )
+                };
                 handler.counter_order_id = value(0);
                 handler.counter_exec_id = value(1);
                 handler.counter_match_id = value(2);
@@ -76,14 +82,16 @@ impl Loader {
             }
             _ => {
                 let (records, _) = chunk[1..].as_chunks::<ORDER_RECORD>();
-                self.orders.extend(records.iter().map(|record| types::decode_order(record)));
+                self.orders
+                    .extend(records.iter().map(|record| types::decode_order(record)));
             }
         }
     }
 
     /// Restores every queue in its original order.
     pub fn finish(mut self, handler: &mut Handler) {
-        self.orders.sort_unstable_by_key(|order| order.sequence_number);
+        self.orders
+            .sort_unstable_by_key(|order| order.sequence_number);
         for order in &self.orders {
             handler.book.add(order);
         }

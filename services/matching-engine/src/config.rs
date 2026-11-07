@@ -19,7 +19,10 @@ const SNAPSHOTS_KEPT: usize = 3;
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
 pub fn error_handler(code: i32, message: &str) {
-    error!(code, message, "Critical Aeron communication failure. Exiting.");
+    error!(
+        code,
+        message, "Critical Aeron communication failure. Exiting."
+    );
     process::exit(1);
 }
 
@@ -83,7 +86,10 @@ pub fn recovery_config() -> RecoveryConfig {
         error!(target: "configuration", "RECOVERY_MODE only accepts rebuild. Exiting.");
         process::exit(1);
     }
-    let config = RecoveryConfig { durable: optional_var("DURABLE_POSITION"), rebuild: mode.is_some() };
+    let config = RecoveryConfig {
+        durable: optional_var("DURABLE_POSITION"),
+        rebuild: mode.is_some(),
+    };
     if config.rebuild && config.durable.is_none() {
         error!(target: "configuration", "RECOVERY_MODE=rebuild needs DURABLE_POSITION. Exiting.");
         process::exit(1);
@@ -103,9 +109,13 @@ pub fn node_config() -> NodeConfig {
         archive_control_channel: required_var("ARCHIVE_CONTROL"),
         snapshots: SnapshotPolicy {
             log_bytes: optional_var("SNAPSHOT_LOG_BYTES").unwrap_or(SNAPSHOT_LOG_BYTES),
-            interval: optional_var("SNAPSHOT_INTERVAL_SECS").unwrap_or(SNAPSHOT_INTERVAL_SECS) * NANOS_PER_SECOND,
+            interval: optional_var("SNAPSHOT_INTERVAL_SECS").unwrap_or(SNAPSHOT_INTERVAL_SECS)
+                * NANOS_PER_SECOND,
         },
-        retention: Retention { keep_snapshots: optional_var("SNAPSHOTS_KEPT").unwrap_or(SNAPSHOTS_KEPT), tape },
+        retention: Retention {
+            keep_snapshots: optional_var("SNAPSHOTS_KEPT").unwrap_or(SNAPSHOTS_KEPT),
+            tape,
+        },
     }
 }
 

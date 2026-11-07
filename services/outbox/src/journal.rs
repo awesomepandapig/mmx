@@ -71,7 +71,10 @@ fn read_record(reader: &mut impl Read) -> io::Result<Option<(Record, u64)>> {
     if !read_fully(reader, &mut payload)? || crc32fast::hash(&payload) != crc {
         return Ok(None);
     }
-    Ok(Some((Record::decode(&payload), (RECORD_HEADER + length) as u64)))
+    Ok(Some((
+        Record::decode(&payload),
+        (RECORD_HEADER + length) as u64,
+    )))
 }
 
 fn read_fully(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<bool> {
@@ -101,12 +104,23 @@ pub struct Journal {
 impl Journal {
     /// Opens the journal, handing every surviving record to `visit`. Whatever follows the last
     /// valid record was never reported as durable, so it's cut off.
-    pub fn open(dir: &Path, mut visit: impl FnMut(&Record) -> Result<(), String>) -> io::Result<Self> {
+    pub fn open(
+        dir: &Path,
+        mut visit: impl FnMut(&Record) -> Result<(), String>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
         let path = dir.join(JOURNAL_FILE);
-        let file = OpenOptions::new().create(true).truncate(false).read(true).append(true).open(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .append(true)
+            .open(&path)?;
         if file.try_lock().is_err() {
-            return Err(io::Error::new(ErrorKind::WouldBlock, "another outbox owns this journal"));
+            return Err(io::Error::new(
+                ErrorKind::WouldBlock,
+                "another outbox owns this journal",
+            ));
         }
         sync_dir(dir)?;
 
@@ -133,7 +147,11 @@ impl Journal {
         }
 
         if journal.synced_length < total {
-            eprintln!("journal: cutting {} bytes after position {}", total - journal.synced_length, journal.position);
+            eprintln!(
+                "journal: cutting {} bytes after position {}",
+                total - journal.synced_length,
+                journal.position
+            );
             journal.file.set_len(journal.synced_length)?;
         }
         // A record that outlived a crash may never have reached the disk itself.
@@ -211,7 +229,10 @@ impl JournalReader {
     pub fn open(dir: &Path, offset: u64) -> io::Result<Self> {
         let mut file = File::open(dir.join(JOURNAL_FILE))?;
         file.seek(SeekFrom::Start(offset))?;
-        Ok(Self { reader: BufReader::new(file), offset })
+        Ok(Self {
+            reader: BufReader::new(file),
+            offset,
+        })
     }
 
     pub fn offset(&self) -> u64 {
@@ -229,7 +250,10 @@ impl JournalReader {
                 self.offset += length;
                 Ok(Some(record))
             }
-            None => Err(io::Error::new(ErrorKind::InvalidData, format!("bad journal record at offset {}", self.offset))),
+            None => Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("bad journal record at offset {}", self.offset),
+            )),
         }
     }
 }

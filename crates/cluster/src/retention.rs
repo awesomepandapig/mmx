@@ -67,7 +67,10 @@ struct Ledger {
 impl Ledger {
     fn new(keep: usize) -> Self {
         let keep = keep.max(MIN_SNAPSHOTS);
-        Self { keep, taken: VecDeque::with_capacity(keep + 1) }
+        Self {
+            keep,
+            taken: VecDeque::with_capacity(keep + 1),
+        }
     }
 
     /// Returns floors once enough snapshots exist that the oldest kept one can be relied on.
@@ -82,7 +85,10 @@ impl Ledger {
         Some(Floors {
             snapshot_recording_id: oldest.recording_id,
             log_position: oldest.log_position,
-            tape: TapeMark { position: oldest.tape.position, swept },
+            tape: TapeMark {
+                position: oldest.tape.position,
+                swept,
+            },
         })
     }
 }
@@ -116,23 +122,38 @@ fn purge_old_snapshots(archive: &ArchiveClient, stream_id: i32, below: i64) {
     };
     for recording in recordings.iter().filter(|recording| recording.id < below) {
         if let Err(error) = archive.purge_recording(recording.id) {
-            eprintln!("failed to purge snapshot recording {}: {error}", recording.id);
+            eprintln!(
+                "failed to purge snapshot recording {}: {error}",
+                recording.id
+            );
         }
     }
 }
 
 fn purge_front(archive: &ArchiveClient, name: &str, recording: &Recording, floor: i64) {
-    let Some(target) = purge_target(recording, floor) else { return };
+    let Some(target) = purge_target(recording, floor) else {
+        return;
+    };
     match archive.purge_segments(recording.id, target) {
-        Ok(segments) => eprintln!("purged {segments} {name} segments, {name} now starts at {target}"),
+        Ok(segments) => {
+            eprintln!("purged {segments} {name} segments, {name} now starts at {target}")
+        }
         // Most often a replay still reading there. The next snapshot tries again.
         Err(error) => eprintln!("failed to purge the {name} to {target}: {error}"),
     }
 }
 
 fn purge(archive: &ArchiveClient, retention: Retention, floors: Floors) {
-    purge_old_snapshots(archive, snapshot::SNAPSHOT_STREAM_ID, floors.snapshot_recording_id);
-    purge_old_snapshots(archive, CONSENSUS_SNAPSHOT_STREAM_ID, floors.snapshot_recording_id);
+    purge_old_snapshots(
+        archive,
+        snapshot::SNAPSHOT_STREAM_ID,
+        floors.snapshot_recording_id,
+    );
+    purge_old_snapshots(
+        archive,
+        CONSENSUS_SNAPSHOT_STREAM_ID,
+        floors.snapshot_recording_id,
+    );
 
     match archive.recordings(LOG_STREAM_ID) {
         Ok(recordings) => {
@@ -144,8 +165,14 @@ fn purge(archive: &ArchiveClient, retention: Retention, floors: Floors) {
     }
 
     let Some(tape) = retention.tape else { return };
-    let Some(recording) = archive.find_recording(tape.stream_id, tape.session_id) else { return };
-    let end = if recording.stop < 0 { floors.tape.position } else { recording.stop };
+    let Some(recording) = archive.find_recording(tape.stream_id, tape.session_id) else {
+        return;
+    };
+    let end = if recording.stop < 0 {
+        floors.tape.position
+    } else {
+        recording.stop
+    };
     if let Some(floor) = tape_floor(floors.tape, end, tape.retain_bytes) {
         purge_front(archive, "tape", &recording, floor);
     }
@@ -189,7 +216,11 @@ impl Housekeeper {
 
     pub(crate) fn on_snapshot(&self, recording_id: i64, log_position: i64, tape: TapeMark) {
         // If the thread has died, recovery still works. Disk use just keeps growing.
-        let _ = self.snapshots.send(Taken { recording_id, log_position, tape });
+        let _ = self.snapshots.send(Taken {
+            recording_id,
+            log_position,
+            tape,
+        });
     }
 }
 
@@ -203,12 +234,21 @@ mod tests {
         Taken {
             recording_id,
             log_position: recording_id * 1_000,
-            tape: TapeMark { position: recording_id * 100, swept },
+            tape: TapeMark {
+                position: recording_id * 100,
+                swept,
+            },
         }
     }
 
     fn recording(start: i64) -> Recording {
-        Recording { id: 1, start, stop: -1, term_length: 16 * MEGABYTE, segment_length: 128 * MEGABYTE }
+        Recording {
+            id: 1,
+            start,
+            stop: -1,
+            term_length: 16 * MEGABYTE,
+            segment_length: 128 * MEGABYTE,
+        }
     }
 
     #[test]
@@ -229,7 +269,10 @@ mod tests {
             Some(Floors {
                 snapshot_recording_id: 5,
                 log_position: 5_000,
-                tape: TapeMark { position: 500, swept: Some(70) },
+                tape: TapeMark {
+                    position: 500,
+                    swept: Some(70)
+                },
             })
         );
     }
@@ -238,13 +281,21 @@ mod tests {
     fn at_least_two_snapshots_are_always_kept() {
         let mut ledger = Ledger::new(1);
         assert_eq!(ledger.add(taken(1, None)), None);
-        assert_eq!(ledger.add(taken(2, None)).map(|floors| floors.snapshot_recording_id), Some(1));
+        assert_eq!(
+            ledger
+                .add(taken(2, None))
+                .map(|floors| floors.snapshot_recording_id),
+            Some(1)
+        );
     }
 
     #[test]
     fn the_purge_target_is_a_segment_boundary_at_or_below_the_floor() {
         let segment = i64::from(128 * MEGABYTE);
-        assert_eq!(purge_target(&recording(0), 2 * segment + 5), Some(2 * segment));
+        assert_eq!(
+            purge_target(&recording(0), 2 * segment + 5),
+            Some(2 * segment)
+        );
         assert_eq!(purge_target(&recording(0), 2 * segment), Some(2 * segment));
     }
 
@@ -253,24 +304,43 @@ mod tests {
         let segment = i64::from(128 * MEGABYTE);
         assert_eq!(purge_target(&recording(0), segment - 1), None);
         assert_eq!(purge_target(&recording(segment), 2 * segment - 1), None);
-        assert_eq!(purge_target(&recording(segment), 2 * segment), Some(2 * segment));
+        assert_eq!(
+            purge_target(&recording(segment), 2 * segment),
+            Some(2 * segment)
+        );
     }
 
     #[test]
     fn segments_are_counted_from_the_term_holding_the_start() {
         let (term, segment) = (i64::from(16 * MEGABYTE), i64::from(128 * MEGABYTE));
         let start = term + 4096;
-        assert_eq!(purge_target(&recording(start), term + segment + 1), Some(term + segment));
+        assert_eq!(
+            purge_target(&recording(start), term + segment + 1),
+            Some(term + segment)
+        );
     }
 
     #[test]
     fn the_tape_stays_until_something_is_swept() {
-        assert_eq!(tape_floor(TapeMark { position: 500, swept: None }, 1_000, 0), None);
+        assert_eq!(
+            tape_floor(
+                TapeMark {
+                    position: 500,
+                    swept: None
+                },
+                1_000,
+                0
+            ),
+            None
+        );
     }
 
     #[test]
     fn the_tape_floor_is_the_lowest_limit() {
-        let mark = |position, swept| TapeMark { position, swept: Some(swept) };
+        let mark = |position, swept| TapeMark {
+            position,
+            swept: Some(swept),
+        };
         assert_eq!(tape_floor(mark(500, 300), 1_000, 100), Some(300));
         assert_eq!(tape_floor(mark(200, 300), 1_000, 100), Some(200));
         assert_eq!(tape_floor(mark(500, 300), 350, 100), Some(250));

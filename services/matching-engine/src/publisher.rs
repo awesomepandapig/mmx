@@ -2,7 +2,7 @@ use crate::types::CancelRequest;
 use crate::types::Order;
 
 use std::hint::spin_loop;
-use std::time::{SystemTime};
+use std::time::SystemTime;
 
 use transport::{AeronExclusivePublication, AeronOfferError};
 
@@ -255,7 +255,11 @@ impl Publisher {
     /// the book alone, so the book at the start of the range is the book at the current position.
     pub fn quiet_range(&self) -> (i64, i64) {
         let current = self.output_position();
-        if self.last_marker_written == self.written { (self.quiet_position, current) } else { (current, current) }
+        if self.last_marker_written == self.written {
+            (self.quiet_position, current)
+        } else {
+            (current, current)
+        }
     }
 
     /// Sends everything written, and returns the stream position that follows it.
@@ -264,7 +268,9 @@ impl Publisher {
             self.drain();
             spin_loop();
         }
-        self.publication.as_ref().map_or(0, AeronExclusivePublication::position)
+        self.publication
+            .as_ref()
+            .map_or(0, AeronExclusivePublication::position)
     }
 
     /// Every report before this marker is final. A gateway that reads it knows that any in-flight
@@ -284,7 +290,12 @@ impl Publisher {
 
     /// Tells gateways and the control plane that recovery reached this point. Every report before
     /// it is final, and it's written by every node at the same position.
-    pub fn publish_recovery_marker(&mut self, event: RecoveryEvent, tape_position: i64, open_orders: u64) {
+    pub fn publish_recovery_marker(
+        &mut self,
+        event: RecoveryEvent,
+        tape_position: i64,
+        open_orders: u64,
+    ) {
         let slot = self.next_slot();
         slot.fill(0);
         slot[0..2].copy_from_slice(&24u16.to_le_bytes());
@@ -345,10 +356,16 @@ impl Publisher {
     pub fn drain(&mut self) {
         while self.leading && self.sent < self.written {
             let index = (self.sent as usize) & (RING_LENGTH - 1);
-            let Some(publication) = &self.publication else { return };
+            let Some(publication) = &self.publication else {
+                return;
+            };
             match publication.offer(&self.ring[index]) {
                 Ok(_) => self.sent += 1,
-                Err(AeronOfferError::NotConnected | AeronOfferError::BackPressured | AeronOfferError::AdminAction) => return,
+                Err(
+                    AeronOfferError::NotConnected
+                    | AeronOfferError::BackPressured
+                    | AeronOfferError::AdminAction,
+                ) => return,
                 Err(err) => {
                     error!("Failed to publish a report: {}", err);
                     return;
@@ -396,7 +413,10 @@ impl Publisher {
 
     #[cfg(test)]
     pub fn report(&self, index: u64) -> &[u8; MAX_MESSAGE_SIZE] {
-        assert!(self.written - index <= RING_LENGTH as u64, "the ring has moved past this report");
+        assert!(
+            self.written - index <= RING_LENGTH as u64,
+            "the ring has moved past this report"
+        );
         &self.ring[(index as usize) & (RING_LENGTH - 1)]
     }
 

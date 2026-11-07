@@ -78,7 +78,8 @@ impl Shared {
     /// True once this process has seen the tape agree with the journal, and nothing has disagreed
     /// since.
     pub fn may_deliver(&self) -> bool {
-        self.verified.load(Ordering::Acquire) && self.halted.lock().expect("no panics while held").is_none()
+        self.verified.load(Ordering::Acquire)
+            && self.halted.lock().expect("no panics while held").is_none()
     }
 
     pub fn is_stopping(&self) -> bool {
@@ -118,7 +119,10 @@ pub struct SyncConfig {
 
 impl Default for SyncConfig {
     fn default() -> Self {
-        Self { max_pending_bytes: 64 * 1024, max_delay: Duration::from_millis(1) }
+        Self {
+            max_pending_bytes: 64 * 1024,
+            max_delay: Duration::from_millis(1),
+        }
     }
 }
 
@@ -132,7 +136,9 @@ pub struct Outbox {
 impl Outbox {
     pub fn open(dir: &Path, config: SyncConfig) -> Result<Self, Error> {
         let mut ledger = Ledger::default();
-        let journal = Journal::open(dir, |record| ledger.apply(&frame::decode(&record.frame)).map(|_| ()))?;
+        let journal = Journal::open(dir, |record| {
+            ledger.apply(&frame::decode(&record.frame)).map(|_| ())
+        })?;
 
         let shared = Arc::new(Shared {
             durable_length: AtomicU64::new(journal.synced_length()),
@@ -146,7 +152,12 @@ impl Outbox {
             consecutive_failures: AtomicU64::new(0),
             syncs: AtomicU64::new(0),
         });
-        Ok(Self { journal, ledger, shared, config })
+        Ok(Self {
+            journal,
+            ledger,
+            shared,
+            config,
+        })
     }
 
     pub fn shared(&self) -> Arc<Shared> {
@@ -170,14 +181,22 @@ impl Outbox {
 
     /// Accepts a frame ending at `position`. It's safe to offer a frame more than once.
     pub fn ingest(&mut self, position: i64, bytes: &[u8]) -> Result<(), Error> {
-        if let Some(reason) = self.shared.halted.lock().expect("no panics while held").clone() {
+        if let Some(reason) = self
+            .shared
+            .halted
+            .lock()
+            .expect("no panics while held")
+            .clone()
+        {
             return Err(Error::Halted(reason));
         }
 
         if position <= self.journal.position() {
             if position == self.journal.position() {
                 if self.journal.last_frame() != bytes {
-                    return Err(self.shared.halt(format!("the tape at {position} differs from the journal")));
+                    return Err(self
+                        .shared
+                        .halt(format!("the tape at {position} differs from the journal")));
                 }
                 self.shared.verified.store(true, Ordering::Release);
             }
@@ -186,15 +205,27 @@ impl Outbox {
 
         if !self.shared.verified.load(Ordering::Acquire) {
             let expected = self.journal.position();
-            return Err(self.shared.halt(format!("the tape skipped the frame at {expected}, and went on to {position}")));
+            return Err(self.shared.halt(format!(
+                "the tape skipped the frame at {expected}, and went on to {position}"
+            )));
         }
 
         let decoded = frame::decode(bytes);
         if let frame::Frame::Unknown(template_id) = decoded {
-            eprintln!("journaling a frame with unknown template {template_id} at {position}, which no webhook covers");
+            eprintln!(
+                "journaling a frame with unknown template {template_id} at {position}, which no webhook covers"
+            );
         }
-        let stamp = self.ledger.apply(&decoded).map_err(|reason| self.shared.halt(format!("at {position}: {reason}")))?;
-        self.journal.append(&Record { position, exec_id: stamp.exec_id, flags: stamp.flags, frame: bytes.to_vec() });
+        let stamp = self
+            .ledger
+            .apply(&decoded)
+            .map_err(|reason| self.shared.halt(format!("at {position}: {reason}")))?;
+        self.journal.append(&Record {
+            position,
+            exec_id: stamp.exec_id,
+            flags: stamp.flags,
+            frame: bytes.to_vec(),
+        });
 
         if self.journal.pending_len() >= self.config.max_pending_bytes {
             self.sync()?;
@@ -204,7 +235,11 @@ impl Outbox {
 
     /// Flushes pending frames if the oldest has waited long enough. Call this between polls.
     pub fn tick(&mut self) -> Result<(), Error> {
-        if self.journal.pending_since().is_some_and(|since| since.elapsed() >= self.config.max_delay) {
+        if self
+            .journal
+            .pending_since()
+            .is_some_and(|since| since.elapsed() >= self.config.max_delay)
+        {
             self.sync()?;
         }
         Ok(())
@@ -217,9 +252,15 @@ impl Outbox {
         }
         self.journal.sync()?;
         self.shared.syncs.fetch_add(1, Ordering::Relaxed);
-        self.shared.durable_position.store(self.journal.position(), Ordering::Release);
-        self.shared.durable_exec_id.store(self.journal.exec_id(), Ordering::Release);
-        self.shared.durable_length.store(self.journal.synced_length(), Ordering::Release);
+        self.shared
+            .durable_position
+            .store(self.journal.position(), Ordering::Release);
+        self.shared
+            .durable_exec_id
+            .store(self.journal.exec_id(), Ordering::Release);
+        self.shared
+            .durable_length
+            .store(self.journal.synced_length(), Ordering::Release);
         Ok(())
     }
 }

@@ -1,4 +1,4 @@
-# Sample markets for `tools/scripts/sbx.py up --cluster`. The format is described in
+# Sample markets for `tools/scripts/mmx.py up --cluster`. The format is described in
 # services/api/rest/markets.yaml. Edit them in the console, or edit this file and apply it with:
 #
 #   target/release/mmx markets reload

@@ -75,7 +75,7 @@ def main():
     time.sleep(13)
     leader = int(cluster("leader").splitlines()[-1])
     follower = (leader + 1) % 3
-    tap = subprocess.Popen([ROOT / "target/release/sbx-tap", "--json", "--channel",
+    tap = subprocess.Popen([ROOT / "target/release/mmx-tap", "--json", "--channel",
                             f"aeron:udp?endpoint=localhost:0|control=localhost:{40450 + follower}|session-id=1002"],
                            env=env, stdout=open(RUN / "tap.jsonl", "w"), stderr=subprocess.DEVNULL)
     api = subprocess.Popen([ROOT / "target/release/api"], stdout=open(RUN / "api.log", "w"), stderr=subprocess.STDOUT, env={

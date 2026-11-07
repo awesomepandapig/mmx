@@ -1,0 +1,64 @@
+# Production operations
+
+Install with [Helm](/installation/helm). The default profile runs three voters on separate hosts with shared CPUs, 9 GiB of voter memory, and 15 GiB of tape storage per voter. Add capacity for gateways, consumers, dependencies, and retained history.
+
+## Capacity
+
+`cluster.engine.maxOrders` defaults to 100,000 resting orders across all markets. Size memory and tape retention for your workload. The archive retains history by default; monitor free disk and plan backups before increasing admission volume.
+
+The optional `values-performance.yaml` profile enables dedicated busy-spinning threads and CPU pinning. Use it on prepared Linux nodes when measurements justify exclusive CPUs. Configure the kubelet's static CPU manager and suitable reserved system CPUs; on SMT hosts, whole-core allocations must match the SMT width. Raise Linux socket-buffer limits to match the requested Aeron buffers. These are peak-throughput settings, not installation prerequisites.
+
+## Service and network configuration
+
+Use `console.service`, `gateway.service`, and `websocket.service` to select `ClusterIP`, `LoadBalancer`, or `NodePort`. Load-balancer source ranges and network policies restrict network access. Keep REST orders behind trusted game servers; expose public WebSocket traffic through TLS.
+
+A TLS proxy for the console must forward `X-Forwarded-Proto: https` and the public host. Allow long-lived responses on `/admin/v1/events` and `/admin/v1/markets/*/stream`.
+
+## Operator sign-in
+
+Configure your OIDC provider with the console callback URL `/admin/v1/oidc/callback`. Store its client secret in a Kubernetes Secret:
+
+```yaml
+console:
+  passwordLogin: false
+  oidc:
+    enabled: true
+    issuer: https://identity.example
+    clientId: mmx-console
+    clientSecret: { name: mmx-oidc, key: client-secret }
+    groups:
+      admin: [mmx-admins]
+      operator: [mmx-operators]
+      viewer: [mmx-viewers]
+```
+
+Group names match exactly; membership in several groups grants the highest role. No matching group denies access. Sensitive console operations require a sign-in within five minutes. Keep `MMX_ADMIN_TOKEN` as the operator recovery credential; see [Authentication](/guides/authentication#operator-access).
+
+## Upgrades
+
+:::warning[Preserve quorum]
+**Restart voters one at a time, with the leader last.** Members use `OnDelete`; readiness alone does not establish that a member has caught up. Confirm catch-up before restarting another voter.
+:::
+
+Review replay compatibility before engine upgrades. Fence admission and verify replay against a disposable copy of existing history when the release changes framing or replay behavior. Preserve archive and output volumes.
+
+Market and webhook settings are stored in `mmx-config` and `mmx-control`. The chart preserves them across upgrades and uninstall. Avoid managing their seeded content from client-side Helm rendering or GitOps without an explicit ownership policy.
+
+## Failure domains
+
+Three host-separated voters tolerate one unavailable voter. Spread voters across zones when zone failures are in scope. Keep backups of archives and operator configuration; rehearse restore and safe reopening.
+
+## Alerts
+
+- **Disk:** free space and archive growth on every voter.
+- **Consumers:** applied position, checkpoint age, replay progress, and feed gaps.
+- **Webhooks:** backlog size and age of the oldest undelivered event.
+- **Telemetry:** bounded export queues and collector failures.
+
+Alert on lag as well as connectivity. Keep telemetry off the matching thread.
+
+:::warning[Recorder ownership]
+**Run one QuestDB recorder and no concurrent rebuild.** Stop the recorder before a destructive history rebuild. A forced pod deletion does not fence a partitioned writer.
+:::
+
+For uncertain submissions during failover, retain the reservation and use [REST reconciliation](/api/rest#reconciliation-and-retries). The configured leader timeout is not an end-to-end recovery guarantee.

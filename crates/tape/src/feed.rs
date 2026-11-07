@@ -71,7 +71,12 @@ struct Pump<P> {
 
 impl<P: Processor> Pump<P> {
     fn new(state: P, publishing: bool) -> Self {
-        Self { state, publishing, updates: Vec::new(), waiting: VecDeque::new() }
+        Self {
+            state,
+            publishing,
+            updates: Vec::new(),
+            waiting: VecDeque::new(),
+        }
     }
 
     fn on_frame(&mut self, buffer: &[u8]) {
@@ -116,7 +121,11 @@ impl<P: Processor> Pump<P> {
 
 async fn connect(url: &str) -> Client {
     loop {
-        match ConnectOptions::new().retry_on_initial_connect().connect(url).await {
+        match ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect(url)
+            .await
+        {
             Ok(client) => return client,
             Err(e) => {
                 error!("NATS: Failed to connect to {}: {}", url, e);
@@ -129,7 +138,10 @@ async fn connect(url: &str) -> Client {
 async fn publish(client: &Client, update: Update) {
     let subject = Subject::from(update.subject);
     loop {
-        match client.publish(subject.clone(), update.payload.clone().into()).await {
+        match client
+            .publish(subject.clone(), update.payload.clone().into())
+            .await
+        {
             Ok(()) => return,
             Err(e) if e.kind() == PublishErrorKind::Send => {
                 warn!("NATS: Retrying a publish to {}: {}", subject, e);
@@ -154,7 +166,9 @@ async fn publish_updates(url: String, mut queue: Receiver<Update>) {
 }
 
 fn save<P: Processor>(path: &Path, source: &Source, pump: &Pump<P>) {
-    let Some(position) = source.position() else { return };
+    let Some(position) = source.position() else {
+        return;
+    };
     let checkpoint = Checkpoint::new(position, pump.publishing, &pump.state);
     if let Err(e) = checkpoint::save(path, &checkpoint) {
         error!("Failed to save {}: {}", path.display(), e);
@@ -189,13 +203,19 @@ pub fn run<P: Processor>() {
         error!("{}", e);
         process::exit(1);
     });
-    let runtime = Builder::new_multi_thread().enable_all().build().unwrap_or_else(|e| {
-        error!("Failed to start the runtime: {}", e);
-        process::exit(1);
-    });
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            error!("Failed to start the runtime: {}", e);
+            process::exit(1);
+        });
 
     let (queue, receiver) = mpsc::channel(QUEUE_LENGTH);
-    runtime.spawn(publish_updates(transport::env_or("NATS_URL", "localhost"), receiver));
+    runtime.spawn(publish_updates(
+        transport::env_or("NATS_URL", "localhost"),
+        receiver,
+    ));
 
     let path = checkpoint::path_for(P::NAME);
     let checkpoint = config.as_ref().and_then(|_| checkpoint::load::<P>(&path));
@@ -223,13 +243,18 @@ pub fn run<P: Processor>() {
         if !pump.offer(&queue) {
             if last_warning.elapsed() >= WARN_EVERY {
                 last_warning = Instant::now();
-                warn!("NATS can't keep up, so reading has paused with {} updates waiting", pump.waiting.len());
+                warn!(
+                    "NATS can't keep up, so reading has paused with {} updates waiting",
+                    pump.waiting.len()
+                );
             }
             sleep(FULL_QUEUE_WAIT);
             continue;
         }
 
-        let read = source.poll(FRAGMENT_LIMIT, &mut |buffer, _position| pump.on_frame(buffer));
+        let read = source.poll(FRAGMENT_LIMIT, &mut |buffer, _position| {
+            pump.on_frame(buffer)
+        });
 
         if !pump.publishing && source.is_live() {
             info!("Reached the live stream, so publishing has started");
@@ -275,11 +300,17 @@ mod tests {
     }
 
     fn update(payload: &str) -> Update {
-        Update { subject: "test.ITEM".to_string(), payload: payload.to_string() }
+        Update {
+            subject: "test.ITEM".to_string(),
+            payload: payload.to_string(),
+        }
     }
 
     fn report(pump: &mut Pump<Echo>, order_id: u64) {
-        let report = ExecutionReportMessage { order_id, ..sample_report() };
+        let report = ExecutionReportMessage {
+            order_id,
+            ..sample_report()
+        };
         pump.state.on_report(&report, &mut pump.updates);
         pump.release();
     }

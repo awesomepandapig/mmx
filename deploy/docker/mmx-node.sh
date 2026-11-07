@@ -77,7 +77,7 @@ aeron.cluster.clock=io.aeron.cluster.NanosecondClusterClock
 aeron.cluster.leader.heartbeat.timeout=${LEADER_HEARTBEAT_TIMEOUT:-500ms}
 aeron.cluster.leader.heartbeat.interval=${LEADER_HEARTBEAT_INTERVAL:-100ms}
 aeron.cluster.session.timeout=${SESSION_TIMEOUT:-30s}
-aeron.cluster.startup.canvass.timeout=${STARTUP_CANVASS_TIMEOUT:-5s}
+aeron.cluster.startup.canvass.timeout=${STARTUP_CANVASS_TIMEOUT:-15s}
 aeron.cluster.election.timeout=${ELECTION_TIMEOUT:-500ms}
 aeron.cluster.service.count=1
 END

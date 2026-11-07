@@ -1,0 +1,115 @@
+# REST
+
+Gateways serve this API on port 8000. Every order route currently needs a trusted `x-player-id` header, as described in [Authentication](/guides/authentication).
+
+Sizes and prices are decimal strings with at most 8 decimal places.
+
+| Method | Path | Does |
+| --- | --- | --- |
+| `POST` | `/api/v1/orders` | Place an order |
+| `GET` | `/api/v1/orders` | List the player's orders |
+| `GET` | `/api/v1/orders/{id}` | Get one order |
+| `DELETE` | `/api/v1/orders/{id}` | Cancel an order |
+| `DELETE` | `/api/v1/orders` | Cancel the player's open orders |
+| `POST` | `/api/v1/admin/markets/reload` | Apply `markets.yaml` to this gateway |
+
+## Place an order
+
+`POST /api/v1/orders`
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `client_order_id` | Yes | A fresh UUIDv7 generated when submitting, in cluster mode. Persist it with the reservation |
+| `product_id` | Yes | The market's symbol |
+| `side` | Yes | `buy` or `sell` |
+| `type` | Yes | `limit` or `market` |
+| `size` | Yes | Quantity, within the market's limits |
+| `price` | Limit orders | A multiple of the market's tick size. Market orders must leave it out |
+
+A `201` returns the order:
+
+```json
+{
+  "id": "019a5430-11aa-7bc1-8c55-7e1f6f4f3c21",
+  "product_id": "IRON",
+  "side": "sell",
+  "type": "limit",
+  "created_at": "2026-11-05T14:02:11.482Z",
+  "size": "100",
+  "filled_size": "0",
+  "executed_value": "0",
+  "status": "open",
+  "settled": false,
+  "price": "9.5"
+}
+```
+
+## List orders
+
+`GET /api/v1/orders`
+
+Query parameters are `product_id`, `status` and `limit`. `limit` defaults to 100 and can go up to 1000. History comes from the recorder, so a very recent order may not be listed yet.
+
+## Cancel an order
+
+`DELETE /api/v1/orders/{id}`
+
+`200` with `"status": "canceled"` means the engine confirmed cancellation. `202` with `"status": "pending"` means the answer isn't known yet, and use reconciliation and the [fill webhook](/guides/webhooks) for the result.
+
+## Cancel all orders
+
+`DELETE /api/v1/orders`
+
+Pass `product_id` to limit it to one market. One request cancels up to 10,000 orders.
+
+| Field | Meaning |
+| --- | --- |
+| `canceled` | Orders that are now canceled |
+| `not_open` | Orders that finished before their cancel arrived |
+| `unresolved` | Orders with no answer yet. Retry them, or repeat this request |
+| `more` | The player has more open orders than one request cancels |
+
+## Errors
+
+Errors return `code` and `message`, and sometimes `details` and `id`.
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| 400 | `invalid_request`, `invalid_side`, `invalid_order_type` | The request is wrong. Nothing was sent |
+| 401 | `unauthenticated` | `x-player-id` is missing or isn't a UUID |
+| 404 | `order_not_found` | No such order |
+| 409 | `duplicate_order` | This ID was already claimed. It does not establish whether the original order executed |
+| 422 | `invalid_body` | The body couldn't be parsed |
+| 422 | `order_rejected` | The engine refused the order, and it won't execute |
+| 422 | `markets_not_reloaded` | The markets file wasn't applied |
+| 429 | `rate_limited` | Too many orders for this player. Honour `Retry-After` |
+| 503 | `outcome_unknown` | The order's outcome isn't known yet |
+| 503 | `recorder_behind` | Order history isn't available yet. Nothing was sent |
+| 500 | `internal` | Something went wrong in the gateway |
+
+## Reconciliation and retries
+
+The current API suppresses repeated order IDs; it does **not** implement replayable idempotent responses. A `409 duplicate_order` means an ID was claimed, even if the gateway failed before publishing. It does not prove acceptance or a fill.
+
+- On `503 outcome_unknown`, a lost response, or a network timeout, keep the reservation held and query `GET /api/v1/orders/{client_order_id}`. Do not create another order with a new ID to replace an ambiguous operation.
+- A missing order may return `status: "unknown"` and `settled: false`. Keep reconciling. A bare missing row in query history is not proof of non-execution.
+- The implementation can return `status: "never_landed"`, `settled: true` after its age/session/barrier checks. Use the explicit reconciliation result rather than inferring non-execution from query history.
+- `503 recorder_behind` explicitly says nothing was sent; retry that request. `429 rate_limited` includes `Retry-After`; wait before retrying, and respect the UUIDv7 admission window.
+- `claim_unavailable`, `claims_recovering`, `stale_client_order_id`, and `future_client_order_id` refuse this submission. Reconcile any earlier ambiguous attempt before choosing a new ID. `claims_recovering` also supplies `Retry-After`.
+- An engine rejection applies to the identified order; a later validation error on a repeat request does not erase an earlier accepted operation. Do not release a hold solely because a repeat received `400` or `422`.
+
+Cluster mode accepts UUIDv7 IDs for 60 seconds by default (`ORDER_ID_WINDOW_SECS`), with up to five seconds of future clock skew. Generate IDs immediately before submission and keep clocks synchronized. This window is an admission rule, not an order lifetime. Older orders remain queryable and cancelable.
+
+The JSON response above illustrates shape only; its historical ID and timestamp cannot be copied into a new order. [Getting started](/getting-started#4-place-a-sell-and-a-buy) generates a fresh ID.
+
+## Additional error codes
+
+| Status | Code | Meaning |
+| --- | --- | --- |
+| 400 | `invalid_client_order_id` | Cluster submission requires UUIDv7 |
+| 400 | `stale_client_order_id`, `future_client_order_id` | ID timestamp is outside the admission window |
+| 422 | `market_halted` | This submission was not sent; cancels remain available |
+| 503 | `claim_unavailable`, `claims_recovering` | The gateway cannot safely obtain a new claim |
+| 503 | `halt_state_unknown` | The gateway cannot verify admission is allowed |
+
+Gateway administration additionally requires a bearer token; see [Authentication](/guides/authentication#gateway-administration).

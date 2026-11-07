@@ -26,7 +26,15 @@ helm.sh/chart: {{ printf "%s-%s" .root.Chart.Name .root.Chart.Version }}
 
 {{/* Call with dict "root" $ "image" "api". */}}
 {{- define "mmx.image" -}}
+{{- $digest := index (.root.Values.image.digests | default dict) .image -}}
+{{- if $digest -}}
+{{- if not (regexMatch "^sha256:[a-fA-F0-9]{64}$" $digest) -}}
+{{- fail (printf "image.digests.%s must be sha256 followed by 64 hex characters" .image) -}}
+{{- end -}}
+{{- printf "%s/%s@%s" .root.Values.image.registry .image $digest -}}
+{{- else -}}
 {{- printf "%s/%s:%s" .root.Values.image.registry .image (.root.Values.image.tag | default .root.Chart.AppVersion) -}}
+{{- end -}}
 {{- end -}}
 
 {{/* Requests equal limits when guaranteed. Otherwise CPU can burst. Call with dict "resources" r "guaranteed" bool. */}}
@@ -255,4 +263,22 @@ periodSeconds: 5
 {{- if ge (int .Values.reportSource) $replicas -}}
 {{- fail "reportSource must be a cluster member" -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Optional fields shared by externally exposed Services. */}}
+{{- define "mmx.serviceNetworking" -}}
+{{- if has .type (list "LoadBalancer" "NodePort") }}
+{{- with .externalTrafficPolicy }}
+externalTrafficPolicy: {{ . }}
+{{- end }}
+{{- end }}
+{{- if eq .type "LoadBalancer" }}
+{{- with .loadBalancerIP }}
+loadBalancerIP: {{ . | quote }}
+{{- end }}
+{{- with .loadBalancerSourceRanges }}
+loadBalancerSourceRanges:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
 {{- end -}}
