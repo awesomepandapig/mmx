@@ -67,7 +67,7 @@ cluster:
 
   engine:
     image: matching-engine
-    # Resting orders across all symbols. See "Capacity" in STARTUP.md for the memory this needs.
+    # Resting orders across all symbols. Size this against measured engine memory; see https://docs.mmx.exchange/guides/production.
     maxOrders: 100000
     reportTermLength: 16m
     rustLog: info

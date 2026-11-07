@@ -5,3 +5,13 @@ type: application
 version: 0.1.0
 appVersion: "0.1.0"
 kubeVersion: ">=1.29.0-0"
+home: https://mmx.exchange
+sources:
+  - https://github.com/awesomepandapig/mmx
+keywords:
+  - trading
+  - matching-engine
+  - game-economy
+annotations:
+  org.opencontainers.image.source: https://github.com/awesomepandapig/mmx
+  org.opencontainers.image.documentation: https://docs.mmx.exchange/installation/helm

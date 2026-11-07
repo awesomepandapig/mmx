@@ -124,6 +124,15 @@ pub async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
     })
 }
 
+/// The cluster as this gateway sees it, for `mmx`, which can't read Aeron itself. Each gateway
+/// answers for itself, so one that's cut off from the cluster doesn't hide what the others see.
+pub async fn cluster(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(match &state.cluster {
+        Some(watch) => json!({ "mode": "cluster", "view": watch.view() }),
+        None => json!({ "mode": "standalone" }),
+    })
+}
+
 pub async fn metrics(State(state): State<Arc<AppState>>) -> Response {
     ([(CONTENT_TYPE, PROMETHEUS_TEXT)], state.metrics.render()).into_response()
 }
