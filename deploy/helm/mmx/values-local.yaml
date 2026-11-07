@@ -42,7 +42,9 @@ gateway:
     sizeLimit: 1Gi
   resources:
     cpu: 100m
-    memory: 256Mi
+    # The client pre-touches ingress and all three voters' report buffers in shared memory.
+    # 256Mi OOM-kills it during cluster connection; leave headroom for mapped buffers and HTTP state.
+    memory: 1Gi
 
 consumers:
   market-data:

@@ -74,6 +74,8 @@ helm template mmx "$chart" >"$out/default.yaml"
 helm template mmx "$chart" --show-only templates/gateway.yaml >"$out/gateway.yaml"
 helm template mmx "$chart" --set websocket.enabled=false --show-only templates/console.yaml >"$out/console-no-ws.yaml"
 helm template mmx "$chart" -f "$chart/values-local.yaml" >"$out/local.yaml"
+helm template mmx "$chart" -f "$chart/values-local.yaml" \
+    --show-only templates/gateway.yaml >"$out/local-gateway.yaml"
 helm template mmx "$chart" --set ui.enabled=true >"$out/marketing.yaml"
 helm template mmx "$chart" --set ui.enabled=false --set demo.enabled=false >"$out/bare.yaml"
 helm template mmx "$chart" --set console.oidc.enabled=true --set console.passwordLogin=false \
@@ -123,6 +125,7 @@ expect "gateway readiness uses its application check" "$out/gateway.yaml" "path:
 expect "console monitors the websocket" "$out/default.yaml" "MMX_WEBSOCKET_URL"
 refuse "disabled websocket is not monitored" "$out/console-no-ws.yaml" "MMX_WEBSOCKET_URL"
 expect "local market-data has its actual resource override" "$out/local.yaml" 'cpu: "750m"'
+expect "local gateway budgets pre-touched Aeron mappings" "$out/local-gateway.yaml" 'memory: "1Gi"'
 expect "helm test has a real read-only hook" "$out/default.yaml" "helm.sh/hook: test"
 refuse "helm test never submits an order" "$out/default.yaml" "POST /api/v1/orders"
 refuse "no provider is connected by default" "$out/default.yaml" "MMX_OIDC_ISSUER"

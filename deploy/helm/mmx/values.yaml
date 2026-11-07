@@ -81,9 +81,10 @@ cluster:
   podDisruptionBudget:
     enabled: true
 
-# Media driver beside every gateway and consumer. Term buffers in shared memory are charged to the
-# driver that touches them, so memory covers both the JVM and the term buffers.
-# Increase driver memory when increasing report term lengths or cluster size.
+# Media driver beside every gateway and consumer. Shared-memory pages are charged to the container
+# that first touches them, which can be the Rust client: it pre-touches mapped Aeron buffers.
+# Budget both driver and client memory, not just the JVM heap or sharedMemory.sizeLimit.
+# Revisit both budgets when increasing term lengths or the number of cluster members.
 driver:
   threadingMode: SHARED
   heapMax: 128m
