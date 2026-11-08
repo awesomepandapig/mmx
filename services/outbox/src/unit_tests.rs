@@ -270,6 +270,28 @@ fn journal_is_owned_by_one_process() {
 }
 
 #[test]
+fn dropping_owner_releases_lock_while_an_inherited_descriptor_survives() {
+    let dir = TestDir::new("inherited-lock");
+    let owner = Journal::open(&dir.0, |_| Ok(())).expect("open");
+    // A concurrent fork can temporarily retain this same open file description until exec.
+    let inherited = owner
+        .duplicate_file_for_test()
+        .expect("duplicate descriptor");
+    assert!(Journal::open(&dir.0, |_| Ok(())).is_err());
+
+    drop(owner);
+    let next = Journal::open(&dir.0, |_| Ok(())).expect("the old owner released its lock");
+    assert!(Journal::open(&dir.0, |_| Ok(())).is_err());
+    drop(inherited);
+    assert!(
+        Journal::open(&dir.0, |_| Ok(())).is_err(),
+        "closing the inherited descriptor must not unlock the new owner"
+    );
+    drop(next);
+    assert!(Journal::open(&dir.0, |_| Ok(())).is_ok());
+}
+
+#[test]
 fn reader_stops_at_the_limit_and_reports_damage_below_it() {
     let dir = TestDir::new("reader");
     write_records(&dir.0, 3);

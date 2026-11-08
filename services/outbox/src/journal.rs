@@ -101,7 +101,25 @@ pub struct Journal {
     exec_id: u64,
 }
 
+impl Drop for Journal {
+    fn drop(&mut self) {
+        // A concurrent fork may retain the open file description until exec. Closing our
+        // descriptor alone would leave its lock behind; release ownership explicitly first.
+        if let Err(error) = self.file.unlock() {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "journal: failed to release ownership lock; closing the file: {error}"
+            );
+        }
+    }
+}
+
 impl Journal {
+    #[cfg(test)]
+    pub(crate) fn duplicate_file_for_test(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
     /// Opens the journal, handing every surviving record to `visit`. Whatever follows the last
     /// valid record was never reported as durable, so it's cut off.
     pub fn open(
@@ -116,14 +134,16 @@ impl Journal {
             .read(true)
             .append(true)
             .open(&path)?;
-        if file.try_lock().is_err() {
-            return Err(io::Error::new(
-                ErrorKind::WouldBlock,
-                "another outbox owns this journal",
-            ));
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "another outbox owns this journal",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
-        sync_dir(dir)?;
-
         let mut journal = Self {
             file,
             pending: Vec::new(),
@@ -135,6 +155,7 @@ impl Journal {
             exec_id: 0,
         };
 
+        sync_dir(dir)?;
         let total = journal.file.metadata()?.len();
         let mut reader = BufReader::new(File::open(&path)?);
         while let Some((record, length)) = read_record(&mut reader)? {
