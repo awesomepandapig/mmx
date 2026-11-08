@@ -1,0 +1,16 @@
+# Feature status
+
+MMX provides replicated price-time matching, REST orders and reconciliation, signed settlement webhooks, public market streams, and an operator console with a native CLI.
+
+## Integration work remaining
+
+| Area | Current behavior | Remaining work |
+| --- | --- | --- |
+| Public order admission | Trusted game servers set account headers | Direct player authentication at the gateway |
+| Private WebSocket orders | JWT subscription handler exists | Publish private order events |
+| Public order book | `level2` emits future changed levels | Atomic snapshot/delta synchronization and gap recovery |
+| Order retries | Duplicate IDs are suppressed | Replayable idempotent responses |
+| Market retirement | Halt, cancel, disable, and remove controls exist | Guard all unsafe edits against resting orders |
+| Webhook backpressure | Ordered retries and `Retry-After` | Configured delivery-rate limits and automatic poison-batch pause |
+
+Follow the [REST](/api/rest), [WebSocket](/api/websocket), and [webhook](/guides/webhooks) contracts when integrating these features. The [repository](https://github.com/awesomepandapig/mmx) tracks implementation changes.

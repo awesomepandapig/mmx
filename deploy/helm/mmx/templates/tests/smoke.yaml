@@ -1,0 +1,46 @@
+{{- $fullname := include "mmx.fullname" . -}}
+{{- $labels := dict "root" . "component" "test" -}}
+# Deliberately read-only: first installs have no markets and no webhook destination.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ $fullname }}-smoke
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+    mmx.io/role: game-server
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  activeDeadlineSeconds: 300
+  automountServiceAccountToken: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  securityContext:
+    {{- include "mmx.podSecurityContext" . | nindent 4 }}
+  containers:
+    - name: smoke
+      image: {{ .Values.tests.image | quote }}
+      command: ["sh", "-ec"]
+      args:
+        - |
+          check() {
+            echo "Checking $1"
+            curl --fail --silent --show-error --retry 20 --retry-all-errors \
+              --retry-delay 1 --max-time 5 "$1"
+            echo
+          }
+          check http://{{ $fullname }}-console:{{ .Values.console.port }}/readyz
+          check http://{{ $fullname }}-gateway:{{ .Values.gateway.service.port }}/readyz
+          check 'http://{{ $fullname }}-questdb:9000/exec?query=select%201'
+          {{- if .Values.ui.enabled }}
+          check http://{{ $fullname }}-web:{{ .Values.ui.port }}/
+          {{- end }}
+      securityContext:
+        {{- include "mmx.containerSecurityContext" . | nindent 8 }}
+      resources:
+        requests: {cpu: 10m, memory: 16Mi}
+        limits: {memory: 64Mi}

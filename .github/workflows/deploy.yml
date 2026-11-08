@@ -1,0 +1,226 @@
+name: deploy
+
+# Versioned image tags and OCI charts belong to release.yml.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+env:
+  BAKE_FILE: deploy/docker/docker-bake.hcl
+
+jobs:
+  validate:
+    name: Check manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: deploy/scripts/validate.sh
+
+  frontend:
+    name: Frontends and browser checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            docs/package-lock.json
+            console/package-lock.json
+            tools/browser/package-lock.json
+      - name: Install dependencies
+        run: |
+          npm --prefix web ci
+          npm --prefix docs ci
+          npm --prefix console ci
+          npm --prefix tools/browser ci
+      - name: Check and build
+        env:
+          VITE_DOCS_URL: http://127.0.0.1:5174
+          DOCS_BASE_URL: http://127.0.0.1:5174
+        run: |
+          npm --prefix web run typecheck
+          npm --prefix web run lint
+          npm --prefix web run build
+          npm --prefix docs run typecheck
+          npm --prefix docs run build
+          npm --prefix console run lint
+          npm --prefix console test
+          npm --prefix console run build
+      - name: Install browser
+        run: tools/browser/node_modules/.bin/playwright install --with-deps chromium
+      - name: Check mobile layouts and documentation routes
+        env:
+          SCREENSHOT_DIR: ${{ github.workspace }}/.local/browser
+        run: |
+          PORT=5193 HOST=127.0.0.1 npm --prefix web start > /tmp/mmx-web.log 2>&1 &
+          DOCS_ROOT=docs/dist/public PORT=5174 HOST=127.0.0.1 node deploy/docker/serve-docs.mjs > /tmp/mmx-docs.log 2>&1 &
+          npm --prefix tools/browser test
+      - name: Build Vercel output
+        env:
+          VERCEL: '1'
+          VITE_DOCS_URL: http://127.0.0.1:5175
+        run: |
+          npm --prefix web run build
+          npm --prefix docs run build
+      - name: Check Vercel handler and static output
+        env:
+          WEB_URL: http://127.0.0.1:5195
+          DOCS_URL: http://127.0.0.1:5175
+          SCREENSHOT_DIR: ${{ github.workspace }}/.local/browser-vercel
+        run: |
+          PORT=5195 node tools/browser/vercel-preview.mjs > /tmp/mmx-vercel-web.log 2>&1 &
+          DOCS_ROOT=docs/.vercel/output/static PORT=5175 HOST=127.0.0.1 node deploy/docker/serve-docs.mjs > /tmp/mmx-vercel-docs.log 2>&1 &
+          npm --prefix tools/browser test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-screenshots
+          path: |
+            .local/browser
+            .local/browser-vercel
+
+  test:
+    name: Cargo test
+    runs-on: ubuntu-24.04
+    env:
+      PLATFORMS: linux/amd64
+      CACHE_SCOPE: amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: deps
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: test
+
+  # Each architecture builds natively, because Gradle and CMake are very slow under emulation.
+  images:
+    name: Images (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: [validate, test, frontend]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      PLATFORMS: linux/${{ matrix.arch }}
+      CACHE_SCOPE: ${{ matrix.arch }}
+      CARGO_INCREMENTAL: "0"
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/mmx
+      TAG: ${{ github.sha }}-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: deps
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          push: ${{ github.event_name != 'pull_request' }}
+
+  chart-install:
+    name: Install the chart
+    runs-on: ubuntu-24.04
+    needs: [validate, test, frontend]
+    env:
+      PLATFORMS: linux/amd64
+      CACHE_SCOPE: amd64
+      REGISTRY: mmx
+      TAG: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: azure/setup-helm@v4
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: deps
+      - uses: docker/bake-action@v6
+        with:
+          source: .
+          files: ${{ env.BAKE_FILE }}
+          targets: core
+          load: true
+      - uses: helm/kind-action@v1
+        with:
+          cluster_name: mmx
+          config: deploy/kind/ci.yaml
+      - name: Load images
+        run: |
+          for image in node matching-engine api mmx outbox websocket market-data trade-reporter; do
+            kind load docker-image "mmx/$image:dev" --name mmx
+          done
+      - name: Install
+        run: |
+          helm install mmx deploy/helm/mmx --namespace mmx --create-namespace \
+            -f deploy/helm/mmx/values-local.yaml \
+            --set image.registry=mmx --set image.tag=dev --set image.pullPolicy=Never --set ui.enabled=false \
+            --wait --timeout 10m
+      - name: Check installed services (read-only)
+        run: helm test mmx --namespace mmx --logs --timeout 3m
+      - name: Show what went wrong
+        if: failure()
+        run: |
+          kubectl get pods --namespace mmx -o wide
+          kubectl describe pods --namespace mmx
+          kubectl logs --namespace mmx --all-containers --prefix --tail=100 \
+            --selector app.kubernetes.io/name=mmx
+
+  publish:
+    name: Multi-arch manifests
+    runs-on: ubuntu-24.04
+    needs: [images, chart-install]
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    env:
+      REGISTRY: ghcr.io/${{ github.repository_owner }}/mmx
+      SHA: ${{ github.sha }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge architectures
+        run: |
+          for image in node matching-engine api mmx websocket market-data trade-reporter outbox observer tools web docs; do
+            docker buildx imagetools create --tag "$REGISTRY/$image:$SHA" \
+              "$REGISTRY/$image:$SHA-amd64" "$REGISTRY/$image:$SHA-arm64"
+          done

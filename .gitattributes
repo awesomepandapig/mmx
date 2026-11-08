@@ -1,0 +1,2 @@
+# Unified diffs preserve context-line whitespace.
+tools/patches/*.patch -whitespace

@@ -1,0 +1,28 @@
+# Architecture
+
+MMX runs the order book for your MMO economy. Your game owns balances, inventory, reservations, and settlement. MMX validates admission, matches orders in price-time order, and records execution.
+
+```text
+Game server → REST gateway → Matching engine / Aeron Cluster
+                                        │
+                                  Aeron Archive (tape)
+                                        │
+                  ┌─────────────────────┼─────────────────┐
+                Outbox             Trade reporter     Market data
+                  │                     │                 │
+           Signed webhooks           QuestDB             NATS
+                  │                     │                 │
+             Game ledger          REST / Console      WebSocket
+```
+
+Three voters replicate the matching workload. Gateways check market configuration, halts, rate limits, and operation IDs before submitting an order. During a leader change they hold requests until the cluster decides or the response becomes uncertain.
+
+:::note[Authority]
+**The tape is the execution record.** QuestDB, public market feeds, and webhook delivery are derived views. A missing history row does not prove an order never executed.
+:::
+
+Reserve assets before admission. The outbox journals events before delivering signed batches. Your receiver commits each event and its dedupe identity together, then acknowledges the batch. Keep reservations held while an order's outcome is unknown.
+
+`mmx serve` hosts the operator API and embedded console. The native CLI uses that API for markets, status, authentication, and webhook configuration. Kubernetes deployments persist shared settings in a ConfigMap and a control Secret; market edits propagate to gateways without restarting the engine.
+
+Keep REST admission behind your [authenticated game servers](/guides/authentication). See [REST reconciliation](/api/rest#reconciliation-and-retries), [webhook contracts](/guides/webhooks), and [feature status](/status) for integration details.

@@ -1,0 +1,23 @@
+# MMX
+
+MMX is self-hosted exchange infrastructure for MMO economies: price-time matching, a replicated execution record, market data, and signed settlement notifications. Deploy it beside your game servers; your game keeps custody of assets and owns its ledger.
+
+Use limit and market orders for interchangeable commodities such as materials, consumables, and currency pairs. MMX reports executions; your application reserves balances, applies transfers, and decides its own fees and economic rules.
+
+## Start here
+
+1. Install with [Helm](/installation/helm) on Kubernetes, use [Local Docker](/installation/local), or [build from source](/installation/source).
+2. Follow [Getting started](/getting-started) to inspect the cluster, sign in, create a market, and trade.
+3. Connect [REST orders](/api/rest) and [signed settlement webhooks](/guides/webhooks) to your game's ledger.
+
+## Operate and integrate
+
+- [Architecture](/guides/architecture): how matching, the tape, and consumers fit together.
+- [Authentication](/guides/authentication): application, player, and operator boundaries.
+- [Markets](/guides/markets): configuration, admission, and halts.
+- [Production operations](/guides/production): resources, observation, upgrades, and recovery.
+- [WebSocket](/api/websocket): market subscriptions and message shapes.
+
+## For agents
+
+Append `.md` to a page URL for Markdown. `/llms.txt` lists the pages; `/llms-full.txt` contains them together.

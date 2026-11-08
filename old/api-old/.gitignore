@@ -1,5 +1,0 @@
-.env
-.DS_Store
-dist
-drizzle
-node_modules

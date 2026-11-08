@@ -1,0 +1,92 @@
+# Fill webhook
+
+MMX delivers fills, cancels, and rejects to one application endpoint, `WEBHOOK_URL`. Your receiver updates its own ledger; MMX never transfers assets directly. New-order acceptance is available through REST, not as a webhook event.
+
+## Configure delivery
+
+Run a receiver on a host or service reachable from the outbox. Generate a signing secret, configure the remote endpoint, then restart delivery:
+
+```sh
+mmx webhook rotate-secret --raw
+# Configure the printed secret in your receiver.
+export WEBHOOK_SECRET='<generated signing secret>'
+mmx webhook set-url https://game.example/webhooks/mmx
+mmx webhook restart
+mmx webhook config
+mmx webhook status
+```
+
+Store the secret in your receiver's secret manager before restarting delivery. Existing queued events can arrive immediately. For a receiver that requires you to generate the secret first, use `openssl rand -hex 32` and configure the same value in the outbox's `WEBHOOK_SECRET` and receiver.
+
+## Test a receiver
+
+The CLI includes a diagnostic receiver. Run it on a reachable test host:
+
+```sh
+mmx webhook listen --bind 0.0.0.0 --port 8094 --secret "$WEBHOOK_SECRET"
+```
+
+Configure that host's reachable `/webhook` URL with `mmx webhook set-url`, then restart the outbox. The listener verifies signatures, deduplicates in memory, and prints events. Its dedupe state ends with the process; use your durable ledger for settlement.
+
+For the local Docker deployment, use `mmx local restart outbox` after configuration changes.
+
+## What MMX sends
+
+One sender posts events in order, up to 100 in a batch, and waits for your answer before sending the next batch.
+
+```http
+POST /webhooks/mmx
+Content-Type: application/json
+X-MMX-Timestamp: 1767225600
+X-MMX-Signature: v1=<lowercase hex>
+
+{"events":[{"fill_id":"9f2c...","type":"fill","terminal":true,"release_qty":"0", ...}]}
+```
+
+## Verify the signature
+
+The signature is `HMAC-SHA256(WEBHOOK_SECRET, "<timestamp>.<raw body>")`. Verify it over the raw bytes before you parse the body, and reject timestamps outside a bounded clock-skew window, for example five minutes. Use synchronized clocks. Each delivery attempt gets a new signing timestamp; its event IDs stay stable.
+
+## Apply each event once
+
+Delivery is at least once, so the same event can arrive again. In one database transaction per event:
+
+1. Insert `fill_id` into a table with a unique key. If it's already there, skip the event.
+2. On a `fill`, apply `last_qty` at `last_px`.
+3. Release `release_qty` from the hold. Act on `terminal` and `release_qty`, never on `type` alone.
+4. If `terminal` is true, close the hold for `client_order_id`. Ignore a later terminal event for a hold that's already closed.
+
+:::warning[Commit before acknowledgement]
+**Answer `2xx` only after the transaction commits.** Keep the dedupe identity and ledger update in the same transaction.
+:::
+
+`release_qty` is in product units. For a buy, your ledger must calculate reserved currency, executed cost, price improvement, and any fees using exact decimal arithmetic. Market buys also need an application-defined spending bound before admission. A zero `release_qty` on a terminal fill does not mean unused currency can remain locked forever.
+
+## Events
+
+| Field | Present on | Meaning |
+| --- | --- | --- |
+| `fill_id` | All | Dedupe key on every event type, 32 hex characters |
+| `type` | All | `fill`, `canceled`, `rejected` or `cancel_rejected` |
+| `tape_position`, `exec_id` | All | Where the event is in the record. Both increase |
+| `terminal` | All | This event closes the hold for `client_order_id` |
+| `release_qty` | All | Unfilled product quantity to release on cancel/reject; not a currency refund amount |
+| `client_order_id` | All | The operation UUID your application sent. On `cancel_rejected`, the cancel request's own ID |
+| `orig_client_order_id` | `cancel_rejected` | The order the cancel named |
+| `order_id` | Not `cancel_rejected` | Engine order ID |
+| `account`, `symbol`, `side`, `status` | Not `cancel_rejected` | The order |
+| `order_qty`, `filled_qty`, `leaves_qty` | Not `cancel_rejected` | Decimal strings |
+| `price` | Limit orders | Decimal string |
+| `match_id`, `last_qty`, `last_px`, `avg_px` | `fill` | Both sides of a trade share `match_id`, not `fill_id` |
+| `reason` | `rejected`, `cancel_rejected` | `duplicate_order`, `unknown_order`, `stale_order` or `other` |
+| `transact_time` | Not `cancel_rejected` | Nanoseconds since the epoch, as a string |
+
+## Delivery failures and backpressure
+
+Anything other than `2xx`, including redirects and timeouts (10 seconds by default), is retried. Local exponential backoff starts at 100 ms and caps at 30 seconds. A valid `Retry-After` response header, as delay seconds or an HTTP date, sets a minimum wait even above that cap; this includes `429` and `503`. Invalid hints fall back to local backoff. Later events wait behind the failed batch. Delivery can also stop on a safety halt or fatal sender failure.
+
+An event the receiver persistently refuses stalls delivery. Events remain in the journal, but this is not protection against journal disk loss; a verified tape rebuild and stable dedupe identities are still needed. Watch `consecutive_failures` on the outbox's `/position` endpoint, on port 8092, and alert on it.
+
+Keep `fill_id` values for as long as you keep the MMX record, because a rebuilt outbox sends history again and only those IDs make that harmless.
+
+The default batch size is 100 events. `WEBHOOK_MAX_EVENTS` accepts 1 through 10,000; invalid values refuse startup. A larger batch is not a substitute for receiver backpressure. See [feature status](/status) for delivery controls in development.

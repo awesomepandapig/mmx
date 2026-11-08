@@ -1,0 +1,36 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "docs": {
+      "root": "docs",
+      "installCommand": "npm ci",
+      "buildCommand": "npm run build"
+    },
+    "web": {
+      "root": "web",
+      "framework": "remix",
+      "installCommand": "npm ci",
+      "buildCommand": "npm run build"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "has": [
+        {
+          "type": "host",
+          "value": "docs.mmx.exchange"
+        }
+      ],
+      "destination": {
+        "service": "docs"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "web"
+      }
+    }
+  ]
+}

@@ -1,0 +1,60 @@
+# WebSocket
+
+The WebSocket service streams market data; orders are submitted over REST, not WebSocket. Market subscriptions are available to anything you allow to reach it. It listens on port 8080 at `mmx-websocket` inside the cluster.
+
+## Subscribe
+
+```json
+{ "type": "subscribe", "channel": "ticker", "symbols": ["IRON", "COAL"] }
+```
+
+Send `"type": "unsubscribe"` to stop. `symbols` is required on every channel except `heartbeats` and `user`. After each change, the service sends your current subscriptions.
+
+| Channel | Sends |
+| --- | --- |
+| `heartbeats` | Regular messages that show the connection is alive |
+| `ticker` | Price updates. Starts with a snapshot |
+| `ticker_batch` | Batched price updates. Starts with a snapshot |
+| `level2` | Future changed price levels; no initial public book snapshot |
+| `candles` | Candle updates |
+| `user` | Reserved for private order subscriptions; see [feature status](/status) |
+
+## The user channel
+
+Use REST reconciliation and signed settlement webhooks for order outcomes. Private-feed availability is tracked in [feature status](/status).
+
+Pass a player token in `jwt`. [Authentication](/guides/authentication) explains how to sign one.
+
+```json
+{ "type": "subscribe", "channel": "user", "jwt": "<player token>" }
+```
+
+To leave, send `unsubscribe` with `player_id`.
+
+## Messages
+
+Updates use this envelope. `sequence_num` counts frames emitted by this socket and resets on reconnect. It cannot detect messages lost upstream between the producer and NATS; it is not a tape position or book-continuity proof.
+
+```json
+{
+  "channel": "ticker",
+  "client_id": "",
+  "timestamp": "2026-11-05T14:02:11.482913000Z",
+  "sequence_num": 42,
+  "events": [{ "type": "update", "tickers": [] }]
+}
+```
+
+Errors look like this, with messages such as `unauthorized` or `too many subscriptions`:
+
+```json
+{ "type": "error", "message": "unauthorized" }
+```
+
+## Freshness and recovery limits
+
+Public `level2` subscriptions currently receive future absolute quantities for changed levels. Existing untouched levels are absent, so subscribing to a quiet market cannot reconstruct its book. Producer checkpoints and NATS reconnects do not provide an atomic snapshot/delta handoff. Do not use this channel as a complete or authoritative book until synchronization support is implemented.
+
+Ticker snapshots contain cached values, which may be old; connection heartbeats prove socket activity, not exchange or feed health. Feed changes can produce notices such as `{"type":"status","market_data":"disconnected"}` or `"gap"`. Treat them as invalidation signals and mark displayed data stale. Automatic resubscription does not repair missing book levels.
+
+The server closes slow clients and idle connections (60 seconds by default). Reconnect with backoff and jitter.

@@ -1,0 +1,145 @@
+# Production operations
+
+Install with [Helm](/installation/helm). The default profile runs three voters on separate hosts with shared CPUs, 9 GiB of voter memory, and 15 GiB of tape storage per voter. Add capacity for gateways, consumers, dependencies, and retained history.
+
+## Capacity
+
+`cluster.engine.maxOrders` defaults to 100,000 resting orders across all markets. Size memory and tape retention for your workload. The archive retains history by default; monitor free disk and plan backups before increasing admission volume.
+
+The optional `values-performance.yaml` profile enables dedicated busy-spinning threads and CPU pinning. Use it on prepared Linux nodes when measurements justify exclusive CPUs:
+- Configure kubelet static CPU manager policy (`--cpu-manager-policy=static`).
+- On SMT hosts, match allocations to full physical core boundaries.
+- Raise host network receive/send socket buffer limits (`sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216`) to match Aeron driver buffers.
+
+## Service and network configuration
+
+Use `console.service`, `gateway.service`, and `websocket.service` to select `ClusterIP`, `LoadBalancer`, or `NodePort`. Keep REST orders behind trusted game servers; expose public WebSocket traffic through TLS.
+
+A TLS proxy for the console must forward `X-Forwarded-Proto: https` and the public host. Allow long-lived responses on `/admin/v1/events` and `/admin/v1/markets/*/stream`.
+
+## Operator sign-in
+
+Configure your OIDC provider with the console callback URL `/admin/v1/oidc/callback`. Store its client secret in a Kubernetes Secret:
+
+```yaml
+console:
+  passwordLogin: false
+  oidc:
+    enabled: true
+    issuer: https://identity.example
+    clientId: mmx-console
+    clientSecret: { name: mmx-oidc, key: client-secret }
+    groups:
+      admin: [mmx-admins]
+      operator: [mmx-operators]
+      viewer: [mmx-viewers]
+```
+
+Group names match exactly; membership in several groups grants the highest role. No matching group denies access. Sensitive console operations require a sign-in within five minutes. Keep `MMX_ADMIN_TOKEN` as the operator recovery credential; see [Authentication](/guides/authentication#operator-access).
+
+## Upgrades
+
+:::warning[Preserve quorum]
+**Restart voters one at a time, with the leader last.** Members use `OnDelete`; readiness alone does not establish that a member has caught up. Confirm catch-up before restarting another voter.
+:::
+
+1. Check current leader and cluster consensus positions:
+   ```sh
+   mmx cluster status
+   ```
+2. Restart a follower voter first:
+   ```sh
+   kubectl delete pod mmx-node-1 -n mmx
+   ```
+3. Verify the restarted voter has caught up to the leader's position before touching the next node:
+   ```sh
+   # Poll until lag_bytes is 0 and member status reports connected
+   mmx cluster status
+   ```
+4. Repeat for the other follower.
+5. Finally, restart the leader node. The remaining two voters will elect a new leader without service interruption.
+
+## Symbol field migration
+
+REST order requests, queries, responses, and market events use `symbol`. WebSocket
+subscriptions use `symbols`. Update game servers and clients together when upgrading from an older
+market-identifier contract; the gateway does not accept the previous field names.
+
+Older ticker checkpoints cannot be read after the field rename. With `TAPE_ARCHIVES` configured,
+market-data ignores the incompatible checkpoint and rebuilds ticker state from the retained tape.
+Allow time for replay before relying on ticker values, and retain the archive throughout the upgrade.
+Live-only consumers cannot reconstruct history; configure archive replay before this upgrade if
+historical ticker state is required. The SBE wire schema and authoritative tape are unchanged.
+
+## QuestDB single-writer & storage fencing
+
+:::warning[Recorder ownership]
+**Run one QuestDB recorder and no concurrent rebuild.** Stop the recorder before a destructive history rebuild. A forced pod deletion does not fence a partitioned writer.
+:::
+
+To prevent storage corruption during node failure or network partitions:
+- **Use `ReadWriteOncePod` access mode**: In Kubernetes 1.27+, configure `questdb.persistence.accessModes: ["ReadWriteOncePod"]`. This instructs the CSI driver to actively fence the volume so that only a single pod in the entire cluster can mount the disk.
+- **Never force-delete stuck pods**: Avoid `kubectl delete pod --force --grace-period=0` on QuestDB or Trade Reporter pods. A partitioned node may still write to the volume before the kubelet terminates the process.
+- **Destructive rebuild procedure**: Before launching `questdb-rebuild.yaml`, scale down the trade-reporter to 0 replicas:
+  ```sh
+  kubectl scale deployment mmx-trade-reporter -n mmx --replicas=0
+  kubectl wait --for=delete pod -l app.kubernetes.io/component=trade-reporter -n mmx --timeout=60s
+  ```
+
+## Observability & Prometheus metrics
+
+Gateways expose native Prometheus text metrics on port **8000** at `/metrics`. Telemetry across the matching engine and tape streams is collected out-of-band by `mmx-observer` and exported via OTLP.
+
+### Gateway metrics (`/metrics`)
+
+| Metric Name | Type | Description |
+| --- | --- | --- |
+| `mmx_gateway_order_latency_seconds` | Histogram | End-to-end admission latency (arriving at gateway to engine confirmation) |
+| `mmx_gateway_orders_accepted_total` | Counter | Total orders accepted and published to cluster |
+| `mmx_gateway_orders_rejected_total` | Counter | Orders refused before admission, labeled by `reason` (`invalid`, `rate_limited`, `engine_rejected`, `duplicate_order`, `outcome_unknown`, `unavailable`, `internal`) |
+| `mmx_gateway_halted_rejects_total` | Counter | Orders rejected because market trading is halted |
+| `mmx_gateway_orders_in_flight` | Gauge | Active requests currently waiting on cluster consensus |
+
+### Observer metrics (OTLP / OpenTelemetry)
+
+| Metric Name | Type | Description |
+| --- | --- | --- |
+| `mmx.orders` | Counter | Total order lifecycle events seen on the authoritative tape |
+| `mmx.trades` | Counter | Total matched trade executions / fills |
+| `mmx.canceled` | Counter | Successfully canceled orders |
+| `mmx.rejected` | Counter | Orders rejected by matching engine |
+| `mmx.violations` | Counter | Engine invariant check violations (**Must always be 0**) |
+| `mmx.filled_qty` | Counter | Aggregate commodity volume filled |
+| `mmx.observer_lag` | Histogram | Lag from matching engine timestamp to observer ingestion (seconds) |
+| `mmx.book_levels` | Gauge | Active order book depth per symbol |
+
+### Recommended PromQL alert rules
+
+```yaml
+groups:
+  - name: mmx-exchange.rules
+    rules:
+      - alert: MMXQuorumLost
+        expr: mmx_gateway_orders_rejected_total{reason="unavailable"} > 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "MMX Gateway reports cluster unavailable; consensus quorum may be lost"
+
+      - alert: MMXHighAdmissionLatency
+        expr: histogram_quantile(0.99, rate(mmx_gateway_order_latency_seconds_bucket[5m])) > 0.05
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MMX 99th percentile order latency exceeds 50ms"
+
+      - alert: MMXInvariantViolation
+        expr: rate(mmx_violations_total[1m]) > 0
+        for: 0s
+        labels:
+          severity: page
+        annotations:
+          summary: "CRITICAL: Engine invariant violation detected on execution tape"
+```

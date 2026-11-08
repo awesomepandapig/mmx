@@ -1,0 +1,7 @@
+# Rebuilds QuestDB from the tape. Nothing refers to this directory, and nothing should: the job drops
+# every table each time it starts. See deploy/README.md for when and how to run it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - job.yaml

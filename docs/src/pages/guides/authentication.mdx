@@ -1,0 +1,33 @@
+# Authentication
+
+## Game requests
+
+Your trusted game gateway authenticates players, authorizes trades, and forwards the account UUID in `x-player-id`.
+
+1. Strip client-supplied `x-player-id` headers.
+2. Authenticate the player and authorize the account, market, and asset reservation.
+3. Set `x-player-id` to the authorized account UUID before forwarding to MMX.
+
+Permit those gateways to reach REST on **8000**. In Kubernetes, configure `networkPolicy.gameServers` for their pod labels or source CIDRs; the default label is `mmx.io/role=game-server`. Use a CNI that enforces NetworkPolicy.
+
+## Operators
+
+The console supports password sessions and OIDC:
+
+| Role | Permissions |
+| --- | --- |
+| Viewer | Read exchange state |
+| Operator | Also edit markets, halt, resume, and cancel orders |
+| Admin | Also manage webhooks, settings, and sign-in |
+
+The native CLI and gateway admin routes accept the `MMX_ADMIN_TOKEN` bearer credential. Store it in your operator secret manager.
+
+:::warning[Recovery credential]
+**Password reset requires the admin token.** `mmx auth reset-password` issues a temporary password and revokes console sessions. If password login is disabled, enable it with `mmx auth password-login on` first.
+:::
+
+For OIDC, register `/admin/v1/oidc/callback` on the console's public origin and map provider groups to roles. See [operator configuration](/guides/production#operator-sign-in).
+
+## Private subscriptions
+
+WebSocket user tokens use HMAC-SHA256 with `WS_PLAYER_TOKEN_SECRET` (32 bytes minimum), an account UUID in `sub`, and Unix expiry in `exp`. Subscription availability is listed in [feature status](/status).

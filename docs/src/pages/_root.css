@@ -1,0 +1,20 @@
+@import url("https://fonts.googleapis.com/css2?family=Funnel+Display:wght@500;600&family=JetBrains+Mono:wght@400;500&family=Rethink+Sans:wght@400;500;600&display=swap");
+
+:root {
+  --vocs-font-family: "Rethink Sans", system-ui, sans-serif;
+  --vocs-font-family-mono: "JetBrains Mono", ui-monospace, monospace;
+  --vocs-background-color-primary: light-dark(#ffffff, #07080e);
+  --vocs-background-color-surface: light-dark(#f5f6fb, #12131d);
+  --vocs-background-color-surfaceTint: light-dark(#eef0f8, #171926);
+  --vocs-border-color-primary: light-dark(#dee1ee, #262840);
+  --vocs-text-color-primary: light-dark(#0b0c15, #ffffff);
+  --vocs-text-color-secondary: light-dark(#545870, #a2a5bb);
+  --vocs-text-color-heading: light-dark(#0b0c15, #ffffff);
+}
+
+h1,
+h2,
+h3 {
+  font-family: "Funnel Display", system-ui, sans-serif;
+  letter-spacing: -0.01em;
+}

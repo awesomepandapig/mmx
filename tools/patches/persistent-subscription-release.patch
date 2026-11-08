@@ -1,0 +1,61 @@
+Aeron persistent-subscription image release candidate
+
+Applies to the Aeron C sources bundled with rusteron-archive 0.2.16.
+Recovered from the integration worktree; tracked upstream work: https://github.com/awesomepandapig/mmx/issues/22
+
+Persistent subscriptions acquire replay/live images but omit matching releases
+when cleaning up subscriptions and abandoning a live image after position checks.
+This candidate adds those releases. It has NOT been enabled in Cargo.toml and
+requires sustained failover/reconnect testing and upstream ownership review before
+production use. The existing consumer client replacement workaround remains needed.
+
+To check/apply against a disposable unpacked rusteron-archive 0.2.16 source copy:
+  patch --dry-run -p1 -d /path/to/rusteron-archive-0.2.16 < persistent-subscription-release.patch
+  patch -p1 -d /path/to/rusteron-archive-0.2.16 < persistent-subscription-release.patch
+
+Do not patch the shared Cargo registry cache. A reviewed deployment must use a
+pinned upstream fix or an explicit reproducible dependency override, then exercise
+image lifetime, subscription restart and native cleanup under sanitizers.
+
+--- a/aeron/aeron-archive/src/main/c/client/aeron_archive_persistent_subscription.c
++++ b/aeron/aeron-archive/src/main/c/client/aeron_archive_persistent_subscription.c
+@@ -744,6 +744,11 @@
+         aeron_async_add_subscription_cancel(
+             persistent_subscription->context->aeron,
+             persistent_subscription->add_replay_subscription);
++    }
++
++    if (NULL != persistent_subscription->replay_image)
++    {
++        aeron_image_release(persistent_subscription->replay_image);
+     }
+ 
+     if (NULL != persistent_subscription->replay_subscription)
+@@ -764,6 +769,11 @@
+         aeron_async_add_subscription_cancel(
+             persistent_subscription->context->aeron,
+             persistent_subscription->add_live_subscription);
++    }
++
++    if (NULL != persistent_subscription->live_image)
++    {
++        aeron_image_release(persistent_subscription->live_image);
+     }
+ 
+     if (NULL != persistent_subscription->live_subscription)
+@@ -2201,6 +2211,7 @@
+             {
+                 if (live_position < persistent_subscription->position)
+                 {
++                    aeron_image_release(image);
+                     aeron_archive_persistent_subscription_clean_up_live_subscription(persistent_subscription);
+                     aeron_archive_persistent_subscription_transition(persistent_subscription, FAILED);
+ 
+@@ -2219,6 +2230,7 @@
+                 }
+                 else if (live_position > persistent_subscription->position)
+                 {
++                    aeron_image_release(image);
+                     aeron_archive_persistent_subscription_clean_up_live_subscription(persistent_subscription);
+                     aeron_archive_persistent_subscription_refresh_recording_descriptor(persistent_subscription);
+ 

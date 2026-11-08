@@ -1,0 +1,155 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* The landing page's light surfaces: the sample game beside the event log. */
+  :root {
+    --canvas: 247 247 250;
+    --surface: 255 255 255;
+    --raised: 241 241 245;
+    --deep: 247 247 250;
+    --line: 226 226 233;
+    --hairline: 236 236 241;
+    --ink: 8 9 15;
+    --muted: 88 90 104;
+    --faint: 108 110 124;
+    --accent: 36 54 240;
+    --brand: 36 54 240;
+    --solid: 8 9 15;
+    --on-solid: 255 255 255;
+    --solid-hover: 36 54 240;
+    --warn: 146 96 0;
+    --warn-wash: 255 246 224;
+    /* Red, kept apart from the ask side's magenta, so a problem can't read as a sell. */
+    --bad: 196 28 40;
+    --bad-wash: 254 234 234;
+    --danger: 214 22 38;
+    --danger-hover: 184 14 28;
+    --s-orders: 47 68 232;
+    --s-trades: 165 106 0;
+    --s-cancels: 88 122 153;
+    --s-rejects: 217 32 48;
+    --bid: 66 87 245;
+    --ask: 229 53 159;
+    --bid-text: 36 54 240;
+    --ask-text: 196 23 128;
+    color-scheme: light;
+  }
+
+  /* `mmx.*` in the landing page's Tailwind config, and its log colours. */
+  .dark {
+    --canvas: 7 8 14;
+    --surface: 18 19 29;
+    --raised: 23 25 38;
+    --deep: 11 12 21;
+    --line: 38 40 64;
+    --hairline: 32 34 58;
+    --ink: 255 255 255;
+    --muted: 162 165 187;
+    --faint: 143 146 173;
+    --accent: 163 172 255;
+    --brand: 36 54 240;
+    --solid: 255 255 255;
+    --on-solid: 8 9 15;
+    --solid-hover: 163 172 255;
+    --warn: 255 197 61;
+    --warn-wash: 44 34 10;
+    --bad: 255 112 118;
+    --bad-wash: 58 16 22;
+    --danger: 232 26 44;
+    --danger-hover: 255 56 72;
+    --s-orders: 133 144 247;
+    --s-trades: 201 154 46;
+    --s-cancels: 109 139 176;
+    --s-rejects: 238 85 96;
+    --bid: 66 87 245;
+    --ask: 229 53 159;
+    --bid-text: 163 172 255;
+    --ask-text: 255 122 200;
+    color-scheme: dark;
+  }
+
+  html {
+    @apply bg-canvas text-ink antialiased;
+  }
+
+  body {
+    @apply min-h-dvh font-body text-[15px] leading-[22px];
+  }
+
+  :focus-visible {
+    @apply outline outline-2 outline-offset-1 outline-accent;
+  }
+
+  /* Numbers line up in tables, so columns of prices can be scanned. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Scroll areas stay quiet until they're needed. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line)) transparent;
+  }
+}
+
+/* The browser's own arrow is the one thing here that doesn't match. */
+.select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='m1 1 4 4 4-4' fill='none' stroke='%238f92ad' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-position: right 0.65rem center;
+  background-repeat: no-repeat;
+  background-size: 10px 6px;
+}
+
+/* The label over a number, in every strip and fact list. */
+.label {
+  @apply text-[12px] font-medium leading-4 text-faint;
+}
+
+/* A column's divider, which is also what you drag. */
+.resize-grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: -4px;
+  width: 9px;
+  z-index: 2;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.resize-grip::after {
+  content: "";
+  position: absolute;
+  top: 7px;
+  bottom: 7px;
+  left: 4px;
+  width: 1px;
+  background: rgb(var(--line));
+}
+
+.resize-grip:hover::after,
+.resize-grip[data-active="true"]::after {
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 3px;
+  background: rgb(var(--accent));
+}
+
+@keyframes skeleton {
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.skeleton {
+  animation: skeleton 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+}

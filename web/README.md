@@ -1,42 +1,23 @@
-# Welcome to Remix!
+# MMX web
 
-- 📖 [Remix docs](https://remix.run/docs)
+Remix landing page and browser-only exchange simulation. The `/demo` route uses local sample state;
+it does not connect to Rust services or provide evidence of backend performance or durability.
 
-## Development
-
-Run the dev server:
-
-```shellscript
+```sh
+npm ci
 npm run dev
-```
-
-## Deployment
-
-First, build your app for production:
-
-```sh
+npm run typecheck
+npm run lint
 npm run build
-```
-
-Then run the app in production mode:
-
-```sh
 npm start
 ```
 
-Now you'll need to pick a host to deploy it to.
+Set `VITE_DOCS_URL` before building to link a custom documentation deployment. See the repository
+[README](../README.md) and [local setup](../docs/src/pages/installation/source.mdx) for backend and browser validation.
 
-### DIY
+## Vercel
 
-If you're familiar with deploying Node applications, the built-in Remix app server is production-ready.
-
-Make sure to deploy the output of `npm run build`
-
-- `build/server`
-- `build/client`
-
-## Styling
-
-This template comes with [Tailwind CSS](https://tailwindcss.com/) already configured for a simple default starting experience. You can use whatever css framework you prefer. See the [Vite docs on css](https://vitejs.dev/guide/features.html#css) for more information.
-
-## MODIFY app/lib/config.ts
+Import the GitHub repository with root directory `web/` and Node 24. The Vercel preset is enabled
+when `VERCEL` is set; local and container builds retain the standard Remix server layout.
+The adapter's pinned Remix peers are overridden to the same patched 2.17.5 release used by the app.
+Check both the adapter build and its Node request handler when updating either package.

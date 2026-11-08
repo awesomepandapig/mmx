@@ -1,0 +1,90 @@
+# A laptop or CI cluster with three workers. Nothing here is exclusive or pinned, and memory is far
+# below production. See "Local cluster" in deploy/README.md.
+
+cluster:
+  guaranteed: false
+  pinThreads: false
+  updateStrategy: OnDelete
+  # Shared CPUs stall for far longer than the production timeouts.
+  leaderHeartbeatTimeout: 5s
+  electionTimeout: 2s
+  threadingMode: SHARED
+  idleStrategy: ""
+  sparseTermBuffers: true
+  socketBuffer: 128k
+  sharedMemory:
+    sizeLimit: 1Gi
+  persistence:
+    size: 2Gi
+  node:
+    heapMin: 128m
+    heapMax: 512m
+    resources:
+      cpu: 500m
+      memory: 2Gi
+  engine:
+    maxOrders: 100000
+    reportTermLength: 16m
+    resources:
+      cpu: 500m
+      memory: 1Gi
+
+driver:
+  heapMax: 128m
+  socketBuffer: 128k
+  resources:
+    cpu: 100m
+    memory: 768Mi
+
+gateway:
+  replicas: 1
+  sharedMemory:
+    sizeLimit: 1Gi
+  resources:
+    cpu: 100m
+    # The client pre-touches ingress and all three voters' report buffers in shared memory.
+    # 256Mi OOM-kills it during cluster connection; leave headroom for mapped buffers and HTTP state.
+    memory: 1Gi
+
+consumers:
+  market-data:
+    persistence:
+      size: 1Gi
+    resources:
+      cpu: 750m
+      memory: 512Mi
+  trade-reporter:
+    resources:
+      cpu: 250m
+      memory: 256Mi
+  outbox:
+    persistence:
+      size: 1Gi
+    resources:
+      cpu: 250m
+      memory: 256Mi
+
+console:
+  replicas: 1
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+websocket:
+  replicas: 1
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+ui:
+  replicas: 1
+  resources:
+    cpu: 100m
+    memory: 128Mi
+
+questdb:
+  persistence:
+    size: 2Gi
+  resources:
+    cpu: 500m
+    memory: 1Gi

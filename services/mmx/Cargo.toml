@@ -1,0 +1,32 @@
+[package]
+name = "mmx"
+version = "0.1.0"
+edition = "2024"
+
+# `mmx` only speaks HTTP, so it must build with plain cargo. Don't add `transport`, `cluster` or
+# `rusteron`, which need Aeron and CMake. reqwest's default TLS backend needs CMake too, so TLS uses
+# rustls on ring, which only needs a C compiler. It's for OIDC providers and the Kubernetes API:
+# services inside the exchange are still plain HTTP.
+[dependencies]
+argon2 = { version = "0.5.3", features = ["std"] }
+async-nats = "0.42.0"
+axum = "0.8.4"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3.31"
+getrandom = "0.3"
+hmac = "0.12.1"
+jsonwebtoken = "9.3"
+password-hash = { version = "0.5", features = ["getrandom"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+serde_yaml = "0.9"
+sha2 = "0.10.9"
+subtle = "2.6"
+tokio = { version = "1.45.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1.17.0", features = ["serde", "v4", "v7"] }

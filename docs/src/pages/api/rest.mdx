@@ -1,0 +1,329 @@
+# REST API
+
+The gateway serves REST on port **8000**. Every order route requires `x-player-id` as a UUID **string**. The current gateway trusts that header from your game server; restrict access as described in [Authentication](/guides/authentication).
+
+Requests and responses use JSON. Send `Content-Type: application/json` with a request body. Prices and quantities are decimal **strings**, with at most eight decimal places: `"1"`, `"10.5"`, or `"0.00000001"`. JSON numbers such as `1` and `1.5` are rejected; exponent notation, negative amounts, and excess precision are rejected too. Order responses omit optional fields without values rather than sending `null`.
+
+| Method | Path | Success response |
+| --- | --- | --- |
+| `POST` | `/api/v1/orders` | `201`, an [Order](#order-response) object |
+| `GET` | `/api/v1/orders` | `200`, an array of Order objects |
+| `GET` | `/api/v1/orders/{id}` | `200`, an Order or reconciliation object |
+| `DELETE` | `/api/v1/orders/{id}` | `200` or `202`, a cancellation object |
+| `DELETE` | `/api/v1/orders` | `200`, a cancellation summary |
+
+## Place an order
+
+`POST /api/v1/orders`
+
+| Field | JSON type | Required | Meaning |
+| --- | --- | --- | --- |
+| `client_order_id` | string (UUIDv7) | Cluster mode | Generate immediately before submitting; persist it with the reservation |
+| `symbol` | string | Yes | Enabled market identifier, e.g. `DEMO` or `IRON`; 1–6 alphanumeric characters, normalized to uppercase |
+| `side` | string | Yes | `buy` or `sell` |
+| `type` | string | Yes | `limit` or `market` |
+| `size` | string (decimal) | Yes | Positive quantity within the market's configured bounds |
+| `price` | string (decimal) | Limit orders | Positive price aligned to tick size; omit for market orders |
+
+Unknown fields are rejected. In standalone development mode, an omitted `client_order_id` generates a UUID; cluster deployments require a fresh UUIDv7. The ID below illustrates the shape; generate a new one for a real request.
+
+```json
+{
+  "client_order_id": "01a1b71f-1232-7b53-a5bb-3aec80e7879c",
+  "symbol": "IRON",
+  "side": "buy",
+  "type": "limit",
+  "size": "100",
+  "price": "9.50"
+}
+```
+
+`201 Created` returns an Order object. In cluster mode it confirms engine acceptance, not that the order remains open: fills can arrive before the response is received. Standalone mode returns after publication without engine confirmation. Read history and process [fill webhooks](/guides/webhooks) for subsequent state.
+
+## Order response
+
+`POST /api/v1/orders` and recorded `GET` responses use this object:
+
+```json
+{
+  "id": "01a1b71f-1232-7b53-a5bb-3aec80e7879c",
+  "symbol": "IRON",
+  "side": "buy",
+  "type": "limit",
+  "created_at": "2026-11-07T17:47:09.250734000Z",
+  "size": "100",
+  "filled_size": "0",
+  "executed_value": "0",
+  "status": "open",
+  "settled": false,
+  "price": "9.5"
+}
+```
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `id` | string (UUID) | Submitted `client_order_id`, or the ID generated in standalone mode |
+| `symbol` | string | Normalized market identifier |
+| `side` | string | `buy` or `sell` |
+| `type` | string | `limit` or `market` |
+| `created_at` | string (RFC 3339 timestamp) | Gateway acceptance time for a POST response; recorded creation time for history |
+| `updated_at` | string (RFC 3339 timestamp), optional | Last recorded update; omitted from the initial POST response |
+| `size` | string (decimal) | Original order quantity |
+| `filled_size` | string (decimal) | Cumulative filled quantity |
+| `executed_value` | string (decimal) | Recorded executed notional |
+| `status` | string | `open`, `filled`, `canceled`, or `rejected`; a partially filled resting order is still `open` |
+| `settled` | boolean | `false` for an open order; `true` for recorded terminal states. This does not mean your game ledger has processed its webhook |
+| `price` | string (decimal), optional | Limit price; omitted for market orders |
+| `cancel_after` | string, optional | Reserved field; the current gateway does not emit it |
+
+Decimal responses are normalized and omit trailing zeros, so a submitted `"9.50"` can return `"9.5"`.
+
+## List orders
+
+`GET /api/v1/orders?symbol=IRON&status=open&limit=100`
+
+| Query parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `symbol` | string, optional | All symbols | Filter by market |
+| `status` | string | `all` | `all` or `open` only; `open` includes partially filled resting orders |
+| `limit` | integer | `100` | From `1` to `1000` |
+
+`200 OK` returns an **array**, without a pagination wrapper:
+
+```json
+[
+  {
+    "id": "01a1b71f-1232-7b53-a5bb-3aec80e7879c",
+    "symbol": "IRON",
+    "side": "buy",
+    "type": "limit",
+    "created_at": "2026-11-07T17:47:09.250734000Z",
+    "updated_at": "2026-11-07T17:47:54.484215000Z",
+    "size": "100",
+    "filled_size": "3",
+    "executed_value": "28.5",
+    "status": "open",
+    "settled": false,
+    "price": "9.5"
+  }
+]
+```
+
+No matching orders returns `[]`. Each element has the [Order response](#order-response) types. History is asynchronous: very recent orders may not appear immediately. An unavailable recorder returns `503 recorder_behind`.
+
+## Get an order
+
+`GET /api/v1/orders/{id}`
+
+`id` is a UUID string in the URL. `200 OK` returns the [Order object](#order-response) when recorded. In cluster mode, an unrecorded ID instead returns this reconciliation object:
+
+```json
+{
+  "id": "01a1b71f-1232-7b53-a5bb-3aec80e7879c",
+  "status": "unknown",
+  "settled": false,
+  "message": "This order may still land. Keep any funds on hold and ask again."
+}
+```
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `id` | string (UUID) | Requested ID |
+| `status` | string | `unknown` or `never_landed` |
+| `settled` | boolean | `false` for `unknown`; `true` for `never_landed` |
+| `message` | string | Human-readable explanation |
+
+`never_landed` is returned only after the gateway proves the order cannot execute. It permits releasing the associated reservation. The reconciliation object has no symbol, size, or price. In standalone mode, an absent order returns `404 order_not_found` instead.
+
+## Cancel an order
+
+`DELETE /api/v1/orders/{id}`
+
+`id` is the original client order UUID. No request body is needed.
+
+```json
+{
+  "id": "01a1b71f-1232-7b53-a5bb-3aec80e7879c",
+  "status": "canceled"
+}
+```
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `id` | string (UUID) | Original order ID |
+| `status` | string | `canceled` or `pending` |
+
+- `200 OK`, `canceled`: the engine confirmed cancellation.
+- `202 Accepted`, `pending`: published without engine confirmation in standalone mode.
+- `404 order_not_found`: the order is no longer open or does not belong to this player.
+- `503 outcome_unknown`: cancellation may have landed; retain the reservation and reconcile.
+
+A cancel rejection does not itself release the original order's reservation. Apply authoritative terminal reports through the [fill webhook](/guides/webhooks).
+
+## Cancel all orders
+
+`DELETE /api/v1/orders?symbol=IRON`
+
+| Query parameter | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `symbol` | string, optional | All symbols | Restrict cancellation to one market |
+
+`200 OK` returns:
+
+```json
+{
+  "canceled": ["01a1b71f-1232-7b53-a5bb-3aec80e7879c"],
+  "not_open": [],
+  "unresolved": [],
+  "more": false
+}
+```
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `canceled` | array of strings (UUIDs) | Orders with confirmed cancellations |
+| `not_open` | array of strings (UUIDs) | Orders that became terminal before their cancel arrived |
+| `unresolved` | array of strings (UUIDs) | Cancels without a confirmed outcome; reconcile or repeat cancellation |
+| `more` | boolean | The batch reached its 10,000-order bound; repeat to check for remaining open orders |
+
+This reads recorded open orders before sending cancellations. New orders can arrive after that read; it does not prevent future submissions. Recorder failure returns `503 recorder_behind`.
+
+## Errors and Python requests
+
+Errors are JSON objects:
+
+```json
+{
+  "code": "invalid_body",
+  "message": "size: must be a decimal string, for example \"1\"; wrap numbers in quotes to preserve precision at line 1 column 94"
+}
+```
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `code` | string | Machine-readable error code |
+| `message` | string | Explanation, including the offending field when available |
+| `details` | string, optional | Additional context |
+| `id` | string (UUID), optional | Order or operation ID associated with the error |
+
+| HTTP status | Typical codes | Action |
+| --- | --- | --- |
+| `400` | `invalid_request`, `invalid_side`, `invalid_order_type`, `invalid_client_order_id`, `stale_client_order_id`, `future_client_order_id` | Correct the request; it was not submitted |
+| `401` | `unauthenticated` | Supply a valid player UUID header, or the admin bearer token for admin routes |
+| `404` | `order_not_found`, `market_not_found` | Check ownership, ID, market, and state |
+| `409` | `duplicate_order` | Reconcile the original request; do not treat the conflict as an execution result |
+| `422` | `invalid_body`, `order_rejected`, `market_halted`, `markets_not_reloaded` | Read the code and explanation; malformed JSON amounts must be quoted strings |
+| `429` | `rate_limited` | Respect `Retry-After` |
+| `503` | `outcome_unknown`, `recorder_behind`, `claim_unavailable`, `claims_recovering`, `halt_state_unknown`, `admin_disabled`, `halt_not_shared`, `market_still_halted` | Follow the returned code; `outcome_unknown` requires reconciliation |
+| `500` | `internal` | Retain reservations if a submission outcome is uncertain and investigate |
+
+`Retry-After` is an integer number of seconds for `rate_limited` and `claims_recovering`.
+
+Python HTTP libraries require header values to be strings or bytes, not `uuid.UUID` objects:
+
+```python
+import uuid
+import requests
+
+player_id = uuid.UUID("6f1c1a52-0a62-4f4e-9d3b-2f5a4c1e7b10")
+response = requests.get(
+    "http://127.0.0.1:8000/api/v1/orders",
+    headers={"x-player-id": str(player_id)},
+    params={"symbol": "DEMO", "limit": 10},
+    timeout=10,
+)
+print(response.status_code, response.json())
+response.raise_for_status()
+```
+
+An error such as `Header part ... must be of type str or bytes` happens **inside the Python client before any request reaches MMX**. Convert UUID objects with `str(...)`, including `client_order_id` in a JSON body. Send sizes and prices as decimal strings, and print the JSON error response before calling `raise_for_status()` so the gateway's explanation remains visible.
+
+## Reconciliation and retries
+
+MMX suppresses duplicate client order IDs within the admission window (`ORDER_ID_WINDOW_SECS`, default 60 seconds). A `409 duplicate_order` indicates an ID was claimed; it does not prove execution or non-execution.
+
+- On `503 outcome_unknown` or a connection drop, keep the reservation and poll `GET /api/v1/orders/{client_order_id}`.
+- `unknown` with `settled: false` means continue polling.
+- `never_landed` means the gateway proved non-execution; the reservation can be released.
+- A missing list row or a network timeout is not proof of non-execution.
+- Do not generate a fresh ID to retry an unresolved economic operation.
+
+## Operator routes
+
+These gateway routes require `Authorization: Bearer <MMX_ADMIN_TOKEN>`. They use the same [error object](#errors-and-python-requests). The browser console talks to `mmx serve`, not directly to these gateway routes.
+
+| Method | Path | Success response |
+| --- | --- | --- |
+| `GET` | `/api/v1/admin/markets` | `200`, `{"markets": [Market, ...]}` |
+| `POST` | `/api/v1/admin/markets/reload` | `200`, `{"markets": ["DEMO", "IRON"]}` |
+| `POST` | `/api/v1/admin/markets/{symbol}/halt` | `200`, a Market object |
+| `POST` | `/api/v1/admin/markets/{symbol}/resume` | `200`, a Market object |
+| `POST` | `/api/v1/admin/markets/{symbol}/cancel-all` | `200`, market cancellation counts |
+| `GET` | `/api/v1/admin/cluster` | `200`, this gateway's cluster view |
+
+A Market object has these fields; all are required:
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `symbol` | string | Market identifier |
+| `tick_size` | string (decimal) | Price increment |
+| `min_size` | string (decimal) | Minimum order size |
+| `max_size` | string (decimal) | Maximum order size |
+| `enabled` | boolean | Whether the market permits new orders |
+| `halted` | boolean | Whether the gateway has halted it |
+
+For example:
+
+```json
+{
+  "symbol": "DEMO",
+  "tick_size": "0.01",
+  "min_size": "1",
+  "max_size": "1000",
+  "enabled": true,
+  "halted": false
+}
+```
+
+Reload returns `markets` as an array of **strings**, not Market objects. Reload every gateway separately. Halts are shared through Valkey and are independent of the market file.
+
+Market-wide cancellation returns:
+
+```json
+{"requested": 10, "canceled": 8, "failed": 1, "truncated": false}
+```
+
+`requested`, `canceled`, and `failed` are non-negative integer counts. `requested - canceled - failed` is the number that became terminal first. `truncated` is a boolean indicating the 10,000-order bound was reached. Halt first if new submissions must stop during cancellation.
+
+The cluster response is `{"mode":"standalone"}` outside cluster mode. In cluster mode it is `{"mode":"cluster","view":{...}}`, with these `view` fields:
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `term` | integer | Latest leadership term |
+| `leader` | integer or null | Leader member index |
+| `leader_connected` | boolean | Whether the leader's reports reach this gateway |
+| `leader_changes` | non-negative integer | Changes observed since gateway startup |
+| `last_leader_change_ms` | integer or null | Unix milliseconds of the last observed change |
+| `last_exec_id` | non-negative integer | Latest observed execution ID |
+| `members` | array of objects | Each has `member` (integer index), `connected` (boolean), and `position` (integer byte position or null) |
+
+Large execution IDs, counters, and positions should be handled without JavaScript integer rounding.
+
+## Health and metrics
+
+These routes do not require authentication:
+
+| Route | Response |
+| --- | --- |
+| `GET /healthz` | `200`, `{"status":"ok"}`; `status` is a string |
+| `GET /readyz` | `200` when the engine link is up, otherwise `503`; JSON shown below |
+| `GET /metrics` | `200`, Prometheus text (`text/plain; version=0.0.4`), not JSON |
+
+```json
+{
+  "ready": true,
+  "checks": {"engine": true, "halts_known": true, "valkey": true, "order_claims": true}
+}
+```
+
+`ready` is a boolean and `checks` maps strings to booleans. `engine` and `halts_known` are always present; `valkey` and `order_claims` depend on gateway configuration. Readiness describes the engine link; inspect the checks to see whether new admissions are paused even while cancellation remains available.

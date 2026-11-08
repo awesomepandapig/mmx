@@ -1,0 +1,168 @@
+{{- $name := printf "%s-gateway" (include "mmx.fullname" .) -}}
+{{- $labels := dict "root" . "component" "gateway" -}}
+{{- $gateway := .Values.gateway -}}
+# The console owns this after install, so `helm upgrade` writes back what's there. Without that, it
+# would put `marketsYaml` over every edit. `keep` stops an uninstall from deleting what operators
+# made. `lookup` is empty under `helm template` and a client-side dry run, which show the seed.
+{{- $configName := include "mmx.configName" . }}
+{{- $config := lookup "v1" "ConfigMap" .Release.Namespace $configName }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $configName }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+data:
+{{- if $config }}
+  {{- toYaml $config.data | nindent 2 }}
+{{- else }}
+  markets.yaml: |
+    {{- .Values.marketsYaml | nindent 4 }}
+  {{- with .Values.webhookUrl }}
+  WEBHOOK_URL: {{ . | quote }}
+  {{- end }}
+{{- end }}
+---
+# One address per pod, because a reload has to reach every gateway, and the Service below reaches
+# one of them per call. A pod that isn't ready still has to be seen, so that it shows up as such.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-pods
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $gateway.service.port }}
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+  {{- with $gateway.service.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $gateway.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $gateway.service.type }}
+  {{- include "mmx.serviceNetworking" $gateway.service | nindent 2 }}
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $gateway.service.port }}
+      targetPort: http
+      {{- if and (has $gateway.service.type (list "NodePort" "LoadBalancer")) $gateway.service.nodePort }}
+      nodePort: {{ $gateway.service.nodePort }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  replicas: {{ $gateway.replicas }}
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+        mmx.io/aeron-client: "true"
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "mmx.podSecurityContext" . | nindent 8 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "mmx.selectorLabels" $labels | nindent 14 }}
+      containers:
+        {{- include "mmx.driverContainer" (dict "root" .) | nindent 8 }}
+        - name: gateway
+          image: {{ include "mmx.image" (dict "root" . "image" $gateway.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            {{- include "mmx.secretEnvFrom" . | nindent 12 }}
+          env:
+            {{- include "mmx.aeronClientEnv" . | nindent 12 }}
+            {{- include "mmx.adminTokenEnv" . | nindent 12 }}
+            - name: CLUSTER_INGRESS_ENDPOINTS
+              value: {{ include "mmx.ingressEndpoints" . | quote }}
+            - name: CLUSTER_REPORT_CHANNELS
+              value: {{ include "mmx.reportChannels" . | quote }}
+            - name: CLUSTER_RESPONSE_CHANNEL
+              value: "aeron:udp?endpoint=$(POD_IP):{{ $gateway.responsePort }}"
+            - name: CLUSTER_SESSION_TIMEOUT
+              value: {{ .Values.cluster.sessionTimeout | quote }}
+            - name: MARKETS_FILE
+              value: /etc/mmx/markets.yaml
+            - name: MMX_DEMO
+              value: {{ .Values.demo.enabled | quote }}
+            - name: RUST_LOG
+              value: {{ $gateway.rustLog | quote }}
+            {{- range $key, $value := $gateway.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          securityContext:
+            {{- include "mmx.containerSecurityContext" . | nindent 12 }}
+          # The port only opens once the gateway has a cluster session.
+          readinessProbe:
+            {{- include "mmx.readinessProbe" (dict "port" "http" "path" $gateway.readinessPath) | nindent 12 }}
+          resources:
+            {{- include "mmx.resources" (dict "resources" $gateway.resources "guaranteed" false) | nindent 12 }}
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: markets
+              mountPath: /etc/mmx
+              readOnly: true
+      volumes:
+        {{- include "mmx.aeronVolumes" (dict "sizeLimit" $gateway.sharedMemory.sizeLimit) | nindent 8 }}
+        # Mounted as a directory so edits reach the pod. Only this key: the rest isn't a gateway's.
+        - name: markets
+          configMap:
+            name: {{ $configName }}
+            items:
+              - key: markets.yaml
+                path: markets.yaml
+{{- if gt (int $gateway.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+{{- end }}

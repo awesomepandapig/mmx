@@ -1,0 +1,30 @@
+MMX installed in namespace {{ .Release.Namespace }}.
+
+Check workloads: kubectl get pods,services -n {{ .Release.Namespace }}
+Check health: helm test {{ .Release.Name }} -n {{ .Release.Namespace }} --logs --timeout 5m
+
+Service addresses (HTTP inside the cluster; terminate TLS at your ingress/proxy):
+  Console:   {{ include "mmx.fullname" . }}-console:{{ .Values.console.port }} ({{ .Values.console.service.type }})
+  REST:      {{ include "mmx.fullname" . }}-gateway:{{ .Values.gateway.service.port }} ({{ .Values.gateway.service.type }})
+{{- if .Values.websocket.enabled }}
+  WebSocket: {{ include "mmx.fullname" . }}-websocket:{{ .Values.websocket.port }} ({{ .Values.websocket.service.type }})
+{{- end }}
+
+Choose ClusterIP for ingress or in-cluster access, LoadBalancer for a configured cloud/MetalLB
+controller, or NodePort for node-address access. Set service.nodePort for a fixed node port.
+Keep REST private to trusted application servers. Match networkPolicy.gameServers to the actual
+caller pods or source CIDRs; changing Service type alone does not permit network access.
+
+Read the initial console password from the initializing replica:
+  kubectl logs -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }},app.kubernetes.io/component=console -c mmx --prefix --tail=200 | grep 'Console: first-run admin password:'
+If console.adminPasswordSecret is configured, use that Secret instead. Choose a permanent password
+on first login, then create markets and configure a reachable webhook receiver.
+
+GitOps/Argo: the console mutates {{ include "mmx.configName" . }} (ConfigMap) and
+{{ include "mmx.controlSecretName" . }} (Secret). Helm template cannot preserve live data through
+lookup and generates a new seed token. Before enabling automatic sync, exclude /data on these
+objects from reconciliation AND configure RespectIgnoreDifferences=true. Keep and back up their
+live data; a rendered seed must never overwrite operator configuration or credentials.
+
+Voters use OnDelete. Restart one at a time after establishing catch-up; never delete a quorum.
+The default uses shared CPUs. values-performance.yaml requires prepared dedicated CPU nodes.

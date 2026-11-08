@@ -1,0 +1,231 @@
+{{- $fullname := include "mmx.fullname" . -}}
+{{- if .Values.websocket.enabled }}
+{{- $name := printf "%s-websocket" $fullname -}}
+{{- $labels := dict "root" . "component" "websocket" -}}
+{{- $websocket := .Values.websocket }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+  {{- with $websocket.service.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $websocket.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $websocket.service.type }}
+  {{- include "mmx.serviceNetworking" $websocket.service | nindent 2 }}
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  ports:
+    - name: ws
+      port: {{ $websocket.port }}
+      targetPort: ws
+      {{- if and (has $websocket.service.type (list "NodePort" "LoadBalancer")) $websocket.service.nodePort }}
+      nodePort: {{ $websocket.service.nodePort }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  replicas: {{ $websocket.replicas }}
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "mmx.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: websocket
+          image: {{ include "mmx.image" (dict "root" . "image" $websocket.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: ws
+              containerPort: {{ $websocket.port }}
+          envFrom:
+            {{- include "mmx.secretEnvFrom" . | nindent 12 }}
+          env:
+            - name: WS_ADDR
+              value: "0.0.0.0:{{ $websocket.port }}"
+            - name: NATS_URL
+              value: "nats://{{ $fullname }}-nats:4222"
+            - name: RUST_LOG
+              value: {{ $websocket.rustLog | quote }}
+            {{- range $key, $value := $websocket.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          securityContext:
+            {{- include "mmx.containerSecurityContext" . | nindent 12 }}
+          readinessProbe:
+            {{- include "mmx.readinessProbe" (dict "port" "ws" "path" $websocket.readinessPath) | nindent 12 }}
+          resources:
+            {{- include "mmx.resources" (dict "resources" $websocket.resources "guaranteed" false) | nindent 12 }}
+{{- end }}
+{{- if .Values.ui.enabled }}
+{{- $name := printf "%s-web" $fullname -}}
+{{- $labels := dict "root" . "component" "web" -}}
+{{- $ui := .Values.ui }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+  {{- with $ui.service.labels }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $ui.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $ui.service.type }}
+  {{- include "mmx.serviceNetworking" $ui.service | nindent 2 }}
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $ui.port }}
+      targetPort: http
+      {{- if and (has $ui.service.type (list "NodePort" "LoadBalancer")) $ui.service.nodePort }}
+      nodePort: {{ $ui.service.nodePort }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  replicas: {{ $ui.replicas }}
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "mmx.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: web
+          image: {{ include "mmx.image" (dict "root" . "image" $ui.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ $ui.port }}
+          env:
+            - name: PORT
+              value: {{ $ui.port | quote }}
+            - name: GATEWAY_URL
+              value: "http://{{ $fullname }}-gateway:{{ .Values.gateway.service.port }}"
+            - name: MMX_DEMO
+              value: {{ .Values.demo.enabled | quote }}
+            {{- range $key, $value := $ui.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- if .Values.demo.enabled }}
+          envFrom:
+            - secretRef:
+                name: {{ $fullname }}-demo
+            {{- end }}
+          securityContext:
+            {{- include "mmx.containerSecurityContext" . | nindent 12 }}
+          readinessProbe:
+            {{- include "mmx.readinessProbe" (dict "port" "http" "path" "/") | nindent 12 }}
+          resources:
+            {{- include "mmx.resources" (dict "resources" $ui.resources "guaranteed" false) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+{{- end }}
+{{- if .Values.demo.enabled }}
+{{- $labels := dict "root" . "component" "demo" }}
+{{- $demoName := printf "%s-demo" $fullname }}
+{{- $demo := lookup "v1" "Secret" .Release.Namespace $demoName }}
+---
+# Generated once and kept across upgrades. Read it with kubectl: there's no default.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $demoName }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+data:
+{{- if $demo }}
+  {{- toYaml $demo.data | nindent 2 }}
+{{- else }}
+  DEMO_USERNAME: {{ "demo" | b64enc | quote }}
+  DEMO_PASSWORD: {{ randAlphaNum 32 | b64enc | quote }}
+{{- end }}
+{{- if .Values.demo.bots.enabled }}
+{{- $bots := .Values.demo.bots }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-demo-bots
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  replicas: {{ $bots.replicas }}
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+    spec:
+      securityContext:
+        {{- include "mmx.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: bots
+          image: {{ include "mmx.image" (dict "root" . "image" $bots.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - secretRef:
+                name: {{ $fullname }}-demo
+          env:
+            - name: GATEWAY_URL
+              value: "http://{{ $fullname }}-gateway:{{ .Values.gateway.service.port }}"
+            {{- range $key, $value := $bots.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          securityContext:
+            {{- include "mmx.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- include "mmx.resources" (dict "resources" $bots.resources "guaranteed" false) | nindent 12 }}
+{{- end }}
+{{- end }}

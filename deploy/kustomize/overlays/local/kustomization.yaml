@@ -1,0 +1,83 @@
+# A laptop or CI cluster with three workers, matching deploy/helm/mmx/values-local.yaml. Nothing here
+# is exclusive or pinned, and memory is far below production.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: mmx
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+components:
+  - ../../components/ui
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: mmx-node
+    behavior: merge
+    literals:
+      - PIN_THREADS=false
+      - LEADER_HEARTBEAT_TIMEOUT=5s
+      - ELECTION_TIMEOUT=2s
+      - THREADING=SHARED
+      - IDLE=
+      - SPARSE_TERM_BUFFERS=true
+      - SOCKET_BUFFER=2m
+      - JAVA_HEAP_MIN=128m
+      - JAVA_HEAP_MAX=512m
+      - REPORT_TERM_LENGTH=16m
+      - MAX_ORDERS=100000
+
+images:
+  - name: ghcr.io/awesomepandapig/mmx/node
+    newName: mmx/node
+    newTag: dev
+  - name: ghcr.io/awesomepandapig/mmx/matching-engine
+    newName: mmx/matching-engine
+    newTag: dev
+  - name: ghcr.io/awesomepandapig/mmx/api
+    newName: mmx/api
+    newTag: dev
+  - name: ghcr.io/awesomepandapig/mmx/market-data
+    newName: mmx/market-data
+    newTag: dev
+  - name: ghcr.io/awesomepandapig/mmx/trade-reporter
+    newName: mmx/trade-reporter
+    newTag: dev
+  - name: ghcr.io/awesomepandapig/mmx/websocket
+    newName: mmx/websocket
+    newTag: dev
+  - name: ghcr.io/awesomepandapig/mmx/web
+    newName: mmx/web
+    newTag: dev
+
+replicas:
+  - name: mmx-gateway
+    count: 1
+  - name: mmx-websocket
+    count: 1
+  - name: mmx-web
+    count: 1
+
+patches:
+  - path: node-resources.yaml
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/emptyDir/sizeLimit
+        value: 1Gi
+    target:
+      kind: Deployment
+      labelSelector: mmx.io/aeron-client=true
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/emptyDir/sizeLimit
+        value: 1Gi
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 1Gi
+    target:
+      kind: StatefulSet
+      labelSelector: mmx.io/aeron-client=true

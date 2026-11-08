@@ -1,0 +1,313 @@
+name: mmx
+
+x-node-env: &node-env
+  CLUSTER_NAME: mmx-node
+  CLUSTER_SIZE: "3"
+  CLUSTER_ID: "0"
+  AERON_DIR: /dev/shm/aeron
+  DATA_DIR: /data
+  THREADING: SHARED
+  SOCKET_BUFFER: 128k
+  LOG_TERM_LENGTH: 16m
+  REPORT_TERM_LENGTH: 16m
+  SPARSE_TERM_BUFFERS: "true"
+  SYNC: "1"
+  JAVA_HEAP_MIN: 128m
+  JAVA_HEAP_MAX: 512m
+  LEADER_HEARTBEAT_TIMEOUT: 5s
+  ELECTION_TIMEOUT: 2s
+  STARTUP_CANVASS_TIMEOUT: 15s
+  MAX_ORDERS: "100000"
+  PUB_STREAM_ID: "1002"
+
+x-node: &node
+  image: ${MMX_REGISTRY:-ghcr.io/awesomepandapig/mmx}/node:${MMX_VERSION:-0.1.0}
+  build:
+    context: ..
+    dockerfile: deploy/docker/Dockerfile
+    target: node
+  user: "${MMX_UID:-10001}:${MMX_GID:-10001}"
+  restart: unless-stopped
+  depends_on:
+    init:
+      condition: service_completed_successfully
+
+x-engine: &engine
+  image: ${MMX_REGISTRY:-ghcr.io/awesomepandapig/mmx}/matching-engine:${MMX_VERSION:-0.1.0}
+  build:
+    context: ..
+    dockerfile: deploy/docker/Dockerfile
+    target: matching-engine
+  user: "${MMX_UID:-10001}:${MMX_GID:-10001}"
+  restart: unless-stopped
+
+x-driver-env: &driver-env
+  AERON_DIR: /dev/shm/aeron
+  THREADING: SHARED
+  SOCKET_BUFFER: 128k
+  JAVA_HEAP_MIN: 64m
+  JAVA_HEAP_MAX: 128m
+
+x-driver: &driver
+  <<: *node
+  command: [driver]
+  environment: *driver-env
+
+x-client-env: &client-env
+  AERON_DIR: /dev/shm/aeron
+  TAPE_ARCHIVES: mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012
+  TAPE_REPORTS: mmx-node-0.mmx-node:40450,mmx-node-1.mmx-node:40451,mmx-node-2.mmx-node:40452
+  NATS_URL: nats:4222
+  RUST_LOG: info
+
+x-client: &client
+  user: "${MMX_UID:-10001}:${MMX_GID:-10001}"
+  restart: unless-stopped
+
+services:
+  init:
+    <<: *node
+    user: "0:0"
+    restart: "no"
+    depends_on: []
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - 'for dir in /vol/*; do mkdir -p "$$dir"; chown "${MMX_UID:-10001}:${MMX_GID:-10001}" "$$dir"; done'
+    volumes:
+      - node0-data:/vol/node0
+      - node1-data:/vol/node1
+      - node2-data:/vol/node2
+      - outbox-data:/vol/outbox
+      - checkpoints:/vol/checkpoints
+      - node0-shm:/vol/node0-shm
+      - node1-shm:/vol/node1-shm
+      - node2-shm:/vol/node2-shm
+      - gateway-shm:/vol/gateway-shm
+      - reporter-shm:/vol/reporter-shm
+      - market-data-shm:/vol/market-data-shm
+      - outbox-shm:/vol/outbox-shm
+
+  node0:
+    <<: *node
+    hostname: mmx-node-0
+    environment:
+      <<: *node-env
+      NODE_ID: "0"
+    networks:
+      default:
+        aliases: [mmx-node-0.mmx-node]
+    volumes: [node0-shm:/dev/shm, node0-data:/data]
+  node1:
+    <<: *node
+    hostname: mmx-node-1
+    environment:
+      <<: *node-env
+      NODE_ID: "1"
+    networks:
+      default:
+        aliases: [mmx-node-1.mmx-node]
+    volumes: [node1-shm:/dev/shm, node1-data:/data]
+  node2:
+    <<: *node
+    hostname: mmx-node-2
+    environment:
+      <<: *node-env
+      NODE_ID: "2"
+    networks:
+      default:
+        aliases: [mmx-node-2.mmx-node]
+    volumes: [node2-shm:/dev/shm, node2-data:/data]
+
+  engine0:
+    <<: *engine
+    network_mode: service:node0
+    depends_on: [node0]
+    environment:
+      <<: *node-env
+      NODE_ID: "0"
+    volumes: [node0-shm:/dev/shm]
+  engine1:
+    <<: *engine
+    network_mode: service:node1
+    depends_on: [node1]
+    environment:
+      <<: *node-env
+      NODE_ID: "1"
+    volumes: [node1-shm:/dev/shm]
+  engine2:
+    <<: *engine
+    network_mode: service:node2
+    depends_on: [node2]
+    environment:
+      <<: *node-env
+      NODE_ID: "2"
+    volumes: [node2-shm:/dev/shm]
+
+  gateway-driver:
+    <<: *driver
+    volumes: [gateway-shm:/dev/shm]
+    ports: ["${MMX_BIND_HOST:-127.0.0.1}:${MMX_GATEWAY_PORT:-8000}:8000"]
+  gateway:
+    <<: *client
+    image: ${MMX_REGISTRY:-ghcr.io/awesomepandapig/mmx}/api:${MMX_VERSION:-0.1.0}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      target: service
+      args: {SERVICE: api}
+    network_mode: service:gateway-driver
+    depends_on: [gateway-driver, engine0, engine1, engine2, valkey, questdb]
+    environment:
+      <<: *client-env
+      BIND_ADDR: 0.0.0.0:8000
+      MMX_ADMIN_TOKEN: ${MMX_ADMIN_TOKEN:?Run mmx local up to initialize credentials}
+      MARKETS_FILE: /state/markets.yaml
+      QUESTDB_URL: http://questdb:9000
+      VALKEY_URL: redis://valkey:6379
+      CLUSTER_SESSION_TIMEOUT: 30s
+      CLUSTER_INGRESS_ENDPOINTS: mmx-node-0.mmx-node:20000,mmx-node-1.mmx-node:20001,mmx-node-2.mmx-node:20002
+      CLUSTER_RESPONSE_CHANNEL: aeron:udp?endpoint=gateway-driver:20301
+      CLUSTER_REPORT_CHANNELS: aeron:udp?endpoint=gateway-driver:0|control=mmx-node-0.mmx-node:40450|session-id=1002,aeron:udp?endpoint=gateway-driver:0|control=mmx-node-1.mmx-node:40451|session-id=1002,aeron:udp?endpoint=gateway-driver:0|control=mmx-node-2.mmx-node:40452|session-id=1002
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, "3", http://127.0.0.1:8000/readyz]
+      interval: 2s
+      timeout: 4s
+      start_period: 60s
+      retries: 60
+    volumes: [gateway-shm:/dev/shm, ./config:/state:ro]
+
+  reporter-driver:
+    <<: *driver
+    volumes: [reporter-shm:/dev/shm]
+  trade-reporter:
+    <<: *client
+    image: ${MMX_REGISTRY:-ghcr.io/awesomepandapig/mmx}/trade-reporter:${MMX_VERSION:-0.1.0}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      target: service
+      args: {SERVICE: trade-reporter}
+    network_mode: service:reporter-driver
+    depends_on: [reporter-driver, engine0, engine1, engine2, questdb]
+    environment:
+      <<: *client-env
+      QUESTDB_CONF: http::addr=questdb:9000;
+      CLIENT_HOST: reporter-driver
+    volumes: [reporter-shm:/dev/shm]
+
+  market-data-driver:
+    <<: *driver
+    volumes: [market-data-shm:/dev/shm]
+  market-data:
+    <<: *client
+    image: ${MMX_REGISTRY:-ghcr.io/awesomepandapig/mmx}/market-data:${MMX_VERSION:-0.1.0}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      target: service
+      args: {SERVICE: market-data}
+    network_mode: service:market-data-driver
+    depends_on: [market-data-driver, engine0, engine1, engine2, nats]
+    environment:
+      <<: *client-env
+      CHECKPOINT_DIR: /checkpoints
+      CLIENT_HOST: market-data-driver
+    volumes: [market-data-shm:/dev/shm, checkpoints:/checkpoints]
+
+  outbox-driver:
+    <<: *driver
+    volumes: [outbox-shm:/dev/shm]
+  outbox:
+    <<: *client
+    image: ${MMX_REGISTRY:-ghcr.io/awesomepandapig/mmx}/outbox:${MMX_VERSION:-0.1.0}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      target: service
+      args: {SERVICE: outbox}
+    network_mode: service:outbox-driver
+    depends_on: [outbox-driver, engine0, engine1, engine2]
+    env_file: [./config/outbox.env]
+    environment:
+      <<: *client-env
+      OUTBOX_DIR: /data
+      CLIENT_HOST: outbox-driver
+      OUTBOX_HTTP: 0.0.0.0:8092
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, "3", http://127.0.0.1:8092/healthz]
+      interval: 2s
+      timeout: 4s
+      start_period: 30s
+      retries: 30
+    volumes: [outbox-shm:/dev/shm, outbox-data:/data]
+
+  websocket:
+    <<: *client
+    image: ${MMX_REGISTRY:-ghcr.io/awesomepandapig/mmx}/websocket:${MMX_VERSION:-0.1.0}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      target: service
+      args: {SERVICE: websocket}
+    depends_on: [nats]
+    environment:
+      NATS_URL: nats:4222
+      WS_ADDR: 0.0.0.0:8080
+    ports: ["${MMX_BIND_HOST:-127.0.0.1}:${MMX_WEBSOCKET_PORT:-8080}:8080"]
+
+  console:
+    <<: *client
+    image: ${MMX_REGISTRY:-ghcr.io/awesomepandapig/mmx}/mmx:${MMX_VERSION:-0.1.0}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+      target: service
+      args: {SERVICE: mmx}
+    command: [/usr/local/bin/service, serve]
+    depends_on: [gateway, trade-reporter, market-data, outbox, websocket]
+    environment:
+      MMX_BIND: 0.0.0.0:8093
+      MMX_ADMIN_TOKEN: ${MMX_ADMIN_TOKEN:?Run mmx local up to initialize credentials}
+      MMX_GATEWAY_URLS: http://gateway-driver:8000
+      MMX_OUTBOX_URL: http://outbox-driver:8092
+      MMX_WEBSOCKET_URL: websocket:8080
+      NATS_URL: nats:4222
+      VALKEY_URL: redis://valkey:6379
+      QUESTDB_URL: http://questdb:9000
+      MARKETS_FILE: /state/markets.yaml
+      MMX_STATE_DIR: /state
+      MMX_OUTBOX_RESTART: mmx local restart outbox
+    ports: ["${MMX_BIND_HOST:-127.0.0.1}:${MMX_CONSOLE_PORT:-8093}:8093"]
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --max-time, "3", http://127.0.0.1:8093/readyz]
+      interval: 2s
+      timeout: 4s
+      start_period: 60s
+      retries: 60
+    volumes: [./config:/state]
+
+  nats:
+    image: docker.io/library/nats:2-alpine
+    restart: unless-stopped
+  valkey:
+    image: docker.io/valkey/valkey:8-alpine
+    restart: unless-stopped
+  questdb:
+    image: docker.io/questdb/questdb:8.2.3
+    restart: unless-stopped
+    volumes: [questdb-data:/var/lib/questdb]
+
+volumes:
+  node0-data:
+  node1-data:
+  node2-data:
+  outbox-data:
+  checkpoints:
+  questdb-data:
+  node0-shm:
+  node1-shm:
+  node2-shm:
+  gateway-shm:
+  reporter-shm:
+  market-data-shm:
+  outbox-shm:

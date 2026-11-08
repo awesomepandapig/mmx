@@ -1,0 +1,198 @@
+{{- include "mmx.validate" . -}}
+{{- $name := include "mmx.clusterName" . -}}
+{{- $labels := dict "root" . "component" "node" -}}
+{{- $cluster := .Values.cluster -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+data:
+  CLUSTER_NAME: {{ $name | quote }}
+  CLUSTER_SIZE: {{ $cluster.replicas | quote }}
+  CLUSTER_ID: {{ $cluster.id | quote }}
+  AERON_DIR: /dev/shm/aeron
+  DATA_DIR: /data
+  PIN_THREADS: {{ $cluster.pinThreads | quote }}
+  LEADER_HEARTBEAT_TIMEOUT: {{ $cluster.leaderHeartbeatTimeout | quote }}
+  LEADER_HEARTBEAT_INTERVAL: {{ $cluster.leaderHeartbeatInterval | quote }}
+  ELECTION_TIMEOUT: {{ $cluster.electionTimeout | quote }}
+  STARTUP_CANVASS_TIMEOUT: {{ $cluster.startupCanvassTimeout | quote }}
+  SESSION_TIMEOUT: {{ $cluster.sessionTimeout | quote }}
+  THREADING: {{ $cluster.threadingMode | quote }}
+  IDLE: {{ $cluster.idleStrategy | quote }}
+  SPARSE_TERM_BUFFERS: {{ $cluster.sparseTermBuffers | quote }}
+  SOCKET_BUFFER: {{ $cluster.socketBuffer | quote }}
+  LOG_TERM_LENGTH: {{ $cluster.logTermLength | quote }}
+  SYNC: {{ $cluster.archiveSyncLevel | quote }}
+  JAVA_HEAP_MIN: {{ $cluster.node.heapMin | quote }}
+  JAVA_HEAP_MAX: {{ $cluster.node.heapMax | quote }}
+  REPORT_TERM_LENGTH: {{ $cluster.engine.reportTermLength | quote }}
+  MAX_ORDERS: {{ $cluster.engine.maxOrders | quote }}
+  PUB_STREAM_ID: "1002"
+  RUST_LOG: {{ $cluster.engine.rustLog | quote }}
+  RUST_BACKTRACE: "1"
+  {{- range $key, $value := $cluster.engine.env }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-extra
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+data:
+  extra.properties: |
+    {{- range $key, $value := $cluster.extraProperties }}
+    {{ $key }}={{ $value }}
+    {{- end }}
+---
+# Aeron uses UDP on fixed per-member ports, reached by pod name, so this Service only publishes DNS.
+# Names must exist before pods are ready, because a pod can't start without its peers' names.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "mmx.selectorLabels" $labels | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  serviceName: {{ $name }}
+  replicas: {{ $cluster.replicas }}
+  # Members can't reach a quorum one at a time, so they have to start together.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: {{ $cluster.updateStrategy }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mmx.labels" $labels | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- include "mmx.podSecurityContext" . | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          {{- if eq $cluster.antiAffinity "required" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "mmx.selectorLabels" $labels | nindent 18 }}
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "mmx.selectorLabels" $labels | nindent 20 }}
+          {{- end }}
+      containers:
+        - name: node
+          image: {{ include "mmx.image" (dict "root" . "image" $cluster.node.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["cluster"]
+          envFrom:
+            - configMapRef:
+                name: {{ $name }}
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: EXTRA_PROPS_FILE
+              value: /etc/mmx/extra.properties
+          securityContext:
+            {{- include "mmx.containerSecurityContext" . | nindent 12 }}
+          # There's no liveness probe: the process exits when it fails, and a false positive here
+          # would cost a member.
+          startupProbe:
+            exec:
+              command: ["test", "-f", "/dev/shm/aeron/cnc.dat"]
+            periodSeconds: 2
+            failureThreshold: 180
+          resources:
+            {{- include "mmx.resources" (dict "resources" $cluster.node.resources "guaranteed" $cluster.guaranteed) | nindent 12 }}
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            - name: config
+              mountPath: /etc/mmx
+              readOnly: true
+        - name: engine
+          image: {{ include "mmx.image" (dict "root" . "image" $cluster.engine.image) | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - configMapRef:
+                name: {{ $name }}
+          securityContext:
+            {{- include "mmx.containerSecurityContext" . | nindent 12 }}
+          resources:
+            {{- include "mmx.resources" (dict "resources" $cluster.engine.resources "guaranteed" $cluster.guaranteed) | nindent 12 }}
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ $cluster.sharedMemory.sizeLimit }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: config
+          configMap:
+            name: {{ $name }}-extra
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $cluster.persistence.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $cluster.persistence.size }}
+{{- if $cluster.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "mmx.labels" $labels | nindent 4 }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "mmx.selectorLabels" $labels | nindent 6 }}
+{{- end }}

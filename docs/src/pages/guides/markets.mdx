@@ -1,0 +1,52 @@
+# Markets
+
+`markets.yaml` lists tradable products. Units within each market must be interchangeable. The examples use materials, but symbols are application-defined. Gateways refuse orders for any market that's missing or disabled. Players can still cancel open orders in a disabled market.
+
+```yaml
+markets:
+  - symbol: IRON
+    tick_size: "0.01"
+    min_size: "1"
+    max_size: "100000"
+  - symbol: COAL
+    tick_size: "0.01"
+    enabled: false
+```
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `symbol` | Yes | 1 to 6 letters or digits |
+| `tick_size` | Yes | Prices must be a multiple of this |
+| `min_size` | No | Smallest order size |
+| `max_size` | No | Largest order size |
+| `enabled` | No | Defaults to `true` |
+
+Decimals are strings with at most 8 decimal places.
+
+## Changing markets after installation
+
+The engine learns about a symbol when its first order arrives, so a new market does not need an engine restart.
+
+`marketsYaml` seeds the ConfigMap on first installation. The chart preserves an existing ConfigMap during `helm upgrade`; changing `--set-file marketsYaml=...` later does not replace console edits.
+
+Use the CLI to edit a market and inspect propagation:
+
+```sh
+mmx markets set IRON --tick-size 0.01 --min-size 1 --max-size 100000
+mmx markets get IRON
+```
+
+For a complete configuration file:
+
+```sh
+mmx markets validate markets.yaml
+mmx markets apply markets.yaml
+```
+
+The control plane reloads each gateway after its mounted configuration updates. Inspect each gateway's result; configuration propagation can take around a minute. A failed reload retains the previous configuration on that gateway.
+
+## Halts and existing orders
+
+Halting stops new admission for the market; resting orders remain, and cancels remain available. Requests already admitted may still complete. Inspect each gateway's result before treating a halt as propagated.
+
+Disabling or removing a market does not cancel its engine book. Resolve resting orders explicitly before retiring a product or changing its economic meaning. See [feature status](/status) for retirement safeguards.

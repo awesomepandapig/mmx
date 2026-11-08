@@ -1,0 +1,106 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mmx-questdb-rebuild
+  labels:
+    app.kubernetes.io/name: mmx
+    app.kubernetes.io/component: questdb-rebuild
+spec:
+  # A retry would drop the tables again, so a failure stays failed.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mmx
+        app.kubernetes.io/component: questdb-rebuild
+        mmx.io/aeron-client: "true"
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # A native sidecar, so the driver can't keep the pod alive after trade-reporter exits.
+      initContainers:
+        - name: aeron-driver
+          image: ghcr.io/awesomepandapig/mmx/node:0.1.0
+          restartPolicy: Always
+          args: ["driver"]
+          env:
+            - name: AERON_DIR
+              value: /dev/shm/aeron
+            - name: THREADING
+              value: SHARED
+            - name: SOCKET_BUFFER
+              value: 4m
+            - name: JAVA_HEAP_MIN
+              value: 256m
+            - name: JAVA_HEAP_MAX
+              value: 256m
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            exec:
+              command: ["test", "-f", "/dev/shm/aeron/cnc.dat"]
+            periodSeconds: 1
+            failureThreshold: 60
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1536Mi
+            limits:
+              memory: 1536Mi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: trade-reporter
+          image: ghcr.io/awesomepandapig/mmx/trade-reporter:0.1.0
+          args: ["/usr/local/bin/service", "--rebuild"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AERON_DIR
+              value: /dev/shm/aeron
+            - name: CLIENT_HOST
+              value: $(POD_IP)
+            - name: TAPE_ARCHIVES
+              value: mmx-node-0.mmx-node:8010,mmx-node-1.mmx-node:8011,mmx-node-2.mmx-node:8012
+            - name: TAPE_REPORTS
+              value: mmx-node-0.mmx-node:40450,mmx-node-1.mmx-node:40451,mmx-node-2.mmx-node:40452
+            - name: QUESTDB_CONF
+              value: http::addr=mmx-questdb:9000;
+            - name: RUST_LOG
+              value: info
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

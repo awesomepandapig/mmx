@@ -1,0 +1,42 @@
+# This Vercel project builds only the public website and documentation.
+# CLI uploads do not apply .gitignore rules.
+target/
+crates/
+services/
+console/
+deploy/
+tools/
+auth/
+vendor/
+transparent_listener/
+.claude/
+.local/
+.agents/
+.codex/
+.aws/
+.run/
+.test-install/
+.terraform/
+notes/
+reports/
+research_notes/
+reviews/
+
+# Install dependencies and generate deployment output in Vercel's build.
+**/node_modules/
+**/build/
+**/dist/
+**/.vercel/
+**/.vocs/
+**/.vite/
+**/__pycache__/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+*.tfstate
+*.tfstate.backup

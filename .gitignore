@@ -1,7 +1,42 @@
 .vscode
 .DS_Store
 
-tests/
 transparent_listener/
-old/
 target/
+.run/
+.test-install/
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+tools/bench/ec2/hosts.json
+__pycache__/
+
+# Deprecated services
+auth/
+
+# Local agent workspaces, worktrees, investigations, notes, and scratch folders
+.claude/
+.local/
+notes/
+reports/
+research_notes/
+reviews/
+
+# Dependencies and build outputs
+**/node_modules/
+**/build/
+**/dist/
+**/.vocs/
+**/.vite/
+*.tsbuildinfo
+*.log
+.env
+.env.*
+!.env.example
+
+# Vercel project links and build output
+**/.vercel/
+
+# Runtime state for an explicit source Compose deployment
+/deploy/config/
