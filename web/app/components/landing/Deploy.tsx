@@ -2,7 +2,7 @@ import { Lock } from "lucide-react";
 import type { ReactNode } from "react";
 import BrandLogo from "./BrandLogo";
 import { CARD, H2, SECTION } from "./layout";
-import { DOCS_URL, REPO_URL } from "./links";
+import { CHART_URL, REPO_URL } from "./links";
 
 const MARK = "size-[72px] text-mmx-periwinkle";
 
@@ -52,7 +52,7 @@ export default function Deploy() {
           title="Deploy with Helm"
           body="Install the chart in your cluster."
           link={{
-            href: `${DOCS_URL}/installation/helm`,
+            href: CHART_URL,
             label: "View the chart",
           }}
         />
